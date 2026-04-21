@@ -1,0 +1,42 @@
+[package]
+name = "dragonsci"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated scientific visualization for Python, written in Rust"
+license = "MIT"
+homepage = "https://github.com/nashkocur/dragonsci"
+repository = "https://github.com/nashkocur/dragonsci"
+exclude = [
+    "python/**/*.pyd",
+    "python/**/*.so",
+    "python/**/*.dylib",
+    "python/**/__pycache__/**",
+    "dist*/**",
+    "tests/**",
+    "test_bench.py",
+]
+
+[lib]
+name = "_dragonsci"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+wgpu = { version = "24", features = ["wgsl"] }
+raw-window-handle = "0.6"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.28"
+glyphon = "0.8"
+pollster = "0.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

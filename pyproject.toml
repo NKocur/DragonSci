@@ -1,0 +1,68 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "dragonsci"
+version = "0.1.0"
+description = "GPU-accelerated scientific visualization for Python, written in Rust"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Nash Kocur", email = "nash.kocur@gmail.com" }]
+maintainers = [{ name = "Nash Kocur", email = "nash.kocur@gmail.com" }]
+keywords = ["scatter", "3d", "visualization", "point-cloud", "tkinter", "rust", "wgpu"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Software Development :: User Interfaces",
+    "Environment :: X11 Applications",
+]
+dependencies = ["numpy>=1.20"]
+
+[project.optional-dependencies]
+dev = ["maturin", "pytest"]
+
+[project.urls]
+Homepage = "https://github.com/nashkocur/dragonsci"
+Repository = "https://github.com/nashkocur/dragonsci"
+"Bug Tracker" = "https://github.com/nashkocur/dragonsci/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "dragonsci._dragonsci"
+features = ["pyo3/extension-module"]
+# Exclude compiled extensions (placed by `maturin develop`), build output
+# directories (match any dist*/check* prefix), and bytecode caches.
+exclude = [
+    # NOTE: maturin's `exclude` is applied to both sdist and wheel.
+    # Do NOT list *.pyd / *.so / *.dylib here — those patterns would strip
+    # the freshly-compiled extension from the wheel.  The dev-tree artifact
+    # placed by `maturin develop` is handled by scripts/build_wheel.py.
+    "target/**",
+    "dist*/**",
+    ".vscode/**",
+    ".idea/**",
+    ".claude/**",
+    ".pytest_cache/**",
+    ".test-cache/**",
+    "htmlcov/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/*.pyo",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

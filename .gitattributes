@@ -1,0 +1,17 @@
+# Normalize line endings: store as LF, check out as native on Windows
+* text=auto
+
+# Source files: always LF
+*.rs    text eol=lf
+*.py    text eol=lf
+*.wgsl  text eol=lf
+*.toml  text eol=lf
+*.lock  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+
+# Binary files: never touch
+*.pyd   binary
+*.so    binary
+*.dylib binary
+*.whl   binary

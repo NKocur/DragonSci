@@ -1,0 +1,5 @@
+# Use the MinGW/GNU toolchain to match MSYS2 Python.
+# MSYS2 Python ships libpython3.12.dll.a (MinGW format), not python3.12.lib
+# (MSVC format), so the MSVC linker cannot link against it.
+[build]
+target = "x86_64-pc-windows-gnu"
