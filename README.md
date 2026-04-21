@@ -1,5 +1,9 @@
 # dragonsci
 
+<p align="center">
+  <img src="dragonscilogo.png" alt="DragonSci logo" width="320"/>
+</p>
+
 GPU-accelerated scientific visualization for Python, written in Rust.
 
 Renders large point clouds (250 k+ points) at interactive frame rates by using
