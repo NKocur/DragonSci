@@ -15,7 +15,7 @@ import tkinter as tk
 import tkinter.filedialog as fd
 import numpy as np
 
-from dragonsci import Scatter3D, Scatter2D, link_cameras, unlink_cameras
+from dragonsci import Scatter3D, Scatter2D, Figure, link_cameras, unlink_cameras
 
 # ── Theme ──────────────────────────────────────────────────────────────────────
 
@@ -127,6 +127,10 @@ class DemoApp(tk.Tk):
         ("Categ. Color",      "_sec_catcolor",    False),
         ("Size by Column",    "_sec_sizebycolumn", False),
         ("2D Mode",           "_sec_2dmode",      False),
+        ("Marginal Hists",    "_sec_marginals",   False),
+        ("Point Labels",      "_sec_labels",      False),
+        ("Figure Subplots",   "_sec_figure",      False),
+        ("Statistical Overlays", "_sec_stat_overlays", False),
         ("── planned ──",    "",                 True),   # separator
         ("Lasso Selection",   "_sec_lasso",       False),
         ("Streaming",         "_sec_streaming",   False),
@@ -143,6 +147,7 @@ class DemoApp(tk.Tk):
         self._actor_handles: list[int] = []
         self._linked_wins: list[tuple] = []
         self._scatter_parent: "tk.Frame | None" = None
+        self._figure: "Figure | None" = None
 
         self._build_layout()
         self.after(200, lambda: self._switch("_sec_basics"))
@@ -221,14 +226,21 @@ class DemoApp(tk.Tk):
         self.scatter.pack(fill="both", expand=True)
 
     def _switch(self, method: str) -> None:
+        # Tear down Figure if leaving that section.
+        if self._figure is not None and method != "_sec_figure":
+            self._figure.destroy()
+            self._figure = None
+            self.scatter.pack(fill="both", expand=True)
+
         # If leaving 2D mode, restore the Scatter3D widget.
-        if isinstance(self.scatter, Scatter2D) and method != "_sec_2dmode":
+        if isinstance(self.scatter, Scatter2D) and method not in ("_sec_2dmode", "_sec_marginals"):
             self._swap_scatter(Scatter3D)
 
         # Reset scatter state that may have been changed by previous section
         self.scatter.disable_picking()
         self.scatter.bind("<<PointPicked>>",      lambda e: None)
         self.scatter.bind("<<SelectionChanged>>", lambda e: None)
+        self.scatter.clear_labels()
 
         # Clear controls
         for w in self._ctrl_frame.winfo_children():
@@ -609,6 +621,26 @@ class DemoApp(tk.Tk):
             self.scatter.show_grid_planes(major_var.get(), minor_var.get())
         _check(p, "Major grid planes", major_var, _update_planes)
         _check(p, "Minor grid planes", minor_var, _update_planes)
+
+        _head(p, "TICK COUNT")
+        _label(p, "Max ticks per axis (0 = auto):", fg=DIM)
+        tick_vars = {ax: tk.IntVar(value=0) for ax in ("X", "Y", "Z")}
+
+        def _apply_ticks(*_):
+            def _val(ax):
+                v = tick_vars[ax].get()
+                return v if v > 0 else None
+            self.scatter.set_ticks(x=_val("X"), y=_val("Y"), z=_val("Z"))
+
+        for ax in ("X", "Y", "Z"):
+            row = tk.Frame(p, bg=PANEL)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=f"{ax}:", bg=PANEL, fg=FG, font=FM,
+                     width=3, anchor="w").pack(side="left")
+            tk.Scale(row, variable=tick_vars[ax], from_=0, to=20, resolution=1,
+                     orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                     highlightthickness=0, command=_apply_ticks,
+                     ).pack(side="left", fill="x", expand=True)
 
         axes_var = tk.BooleanVar(value=False)
         _check(p, "Orientation axes widget",
@@ -1045,6 +1077,327 @@ class DemoApp(tk.Tk):
 
         _load_numpy()
 
+    # ── Section: Point Labels ─────────────────────────────────────────────────
+
+    def _sec_labels(self, p: tk.Frame) -> None:
+        # Five Gaussian clusters; label each centroid
+        n_clusters = 5
+        n_per      = 10_000
+        rng        = np.random.default_rng(7)
+        CLUSTER_COLORS = [
+            (1.0, 0.4, 0.4), (0.4, 1.0, 0.4), (0.3, 0.6, 1.0),
+            (1.0, 0.9, 0.2), (1.0, 0.5, 1.0),
+        ]
+        angles   = np.linspace(0, 2 * np.pi, n_clusters, endpoint=False)
+        centers  = [(3 * np.cos(a), 3 * np.sin(a), 0.0) for a in angles]
+        names    = [f"Cluster {i}" for i in range(n_clusters)]
+
+        chunks = []
+        for cx, cy, cz in centers:
+            c = rng.standard_normal((n_per, 3)).astype(np.float32) * 0.5
+            c[:, 0] += cx; c[:, 1] += cy; c[:, 2] += cz
+            chunks.append(c)
+        all_pts = np.concatenate(chunks)
+        scalars = np.repeat(np.arange(n_clusters, dtype=np.float32), n_per)
+
+        label_handles: list[int] = []
+        info_var  = tk.StringVar(value=f"{len(all_pts):,} pts  ·  {n_clusters} labels")
+        vis_var   = tk.BooleanVar(value=True)
+
+        def _load():
+            self.scatter.clear_labels()
+            label_handles.clear()
+            self.scatter.set_points(all_pts, scalars=scalars,
+                                    colormap="plasma", point_size=2.0)
+            for i, (cx, cy, cz) in enumerate(centers):
+                h = self.scatter.add_label(
+                    (cx, cy, cz + 0.6), names[i],
+                    color=CLUSTER_COLORS[i], size=13.0, anchor="bottom",
+                )
+                label_handles.append(h)
+            info_var.set(f"{len(all_pts):,} pts  ·  {n_clusters} labels")
+            self._status("Labels demo loaded")
+
+        def _rename():
+            for i, h in enumerate(label_handles):
+                self.scatter.update_label(h, text=f"Grp {i}  (n={n_per:,})")
+            info_var.set("Labels renamed")
+
+        def _move_up():
+            for i, h in enumerate(label_handles):
+                cx, cy, cz = centers[i]
+                self.scatter.update_label(h, (cx, cy, cz + 1.5))
+            info_var.set("Labels moved up")
+
+        def _resize():
+            for h in label_handles:
+                self.scatter.update_label(h, size=20.0)
+            info_var.set("Labels resized → 20 pt")
+
+        def _toggle_vis():
+            v = vis_var.get()
+            for h in label_handles:
+                self.scatter.set_label_visibility(h, v)
+            info_var.set(f"Labels {'shown' if v else 'hidden'}")
+
+        def _remove_one():
+            if label_handles:
+                h = label_handles.pop()
+                self.scatter.remove_label(h)
+                info_var.set(f"{len(label_handles)} label(s) remaining")
+
+        def _clear():
+            self.scatter.clear_labels()
+            label_handles.clear()
+            info_var.set("Labels cleared")
+
+        def _anchor_demo():
+            self.scatter.clear_labels()
+            label_handles.clear()
+            pos = (0.0, 0.0, 0.0)
+            for i, (anchor, dy) in enumerate(
+                    [("center", 0), ("left", 0), ("right", 0),
+                     ("top", 0), ("bottom", 0)]):
+                offset = (i - 2) * 2.5
+                h = self.scatter.add_label(
+                    (offset, 0.0, 0.0), anchor,
+                    color=(0.9, 0.9, 0.9), size=13.0, anchor=anchor,
+                )
+                label_handles.append(h)
+            info_var.set("Anchor demo — 5 alignment modes")
+
+        _head(p, "SCENE")
+        _btn(p, "Load (cluster centroids)", _load)
+        _btn(p, "Anchor alignment demo",    _anchor_demo)
+
+        _head(p, "MUTATIONS")
+        _btn(p, "Rename labels",    _rename)
+        _btn(p, "Move labels up",   _move_up)
+        _btn(p, "Resize → 20 pt",   _resize)
+
+        _head(p, "VISIBILITY")
+        _check(p, "Show labels", vis_var, _toggle_vis)
+
+        _head(p, "REMOVAL")
+        _btn(p, "Remove last label", _remove_one, fg=WARN)
+        _btn(p, "Clear all labels",  _clear,      fg=RED)
+
+        _head(p, "STATUS")
+        _label(p, textvariable=info_var, fg=ACT)
+
+        _head(p, "NOTES")
+        _label(p, text="anchor=  center | left | right | top | bottom\n"
+                        "color=   (r,g,b) or \"#RRGGBB\"\n"
+                        "size=    font size in points\n\n"
+                        "Labels project from 3D world space\n"
+                        "every frame — no screen-space drift.", fg=DIM)
+
+        _load()
+
+    # ── Section: Figure Subplots ──────────────────────────────────────────────
+
+    def _sec_figure(self, p: tk.Frame) -> None:
+        # Destroy any previous Figure from a re-entry before creating a new one.
+        if self._figure is not None:
+            self._figure.destroy()
+            self._figure = None
+        # Hide the shared scatter widget; the Figure occupies the right panel.
+        self.scatter.pack_forget()
+        fig = Figure(self._scatter_parent, rows=2, cols=2,
+                     width=1040, height=780, padding=4)
+        fig.pack(fill="both", expand=True)
+        self._figure = fig
+
+        rng = np.random.default_rng(42)
+        n = 20_000
+        pts_torus, sc_torus = _torus(n)
+        pts_sphere, sc_sphere = _sphere(n)
+        pts_helix, sc_helix = _helix(n)
+        pts_gauss, sc_gauss = _gaussian(n)
+
+        info_var  = tk.StringVar(value="—")
+        link_var  = tk.BooleanVar(value=False)
+
+        DATASETS = [
+            (pts_torus,  sc_torus,  "plasma",   "Torus"),
+            (pts_sphere, sc_sphere, "viridis",  "Sphere"),
+            (pts_helix,  sc_helix,  "inferno",  "Helix"),
+            (pts_gauss,  sc_gauss,  "coolwarm", "Gaussian"),
+        ]
+        cells = [(0, 0), (0, 1), (1, 0), (1, 1)]
+
+        def _load(*_):
+            for (r, c), (pts, sc, cmap, name) in zip(cells, DATASETS):
+                fig[r, c].set_points(pts, scalars=sc, colormap=cmap,
+                                     point_size=2.0)
+                fig[r, c].add_label(
+                    (float(pts[:, 0].mean()), float(pts[:, 1].mean()),
+                     float(pts[:, 2].max()) + 0.3),
+                    name, color=(1.0, 0.9, 0.7), size=12.0, anchor="bottom",
+                )
+            info_var.set(f"4 subplots  ·  {n:,} pts each")
+            self._status("Figure demo loaded")
+
+        def _toggle_link():
+            if link_var.get():
+                fig.link_cameras((0, 0), (0, 1), (1, 0), (1, 1))
+                info_var.set("Cameras linked — orbit any subplot")
+                self._status("Cameras linked")
+            else:
+                unlink_cameras(*fig.axes)
+                info_var.set("Cameras unlinked")
+                self._status("Cameras unlinked")
+
+        def _link_top_row():
+            fig.link_cameras((0, 0), (0, 1))
+            info_var.set("Top row cameras linked")
+            self._status("Top row cameras linked")
+
+        def _scalar_bar_row0():
+            fig.scalar_bar(row=0, colormap="plasma", vmin=0.0, vmax=1.0,
+                           title="scalar")
+            info_var.set("Scalar bar on row 0 (rightmost cell)")
+
+        def _scalar_bar_all():
+            fig.scalar_bar(colormap="viridis", vmin=0.0, vmax=1.0)
+            info_var.set("Scalar bar on all rows (rightmost cell each)")
+
+        def _reset_cameras():
+            for w in fig.axes:
+                w.reset_camera()
+            info_var.set("All cameras reset")
+
+        _head(p, "SCENE")
+        _btn(p, "Load all subplots", _load)
+
+        _head(p, "CAMERAS")
+        _check(p, "Link all cameras", link_var, _toggle_link)
+        _btn(p, "Link top row only", _link_top_row)
+        _btn(p, "Reset all cameras", _reset_cameras)
+
+        _head(p, "SCALAR BAR  (v1 workaround)")
+        _btn(p, "scalar_bar(row=0)",  _scalar_bar_row0)
+        _btn(p, "scalar_bar(all)",    _scalar_bar_all)
+
+        _head(p, "NOTES")
+        _label(p, text="Figure(rows=2, cols=2, …)\n"
+                        "fig[row, col]  →  Scatter3D\n"
+                        "fig.axes       →  flat list\n"
+                        "fig.link_cameras(*cells)\n\n"
+                        "scalar_bar(row=r) shows the bar\n"
+                        "in the rightmost cell per row\n"
+                        "(v1 workaround — not a shared bar).", fg=DIM)
+
+        _head(p, "STATUS")
+        _label(p, textvariable=info_var, fg=ACT)
+
+        _load()
+
+    def _sec_stat_overlays(self, p: tk.Frame) -> None:
+        try:
+            from scipy.spatial import ConvexHull as _CH  # noqa: F401
+            _has_scipy = True
+        except ImportError:
+            _has_scipy = False
+
+        if not _has_scipy:
+            _head(p, "SCIPY NOT INSTALLED")
+            _label(p, text="Install with:  pip install dragonsci[stats]", fg=WARN)
+            return
+
+        rng = np.random.default_rng(7)
+        n_per_cluster = 300
+        n_clusters = 4
+        centers = np.array([
+            [0, 0, 0], [4, 0, 0], [2, 4, 0], [2, 2, 4],
+        ], dtype=np.float32)
+        pts_list, lbl_list = [], []
+        for i, c in enumerate(centers):
+            cluster = rng.standard_normal((n_per_cluster, 3)).astype(np.float32) * 0.8 + c
+            pts_list.append(cluster)
+            lbl_list.extend([i] * n_per_cluster)
+        all_pts = np.vstack(pts_list)
+        labels  = np.array(lbl_list)
+
+        mesh_handles: "list[int]" = []
+        overlay_var   = tk.StringVar(value="none")
+        opacity_var   = tk.DoubleVar(value=0.25)
+        nstd_var      = tk.DoubleVar(value=2.0)
+        wireframe_var = tk.BooleanVar(value=False)
+
+        def _rebuild(*_):
+            self.scatter.clear_meshes()
+            mesh_handles.clear()
+            mode    = overlay_var.get()
+            opacity = opacity_var.get()
+            n_std   = nstd_var.get()
+            wf      = wireframe_var.get()
+            if mode == "hulls":
+                hs = self.scatter.add_cluster_hulls(
+                    all_pts, labels, opacity=opacity)
+                if wf:
+                    for h in hs:
+                        self.scatter.update_convex_hull(h, wireframe=True)
+                mesh_handles.extend(hs)
+            elif mode == "ellipsoids":
+                hs = self.scatter.add_cluster_ellipsoids(
+                    all_pts, labels, opacity=opacity, n_std=n_std)
+                if wf:
+                    for h in hs:
+                        self.scatter.update_ellipsoid(h, wireframe=True)
+                mesh_handles.extend(hs)
+            elif mode == "both":
+                hs1 = self.scatter.add_cluster_hulls(
+                    all_pts, labels, opacity=max(0.1, opacity * 0.6))
+                hs2 = self.scatter.add_cluster_ellipsoids(
+                    all_pts, labels, opacity=opacity, n_std=n_std)
+                if wf:
+                    for h in hs1 + hs2:
+                        self.scatter.update_convex_hull(h, wireframe=True) \
+                            if h in hs1 else \
+                            self.scatter.update_ellipsoid(h, wireframe=True)
+                mesh_handles.extend(hs1 + hs2)
+
+        def _load():
+            self.scatter.set_points(all_pts,
+                                    scalars=labels.astype(np.float32),
+                                    colormap="tab10", point_size=3.0)
+            _rebuild()
+
+        _load()
+
+        _head(p, "OVERLAY TYPE")
+        _radio_group(p, overlay_var,
+                     [("None",               "none"),
+                      ("Convex Hulls",       "hulls"),
+                      ("Ellipsoids",         "ellipsoids"),
+                      ("Hulls + Ellipsoids", "both")],
+                     lambda: _rebuild())
+
+        _head(p, "WIREFRAME")
+        tk.Checkbutton(p, text="Draw as wireframe", variable=wireframe_var,
+                       bg=PANEL, fg=FG, selectcolor=PANEL, activebackground=PANEL,
+                       activeforeground=ACT, font=FM,
+                       command=_rebuild).pack(anchor="w", padx=6, pady=2)
+
+        _head(p, "OPACITY")
+        tk.Scale(p, variable=opacity_var, from_=0.05, to=1.0, resolution=0.05,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0, command=lambda _: _rebuild()
+                 ).pack(fill="x", padx=6, pady=2)
+
+        _head(p, "ELLIPSOID N_STD")
+        tk.Scale(p, variable=nstd_var, from_=0.5, to=4.0, resolution=0.25,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0, command=lambda _: _rebuild()
+                 ).pack(fill="x", padx=6, pady=2)
+
+        _head(p, "CONTROLS")
+        _btn(p, "Reload Points", _load, fg=ACT)
+        _btn(p, "Clear Overlays",
+             lambda: (self.scatter.clear_meshes(), mesh_handles.clear()),
+             fg=WARN)
+
     def _sec_lasso(self, p: tk.Frame) -> None:
         try:
             import pandas as _pd
@@ -1291,6 +1644,108 @@ class DemoApp(tk.Tk):
         # Create stream actor and start immediately
         _make_stream()
         _start()
+
+
+    # ── Section: Marginal Histograms ─────────────────────────────────────────
+
+    def _sec_marginals(self, p: tk.Frame) -> None:
+        self._swap_scatter(Scatter2D)
+        scatter = self.scatter
+
+        rng = np.random.default_rng(99)
+        info_var = tk.StringVar(value="—")
+
+        # Controls
+        bins_var    = tk.IntVar(value=50)
+        alpha_var   = tk.DoubleVar(value=0.7)
+        size_var    = tk.IntVar(value=80)
+        orient_var  = tk.StringVar(value="both")
+        color_var   = tk.StringVar(value="#4c8eff")
+        visible_var = tk.BooleanVar(value=True)
+
+        def _apply_marginals(*_):
+            if visible_var.get():
+                scatter.show_marginals(
+                    True,
+                    bins=bins_var.get(),
+                    color=color_var.get(),
+                    alpha=alpha_var.get(),
+                    size=size_var.get(),
+                    orientation=orient_var.get(),
+                )
+            else:
+                scatter.show_marginals(False)
+
+        def _load_clusters(*_):
+            n = 60_000
+            centers = [(-2, -2), (2, -2), (0, 2.5), (-2.5, 1.5), (2.5, 1.5)]
+            chunks = []
+            for cx, cy in centers:
+                c = rng.standard_normal((n // len(centers), 2)).astype(np.float32) * 0.5
+                c[:, 0] += cx
+                c[:, 1] += cy
+                chunks.append(c)
+            xy = np.concatenate(chunks)
+            pts = np.zeros((len(xy), 3), dtype=np.float32)
+            pts[:, :2] = xy
+            scalars = np.hypot(pts[:, 0], pts[:, 1]).astype(np.float32)
+            scatter.set_points(pts, scalars=scalars, colormap="plasma", point_size=2.0)
+            info_var.set(f"{len(pts):,} pts  5 clusters")
+            _apply_marginals()
+
+        def _load_bivariate(*_):
+            n = 40_000
+            pts = np.zeros((n, 3), dtype=np.float32)
+            pts[:, 0] = rng.standard_normal(n).astype(np.float32)
+            pts[:, 1] = (pts[:, 0] * 0.7 + rng.standard_normal(n) * 0.5).astype(np.float32)
+            scatter.set_points(pts, point_size=1.5)
+            info_var.set(f"{n:,} pts  bivariate normal")
+            _apply_marginals()
+
+        def _toggle_marginals(*_):
+            _apply_marginals()
+
+        _head(p, "DATA")
+        _btn(p, "Load clusters",    _load_clusters)
+        _btn(p, "Load bivariate",   _load_bivariate)
+
+        _head(p, "MARGINALS")
+        _check(p, "Show marginals", visible_var, _toggle_marginals)
+
+        _head(p, "ORIENTATION")
+        _radio_group(p, orient_var,
+                     [("Both",    "both"),
+                      ("X only",  "x"),
+                      ("Y only",  "y")],
+                     _apply_marginals)
+
+        _head(p, "BINS")
+        tk.Scale(p, variable=bins_var, from_=5, to=200, resolution=5,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0, command=_apply_marginals).pack(fill="x")
+
+        _head(p, "OPACITY")
+        tk.Scale(p, variable=alpha_var, from_=0.1, to=1.0, resolution=0.05,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0, command=_apply_marginals).pack(fill="x")
+
+        _head(p, "SIZE (px)")
+        tk.Scale(p, variable=size_var, from_=30, to=200, resolution=5,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0, command=_apply_marginals).pack(fill="x")
+
+        _head(p, "COLOR")
+        _radio_group(p, color_var,
+                     [("Blue",   "#4c8eff"),
+                      ("Teal",   "#26c6da"),
+                      ("Orange", "#ffa726"),
+                      ("Pink",   "#ec407a")],
+                     _apply_marginals)
+
+        _head(p, "STATUS")
+        _label(p, textvariable=info_var, fg=ACT)
+
+        _load_clusters()
 
 
 if __name__ == "__main__":

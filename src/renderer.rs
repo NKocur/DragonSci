@@ -102,6 +102,27 @@ struct LineActor {
     data_max: Vec3,
 }
 
+// ── Mesh overlay actor (convex hulls, ellipsoids) ────────────────────────────
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct MeshVertex {
+    pub position: [f32; 3],
+    pub color: [f32; 4],
+}
+
+struct MeshActor {
+    id: u64,
+    vbuf: GrowableBuffer,
+    ibuf: GrowableBuffer,
+    index_count: u32,
+    visible: bool,
+    wireframe: bool,
+    color: [f32; 4],
+    data_min: Vec3,
+    data_max: Vec3,
+}
+
 // ── Screen-space pick cache (projected positions + 16 px spatial grid) ────────
 
 const GRID_CELL_PX: f32 = 16.0;
@@ -198,6 +219,46 @@ impl ScreenPickCache {
             }
         }
     }
+
+    /// Like `for_each_in_rect` but skips cells that are entirely within the
+    /// inner rectangle `[ix0, iy0]–[ix1, iy1]` (already searched).
+    /// Used by the expanding-ring fallback in `pick_point`.
+    fn for_each_in_ring<F: FnMut(u32, [f32; 2])>(
+        &self,
+        ox0: f32, oy0: f32, ox1: f32, oy1: f32,  // outer box
+        ix0: f32, iy0: f32, ix1: f32, iy1: f32,  // inner box (skip)
+        mut f: F,
+    ) {
+        let cx0 = ((ox0 / GRID_CELL_PX).floor() as i32).max(0) as u32;
+        let cy0 = ((oy0 / GRID_CELL_PX).floor() as i32).max(0) as u32;
+        let cx1 = ((ox1 / GRID_CELL_PX).ceil() as i32)
+            .min(self.cols as i32 - 1).max(0) as u32;
+        let cy1 = ((oy1 / GRID_CELL_PX).ceil() as i32)
+            .min(self.rows as i32 - 1).max(0) as u32;
+        // Inner cell range (inclusive) — cells fully inside inner box.
+        let icx0 = ((ix0 / GRID_CELL_PX).ceil() as i32).max(0) as u32;
+        let icy0 = ((iy0 / GRID_CELL_PX).ceil() as i32).max(0) as u32;
+        let icx1 = ((ix1 / GRID_CELL_PX).floor() as i32)
+            .min(self.cols as i32 - 1).max(0) as u32;
+        let icy1 = ((iy1 / GRID_CELL_PX).floor() as i32)
+            .min(self.rows as i32 - 1).max(0) as u32;
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                // Skip cells entirely within the previously searched inner box.
+                if cx >= icx0 && cx <= icx1 && cy >= icy0 && cy <= icy1 {
+                    continue;
+                }
+                let cell = (cy * self.cols + cx) as usize;
+                let start = self.cell_start[cell] as usize;
+                let end   = self.cell_start[cell + 1] as usize;
+                for &pt in &self.sorted_pts[start..end] {
+                    if let Some(xy) = self.screen_xy[pt as usize] {
+                        f(pt, xy);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Streaming buffer metadata ─────────────────────────────────────────────────
@@ -238,7 +299,12 @@ struct Actor {
 
 impl Actor {
     /// Rebuild `pick_cache` when VP matrix or pixel dimensions have changed.
+    /// No-op when positions are not stored (pick storage disabled).
     fn ensure_pick_cache(&mut self, vp: glam::Mat4, w: f32, h: f32) {
+        if self.positions.is_empty() {
+            self.pick_cache = None;
+            return;
+        }
         if let Some(ref c) = self.pick_cache {
             if c.vp == vp && c.w == w && c.h == h { return; }
         }
@@ -257,6 +323,17 @@ struct ScreenshotCache {
     padded_row: u32,
 }
 
+// ── Render surface (windowed vs. offscreen) ───────────────────────────────────
+
+enum RenderSurface {
+    Windowed {
+        surface: wgpu::Surface<'static>,
+        surface_config: wgpu::SurfaceConfiguration,
+    },
+    /// No OS window — renders to an off-screen texture and returns raw bytes.
+    Offscreen,
+}
+
 // ── Cached label (pre-shaped, world position only) ────────────────────────────
 
 struct CachedLabel {
@@ -273,13 +350,55 @@ struct ScalarBarLabel {
     py: f32,
 }
 
+// ── User label (world-space, per-label color/size/anchor) ─────────────────────
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LabelAnchor {
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl LabelAnchor {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Left,
+            2 => Self::Right,
+            3 => Self::Top,
+            4 => Self::Bottom,
+            _ => Self::Center,
+        }
+    }
+}
+
+struct UserLabel {
+    id: u64,
+    text: String,
+    glyph_buf: Buffer,
+    world_pos: Vec3,
+    color: [f32; 4],
+    size: f32,
+    anchor: LabelAnchor,
+    visible: bool,
+}
+
+fn build_label_buffer(font_system: &mut FontSystem, text: &str, size: f32) -> Buffer {
+    let line_h = size * 1.4;
+    let mut buf = Buffer::new(font_system, Metrics::new(size, line_h));
+    buf.set_size(font_system, Some(512.0), Some(line_h * 2.0));
+    buf.set_text(font_system, text, Attrs::new().family(Family::SansSerif), Shaping::Basic);
+    buf.shape_until_scroll(font_system, false);
+    buf
+}
+
 // ── Renderer ─────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
+    render_surface: RenderSurface,
 
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
@@ -376,6 +495,21 @@ pub struct Renderer {
     /// 3-bit sentinel tracking which bounding-box face the camera is on per axis.
     /// 0xFF on init so the first render always builds the geometry with the real eye.
     grid_face_bits: u8,
+
+    /// When false, actor position vecs are kept empty to save RAM.
+    /// Pick/hover operations silently skip actors without stored positions.
+    pub store_pick_data: bool,
+
+    // ── User-defined world-space text labels ──────────────────────────────────
+    user_labels: Vec<UserLabel>,
+    next_user_label_id: u64,
+
+    // ── Mesh overlay actors (convex hulls, ellipsoids) ────────────────────────
+    mesh_actors: Vec<MeshActor>,
+    next_mesh_actor_id: u64,
+    mesh_pipeline_opaque: wgpu::RenderPipeline,
+    mesh_pipeline_transparent: wgpu::RenderPipeline,
+    mesh_pipeline_wireframe: wgpu::RenderPipeline,
 }
 
 impl Renderer {
@@ -523,11 +657,15 @@ impl Renderer {
 
         let camera = Camera::fit(Vec3::ZERO, 1.0, width as f32 / height.max(1) as f32);
 
+        let mesh_wgsl = include_str!("shaders/mesh.wgsl");
+        let mesh_pipeline_opaque      = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
+        let mesh_pipeline_transparent = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
+        let mesh_pipeline_wireframe   = build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
+
         Ok(Self {
             device,
             queue,
-            surface,
-            surface_config,
+            render_surface: RenderSurface::Windowed { surface, surface_config },
             depth_texture,
             depth_view,
             point_pipeline,
@@ -590,7 +728,224 @@ impl Renderer {
             bg_color: [0.05, 0.05, 0.07, 1.0],
             axis_label_texts: ["X".to_string(), "Y".to_string(), "Z".to_string()],
             grid_face_bits: 0xFF,
+            store_pick_data: true,
+            user_labels: Vec::new(),
+            next_user_label_id: 0,
+            mesh_actors: Vec::new(),
+            next_mesh_actor_id: 0,
+            mesh_pipeline_opaque,
+            mesh_pipeline_transparent,
+            mesh_pipeline_wireframe,
         })
+    }
+
+    /// Create a headless renderer that renders to an off-screen texture.
+    /// No OS window is required; suitable for Jupyter / server-side rendering.
+    pub fn new_offscreen(
+        width: u32,
+        height: u32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..Default::default()
+        });
+
+        // No surface — adapter is selected on power preference alone.
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .ok_or("No suitable GPU adapter found for offscreen rendering")?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("dragonsci_offscreen"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+            },
+            None,
+        ))?;
+
+        // Fixed known-good format for offscreen render targets.
+        let surface_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+        let (depth_texture, depth_view) = make_depth_texture(&device, width.max(1), height.max(1));
+
+        let dummy_uniforms = Uniforms {
+            view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            screen_size: [width as f32, height as f32],
+            style: 0,
+            _pad: 0.0,
+        };
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("uniforms"),
+            contents: bytemuck::bytes_of(&dummy_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("uniform_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+                },
+                count: None,
+            }],
+        });
+
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("uniform_bg"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let overlay_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("overlay_uniforms"),
+            contents: bytemuck::bytes_of(&dummy_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let overlay_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay_bg"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: overlay_uniform_buf.as_entire_binding(),
+            }],
+        });
+
+        let point_pipeline = build_point_pipeline(
+            &device, &uniform_layout, surface_format,
+            include_str!("shaders/points.wgsl"),
+        );
+        let line_pipeline = build_line_pipeline(
+            &device, &uniform_layout, surface_format,
+            include_str!("shaders/lines.wgsl"), true,
+        );
+        let line_pipeline_nodepth = build_line_pipeline(
+            &device, &uniform_layout, surface_format,
+            include_str!("shaders/lines.wgsl"), false,
+        );
+
+        let font_system = FontSystem::new();
+        let swash_cache = SwashCache::new();
+        let glyph_cache = Cache::new(&device);
+        let viewport = Viewport::new(&device, &glyph_cache);
+        let mut text_atlas = TextAtlas::new(&device, &queue, &glyph_cache, surface_format);
+        let text_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+        );
+
+        let camera = Camera::fit(Vec3::ZERO, 1.0, width as f32 / height.max(1) as f32);
+
+        let mesh_wgsl = include_str!("shaders/mesh.wgsl");
+        let mesh_pipeline_opaque      = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
+        let mesh_pipeline_transparent = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
+        let mesh_pipeline_wireframe   = build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
+
+        Ok(Self {
+            device,
+            queue,
+            render_surface: RenderSurface::Offscreen,
+            depth_texture,
+            depth_view,
+            point_pipeline,
+            line_pipeline,
+            actors: Vec::new(),
+            next_actor_id: 0,
+            scene_actor_id: None,
+            line_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            line_count: 0,
+            uniform_buffer,
+            uniform_bind_group,
+            camera,
+            fit_center: Vec3::ZERO,
+            fit_radius: 1.0,
+            font_system,
+            swash_cache,
+            text_atlas,
+            text_renderer,
+            viewport,
+            cached_labels: Vec::new(),
+            atlas_trim_counter: 0,
+            last_grid_min: None,
+            last_grid_max: None,
+            last_data_min: None,
+            last_data_max: None,
+            tick_override: [None; 3],
+            axis_visible: [true; 3],
+            scalar_bar_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            scalar_bar_line_count: 0,
+            overlay_bind_group,
+            scalar_bar_labels: Vec::new(),
+            scalar_bar_visible: false,
+            legend_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            legend_line_count: 0,
+            legend_labels: Vec::new(),
+            legend_visible: false,
+            legend_title_stored: String::new(),
+            legend_items_stored: Vec::new(),
+            legend_position_stored: 0,
+            sel_rect_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            sel_rect_visible: false,
+            lasso_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            lasso_vert_count: 0,
+            lasso_visible: false,
+            lasso_pts: Vec::new(),
+            screenshot_cache: None,
+            line_actors: Vec::new(),
+            next_line_actor_id: 0,
+            axes_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            axes_visible: false,
+            line_pipeline_nodepth,
+            surface_format,
+            width,
+            height,
+            point_style: 0,
+            lod_factor: 1,
+            grid_visible: true,
+            major_grid_planes: false,
+            minor_grid_planes: false,
+            bg_color: [0.05, 0.05, 0.07, 1.0],
+            axis_label_texts: ["X".to_string(), "Y".to_string(), "Z".to_string()],
+            grid_face_bits: 0xFF,
+            store_pick_data: true, // always store CPU positions in offscreen mode
+            user_labels: Vec::new(),
+            next_user_label_id: 0,
+            mesh_actors: Vec::new(),
+            next_mesh_actor_id: 0,
+            mesh_pipeline_opaque,
+            mesh_pipeline_transparent,
+            mesh_pipeline_wireframe,
+        })
+    }
+
+    pub fn set_pick_storage(&mut self, enabled: bool) {
+        self.store_pick_data = enabled;
+        if !enabled {
+            for actor in &mut self.actors {
+                actor.positions.clear();
+                actor.positions.shrink_to_fit();
+                actor.pick_cache = None;
+            }
+        }
     }
 
     // ── Scalar bar ────────────────────────────────────────────────────────────
@@ -878,7 +1233,7 @@ impl Renderer {
         if let Some(sid) = self.scene_actor_id {
             if let Some(actor) = self.actors.iter_mut().find(|a| a.id == sid) {
                 actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
-                actor.positions = positions;
+                actor.positions = if self.store_pick_data { positions } else { vec![] };
                 actor.count = count;
                 actor.data_min = data_min;
                 actor.data_max = data_max;
@@ -894,7 +1249,11 @@ impl Renderer {
         Some(id)
     }
 
-    fn _add_actor_buf(&mut self, instances: &[PointInstance], positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> u32 {
+    fn _add_actor_buf(&mut self, instances: &[PointInstance], mut positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> u32 {
+        if !self.store_pick_data {
+            positions.clear();
+            positions.shrink_to_fit();
+        }
         let id = self.next_actor_id;
         self.next_actor_id += 1;
         let mut actor = Actor {
@@ -920,11 +1279,12 @@ impl Renderer {
 
     /// Replace data for an existing actor in-place. Returns false if not found.
     pub fn update_actor_data(&mut self, id: u32, instances: &[PointInstance], positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> bool {
+        let store = self.store_pick_data;
         if let Some(a) = self.actors.iter_mut().find(|a| a.id == id) {
             a.count = count;
             a.data_min = data_min;
             a.data_max = data_max;
-            a.positions = positions;
+            a.positions = if store { positions } else { vec![] };
             a.pick_cache = None;  // positions changed — invalidate pick cache
             if count > 0 {
                 a.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
@@ -965,10 +1325,15 @@ impl Renderer {
             buf.write_at(&self.queue, 0, bytemuck::cast_slice(&instances[..fill as usize]));
         }
 
+        let stream_positions = if self.store_pick_data {
+            positions[..fill as usize].to_vec()
+        } else {
+            vec![]
+        };
         self.actors.push(Actor {
             id,
             buf,
-            positions: positions[..fill as usize].to_vec(),
+            positions: stream_positions,
             count: fill,
             visible: true,
             data_min,
@@ -990,7 +1355,7 @@ impl Renderer {
     ///   writes (head → capacity, 0 → head) to avoid per-point overhead.
     ///
     /// The running bounds are expanded (never contracted) to include the new data.
-    /// Returns `false` when the ID is not a stream actor.
+    /// Returns `(false, _)` when the ID is not a stream actor; `(true, bounds_grew)` otherwise.
     pub fn append_to_stream(
         &mut self,
         id: u32,
@@ -998,18 +1363,18 @@ impl Renderer {
         new_positions: &[[f32; 3]],
         new_data_min: Vec3,
         new_data_max: Vec3,
-    ) -> bool {
+    ) -> (bool, bool) {
         let actor = match self.actors.iter_mut().find(|a| a.id == id) {
             Some(a) => a,
-            None => return false,
+            None => return (false, false),
         };
         let si = match actor.stream.as_mut() {
             Some(si) => si,
-            None => return false,
+            None => return (false, false),
         };
 
         let n = instances.len();
-        if n == 0 { return true; }
+        if n == 0 { return (true, false); }
         let inst_size = std::mem::size_of::<PointInstance>();
         let cap = si.capacity as usize;
 
@@ -1017,11 +1382,13 @@ impl Renderer {
             StreamMode::Append => {
                 let space = cap.saturating_sub(actor.count as usize);
                 let to_write = n.min(space);
-                if to_write == 0 { return true; }
+                if to_write == 0 { return (true, false); }
                 let offset = actor.count as u64 * inst_size as u64;
                 actor.buf.write_at(&self.queue, offset,
                     bytemuck::cast_slice(&instances[..to_write]));
-                actor.positions.extend_from_slice(&new_positions[..to_write]);
+                if !actor.positions.is_empty() {
+                    actor.positions.extend_from_slice(&new_positions[..to_write]);
+                }
                 actor.count += to_write as u32;
             }
             StreamMode::Ring => {
@@ -1040,16 +1407,18 @@ impl Renderer {
                         bytemuck::cast_slice(&instances[seg1_len..to_write]));
                 }
 
-                // Mirror the ring write in the CPU positions vec (for picking).
                 let new_count = (actor.count as usize + to_write).min(cap);
-                if actor.positions.len() < new_count {
-                    actor.positions.resize(new_count, [0.0; 3]);
-                }
-                for i in 0..seg1_len {
-                    actor.positions[head + i] = new_positions[i];
-                }
-                for i in 0..seg2_len {
-                    actor.positions[i] = new_positions[seg1_len + i];
+                // Mirror the ring write in the CPU positions vec (for picking).
+                if !actor.positions.is_empty() {
+                    if actor.positions.len() < new_count {
+                        actor.positions.resize(new_count, [0.0; 3]);
+                    }
+                    for i in 0..seg1_len {
+                        actor.positions[head + i] = new_positions[i];
+                    }
+                    for i in 0..seg2_len {
+                        actor.positions[i] = new_positions[seg1_len + i];
+                    }
                 }
 
                 si.write_head = ((head + to_write) % cap) as u32;
@@ -1058,10 +1427,13 @@ impl Renderer {
         }
 
         // Expand bounds (we never contract — acceptable for streaming visualisation).
+        let prev_min = actor.data_min;
+        let prev_max = actor.data_max;
         actor.data_min = actor.data_min.min(new_data_min);
         actor.data_max = actor.data_max.max(new_data_max);
+        let bounds_grew = actor.data_min != prev_min || actor.data_max != prev_max;
         actor.pick_cache = None;
-        true
+        (true, bounds_grew)
     }
 
     /// Reset a stream actor to empty; preserves the pre-allocated GPU capacity.
@@ -1130,6 +1502,12 @@ impl Renderer {
             bmax = bmax.max(la.data_max);
             any = true;
         }
+        for ma in &self.mesh_actors {
+            if !ma.visible || ma.index_count == 0 { continue; }
+            bmin = bmin.min(ma.data_min);
+            bmax = bmax.max(ma.data_max);
+            any = true;
+        }
         if any { Some((bmin, bmax)) } else { None }
     }
 
@@ -1153,9 +1531,10 @@ impl Renderer {
         for actor in &mut self.actors {
             if !actor.visible { continue; }
             actor.ensure_pick_cache(vp, w, h);
-            let cache = actor.pick_cache.as_ref().unwrap();
-            let positions = &actor.positions;
-            let actor_id = actor.id;
+            let (cache, positions, actor_id) = match actor.pick_cache.as_ref() {
+                Some(c) => (c, &actor.positions, actor.id),
+                None => continue,
+            };
             cache.for_each_in_rect(
                 screen_x - R, screen_y - R, screen_x + R, screen_y + R,
                 |i, [sx, sy]| {
@@ -1168,28 +1547,42 @@ impl Renderer {
             );
         }
 
-        // Fallback: any point within Euclidean distance R is guaranteed to be in the
-        // searched cells (if |dx| ≤ R and |dy| ≤ R then dist ≤ R).  So if the best
-        // candidate's squared distance is ≤ R², no un-searched point can be closer —
-        // we're done.  If best_dist_sq > R², the candidate came from the diagonal
-        // corner of the box (dist up to R√2 ≈ 45 px) or the box was empty, and a
-        // closer point may exist just outside the ±R band.
+        // Fallback: expand the search ring outward one cell at a time.
+        // After visiting all cells in the outer box of radius `search_r`, any
+        // unvisited point lies in a cell whose near edge is at least `search_r`
+        // screen-pixels away — so if best_dist_sq ≤ search_r², we cannot improve
+        // further and stop early.  This avoids the O(N) full-scan in most scenes.
         if best_dist_sq > R * R {
-            for actor in &mut self.actors {
-                if !actor.visible { continue; }
-                actor.ensure_pick_cache(vp, w, h);  // already built above
-                let cache = actor.pick_cache.as_ref().unwrap();
-                let positions = &actor.positions;
-                let actor_id = actor.id;
-                for (i, xy) in cache.screen_xy.iter().enumerate() {
-                    if let Some([sx, sy]) = xy {
-                        let d_sq = (sx - screen_x).powi(2) + (sy - screen_y).powi(2);
-                        if d_sq < best_dist_sq {
-                            best_dist_sq = d_sq;
-                            best = Some((actor_id, i as u32, positions[i]));
-                        }
-                    }
+            let mut inner_r = R;
+            let max_r = w.hypot(h); // screen diagonal — no point is farther
+            while inner_r < max_r {
+                let outer_r = inner_r + GRID_CELL_PX;
+                for actor in &mut self.actors {
+                    if !actor.visible { continue; }
+                    // Cache is already built from the fast-path loop above.
+                    let (cache, positions, actor_id) = match actor.pick_cache.as_ref() {
+                        Some(c) => (c, &actor.positions, actor.id),
+                        None => continue,
+                    };
+                    cache.for_each_in_ring(
+                        screen_x - outer_r, screen_y - outer_r,
+                        screen_x + outer_r, screen_y + outer_r,
+                        screen_x - inner_r, screen_y - inner_r,
+                        screen_x + inner_r, screen_y + inner_r,
+                        |i, [sx, sy]| {
+                            let d_sq = (sx - screen_x).powi(2) + (sy - screen_y).powi(2);
+                            if d_sq < best_dist_sq {
+                                best_dist_sq = d_sq;
+                                best = Some((actor_id, i, positions[i as usize]));
+                            }
+                        },
+                    );
                 }
+                // Every unvisited point is in a cell starting at or beyond inner_r.
+                if best_dist_sq <= inner_r * inner_r {
+                    break;
+                }
+                inner_r = outer_r;
             }
         }
         best
@@ -1209,8 +1602,10 @@ impl Renderer {
         for actor in &mut self.actors {
             if !actor.visible { continue; }
             actor.ensure_pick_cache(vp, w, h);
-            let cache = actor.pick_cache.as_ref().unwrap();
-            let actor_id = actor.id;
+            let (cache, actor_id) = match actor.pick_cache.as_ref() {
+                Some(c) => (c, actor.id),
+                None => continue,
+            };
             cache.for_each_in_rect(sx_min, sy_min, sx_max, sy_max, |i, [sx, sy]| {
                 if sx >= sx_min && sx <= sx_max && sy >= sy_min && sy <= sy_max {
                     result.push((actor_id, i));
@@ -1396,8 +1791,10 @@ impl Renderer {
         for actor in &mut self.actors {
             if !actor.visible { continue; }
             actor.ensure_pick_cache(vp, w, h);
-            let cache = actor.pick_cache.as_ref().unwrap();
-            let actor_id = actor.id;
+            let (cache, actor_id) = match actor.pick_cache.as_ref() {
+                Some(c) => (c, actor.id),
+                None => continue,
+            };
             cache.for_each_in_rect(bb_x0, bb_y0, bb_x1, bb_y1, |i, [sx, sy]| {
                 if point_in_polygon(sx, sy, screen_verts) {
                     result.push((actor_id, i));
@@ -1647,9 +2044,11 @@ impl Renderer {
         }
         self.width = w;
         self.height = h;
-        self.surface_config.width = w;
-        self.surface_config.height = h;
-        self.surface.configure(&self.device, &self.surface_config);
+        if let RenderSurface::Windowed { ref mut surface_config, ref surface } = self.render_surface {
+            surface_config.width = w;
+            surface_config.height = h;
+            surface.configure(&self.device, surface_config);
+        }
         let (dt, dv) = make_depth_texture(&self.device, w, h);
         self.depth_texture = dt;
         self.depth_view = dv;
@@ -1816,6 +2215,12 @@ impl Renderer {
                     }
                 }
             }
+
+            // ── Mesh actors (convex hulls, ellipsoids) ─────────────────────────
+            draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
+                             &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
+                             &self.uniform_bind_group, view_proj, &mut pass);
+
             pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(0, &self.overlay_bind_group, &[]);
             if self.scalar_bar_visible && self.scalar_bar_line_count > 0 {
@@ -1898,11 +2303,29 @@ impl Renderer {
         Ok((w, h, pixels))
     }
 
+    /// Render one frame offscreen and return raw RGBA bytes (width × height × 4).
+    /// Only valid when the renderer was created with `new_offscreen()`.
+    /// For windowed renderers use `screenshot()` instead.
+    pub fn render_offscreen(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let (_w, _h, pixels) = self.screenshot()?;
+        Ok(pixels)
+    }
+
     // ── Render ────────────────────────────────────────────────────────────────
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (output, view) = match &self.render_surface {
+            RenderSurface::Windowed { surface, .. } => {
+                let output = surface.get_current_texture()?;
+                let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                (Some(output), view)
+            }
+            RenderSurface::Offscreen => {
+                // Offscreen mode: callers should use render_offscreen() instead.
+                // Silently succeed without presenting anything.
+                return Ok(());
+            }
+        };
 
         // Rebuild grid geometry if the camera has crossed an axis midplane since
         // the last frame.  This is cheap (small vertex/label counts) and only
@@ -1983,6 +2406,11 @@ impl Renderer {
                 }
             }
 
+            // ── Mesh actors (convex hulls, ellipsoids) ─────────────────────────
+            draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
+                             &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
+                             &self.uniform_bind_group, view_proj, &mut pass);
+
             // Scalar bar: screen-space overlay drawn with identity view_proj.
             pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(0, &self.overlay_bind_group, &[]);
@@ -2029,7 +2457,9 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        if let Some(output) = output {
+            output.present();
+        }
 
         // Trim glyph atlas every 120 frames — infrequent enough to not defeat caching
         self.atlas_trim_counter += 1;
@@ -2039,6 +2469,169 @@ impl Renderer {
         }
 
         Ok(())
+    }
+
+    // ── User label API ────────────────────────────────────────────────────────
+
+    pub fn add_user_label(
+        &mut self,
+        x: f32, y: f32, z: f32,
+        text: &str,
+        color: [f32; 4],
+        size: f32,
+        anchor: u8,
+    ) -> u64 {
+        let id = self.next_user_label_id;
+        self.next_user_label_id += 1;
+        let glyph_buf = build_label_buffer(&mut self.font_system, text, size);
+        self.user_labels.push(UserLabel {
+            id,
+            text: text.to_string(),
+            glyph_buf,
+            world_pos: Vec3::new(x, y, z),
+            color,
+            size,
+            anchor: LabelAnchor::from_u8(anchor),
+            visible: true,
+        });
+        id
+    }
+
+    pub fn update_user_label(
+        &mut self,
+        id: u64,
+        pos: Option<[f32; 3]>,
+        text: Option<&str>,
+        color: Option<[f32; 4]>,
+        size: Option<f32>,
+        anchor: Option<u8>,
+    ) {
+        let Some(label) = self.user_labels.iter_mut().find(|l| l.id == id) else { return };
+        if let Some(p) = pos   { label.world_pos = Vec3::new(p[0], p[1], p[2]); }
+        if let Some(c) = color { label.color = c; }
+        if let Some(a) = anchor { label.anchor = LabelAnchor::from_u8(a); }
+        // Rebuild the glyph buffer when text or size changes.
+        let new_text = text.map(|t| t.to_string());
+        let new_size = size.filter(|&s| (s - label.size).abs() > 0.01);
+        if new_text.is_some() || new_size.is_some() {
+            if let Some(s) = new_size { label.size = s; }
+            if let Some(t) = new_text { label.text = t; }
+            // Borrow fields individually to satisfy the borrow checker.
+            let buf = build_label_buffer(&mut self.font_system, &label.text.clone(), label.size);
+            label.glyph_buf = buf;
+        }
+    }
+
+    pub fn remove_user_label(&mut self, id: u64) {
+        self.user_labels.retain(|l| l.id != id);
+    }
+
+    pub fn set_user_label_visible(&mut self, id: u64, visible: bool) {
+        if let Some(label) = self.user_labels.iter_mut().find(|l| l.id == id) {
+            label.visible = visible;
+        }
+    }
+
+    pub fn clear_user_labels(&mut self) {
+        self.user_labels.clear();
+    }
+
+    // ── Mesh actor API ────────────────────────────────────────────────────────
+
+    pub fn add_mesh_actor(
+        &mut self,
+        vertices: &[[f32; 3]],
+        indices: &[[u32; 3]],
+        color: [f32; 4],
+        wireframe: bool,
+    ) -> u64 {
+        let id = self.next_mesh_actor_id;
+        self.next_mesh_actor_id += 1;
+
+        let (data_min, data_max) = mesh_bounds(vertices);
+        let mesh_verts: Vec<MeshVertex> = vertices.iter()
+            .map(|&p| MeshVertex { position: p, color })
+            .collect();
+
+        let index_bytes: Vec<u8>;
+        let index_count: u32;
+        if wireframe {
+            let wire = triangles_to_wireframe_indices(indices);
+            index_count = wire.len() as u32;
+            index_bytes = bytemuck::cast_slice::<u32, u8>(&wire).to_vec();
+        } else {
+            let flat: Vec<u32> = indices.iter().flat_map(|&[a, b, c]| [a, b, c]).collect();
+            index_count = flat.len() as u32;
+            index_bytes = bytemuck::cast_slice::<u32, u8>(&flat).to_vec();
+        }
+
+        let mut vbuf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
+        let mut ibuf = GrowableBuffer::new(wgpu::BufferUsages::INDEX);
+        vbuf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mesh_verts));
+        ibuf.upload(&self.device, &self.queue, &index_bytes);
+
+        self.mesh_actors.push(MeshActor { id, vbuf, ibuf, index_count, visible: true,
+                                          wireframe, color, data_min, data_max });
+        id
+    }
+
+    pub fn update_mesh_actor(
+        &mut self,
+        id: u64,
+        vertices: &[[f32; 3]],
+        indices: &[[u32; 3]],
+        color: [f32; 4],
+        wireframe: bool,
+    ) -> bool {
+        let actor = match self.mesh_actors.iter_mut().find(|a| a.id == id) {
+            Some(a) => a,
+            None => return false,
+        };
+        let (data_min, data_max) = mesh_bounds(vertices);
+        let mesh_verts: Vec<MeshVertex> = vertices.iter()
+            .map(|&p| MeshVertex { position: p, color })
+            .collect();
+        let index_bytes: Vec<u8>;
+        let index_count: u32;
+        if wireframe {
+            let wire = triangles_to_wireframe_indices(indices);
+            index_count = wire.len() as u32;
+            index_bytes = bytemuck::cast_slice::<u32, u8>(&wire).to_vec();
+        } else {
+            let flat: Vec<u32> = indices.iter().flat_map(|&[a, b, c]| [a, b, c]).collect();
+            index_count = flat.len() as u32;
+            index_bytes = bytemuck::cast_slice::<u32, u8>(&flat).to_vec();
+        }
+        actor.data_min = data_min;
+        actor.data_max = data_max;
+        actor.color = color;
+        actor.wireframe = wireframe;
+        actor.index_count = index_count;
+        actor.vbuf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mesh_verts));
+        actor.ibuf.upload(&self.device, &self.queue, &index_bytes);
+        true
+    }
+
+    pub fn remove_mesh_actor(&mut self, id: u64) -> bool {
+        if let Some(pos) = self.mesh_actors.iter().position(|a| a.id == id) {
+            self.mesh_actors.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_mesh_actor_visibility(&mut self, id: u64, visible: bool) -> bool {
+        if let Some(a) = self.mesh_actors.iter_mut().find(|a| a.id == id) {
+            a.visible = visible;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_mesh_actors(&mut self) {
+        self.mesh_actors.clear();
     }
 
     fn prepare_text_labels(&mut self, vp: glam::Mat4) {
@@ -2136,6 +2729,46 @@ impl Renderer {
                     custom_glyphs: &[],
                 });
             }
+        }
+
+        // User-defined world-space labels
+        for label in &self.user_labels {
+            if !label.visible { continue; }
+            let clip = vp * label.world_pos.extend(1.0);
+            if clip.w <= 0.0 { continue; }
+            let ndc = clip.truncate() / clip.w;
+            if ndc.x < -1.1 || ndc.x > 1.1 || ndc.y < -1.1 || ndc.y > 1.1 { continue; }
+            let sx = (ndc.x + 1.0) * 0.5 * w as f32;
+            let sy = (1.0 - ndc.y) * 0.5 * h as f32;
+
+            // Measure rendered text width from layout runs for anchor offset.
+            let text_w: f32 = label.glyph_buf.layout_runs()
+                .flat_map(|r| r.glyphs.iter())
+                .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
+            let text_h = label.glyph_buf.metrics().line_height;
+
+            let (ox, oy) = match label.anchor {
+                LabelAnchor::Center => (-text_w * 0.5, -text_h * 0.5),
+                LabelAnchor::Left   => (4.0, -text_h * 0.5),
+                LabelAnchor::Right  => (-text_w - 4.0, -text_h * 0.5),
+                LabelAnchor::Top    => (-text_w * 0.5, -text_h - 4.0),
+                LabelAnchor::Bottom => (-text_w * 0.5, 4.0),
+            };
+
+            let r = (label.color[0].clamp(0.0, 1.0) * 255.0) as u8;
+            let g_ch = (label.color[1].clamp(0.0, 1.0) * 255.0) as u8;
+            let b = (label.color[2].clamp(0.0, 1.0) * 255.0) as u8;
+            let a = (label.color[3].clamp(0.0, 1.0) * 255.0) as u8;
+
+            text_areas.push(TextArea {
+                buffer: &label.glyph_buf,
+                left: sx + ox,
+                top: sy + oy,
+                scale: 1.0,
+                bounds: TextBounds::default(),
+                default_color: Color::rgba(r, g_ch, b, a),
+                custom_glyphs: &[],
+            });
         }
 
         // Always call prepare — even with an empty list, this clears any
@@ -2310,6 +2943,224 @@ fn build_line_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+// ── Mesh pipeline builders ────────────────────────────────────────────────────
+
+fn build_mesh_pipeline(
+    device: &wgpu::Device,
+    uniform_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    wgsl: &str,
+    transparent: bool,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mesh_shader"),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mesh_layout"),
+        bind_group_layouts: &[uniform_layout],
+        push_constant_ranges: &[],
+    });
+    let stride = std::mem::size_of::<MeshVertex>() as u64;
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if transparent { "mesh_transparent" } else { "mesh_opaque" }),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: stride,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                ],
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: !transparent,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: if transparent { Some(wgpu::BlendState::ALPHA_BLENDING) } else { None },
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_wireframe_pipeline(
+    device: &wgpu::Device,
+    uniform_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    wgsl: &str,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wireframe_shader"),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("wireframe_layout"),
+        bind_group_layouts: &[uniform_layout],
+        push_constant_ranges: &[],
+    });
+    let stride = std::mem::size_of::<MeshVertex>() as u64;
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mesh_wireframe"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: stride,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                ],
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+// ── Mesh render helper (called from both render() and screenshot()) ───────────
+
+fn draw_mesh_actors<'a>(
+    mesh_actors: &'a [MeshActor],
+    pipeline_wire: &'a wgpu::RenderPipeline,
+    pipeline_opaque: &'a wgpu::RenderPipeline,
+    pipeline_transparent: &'a wgpu::RenderPipeline,
+    bind_group: &'a wgpu::BindGroup,
+    view_proj: glam::Mat4,
+    pass: &mut wgpu::RenderPass<'a>,
+) {
+    // 1. Wireframe actors — alpha-blended, back-to-front sorted
+    let mut wire_idx: Vec<(usize, f32)> = mesh_actors.iter().enumerate()
+        .filter(|(_, ma)| ma.visible && ma.wireframe && ma.index_count > 0)
+        .map(|(i, ma)| {
+            let c = (ma.data_min + ma.data_max) * 0.5;
+            let clip = view_proj * glam::Vec4::new(c.x, c.y, c.z, 1.0);
+            let depth = if clip.w.abs() > 1e-7 { clip.z / clip.w } else { 0.0 };
+            (i, depth)
+        })
+        .collect();
+    wire_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pass.set_pipeline(pipeline_wire);
+    pass.set_bind_group(0, bind_group, &[]);
+    for (i, _) in &wire_idx {
+        let ma = &mesh_actors[*i];
+        if let (Some(vs), Some(is)) = (ma.vbuf.slice(), ma.ibuf.slice()) {
+            pass.set_vertex_buffer(0, vs);
+            pass.set_index_buffer(is, wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..ma.index_count, 0, 0..1);
+        }
+    }
+
+    // Partition filled actors by alpha for depth-correct rendering.
+    let mut opaque_idx: Vec<usize> = Vec::new();
+    let mut transp_idx: Vec<(usize, f32)> = Vec::new();
+    for (i, ma) in mesh_actors.iter().enumerate() {
+        if !ma.visible || ma.wireframe || ma.index_count == 0 { continue; }
+        let c = (ma.data_min + ma.data_max) * 0.5;
+        let clip = view_proj * glam::Vec4::new(c.x, c.y, c.z, 1.0);
+        let depth = if clip.w.abs() > 1e-7 { clip.z / clip.w } else { 0.0 };
+        if ma.color[3] >= 1.0 {
+            opaque_idx.push(i);
+        } else {
+            transp_idx.push((i, depth));
+        }
+    }
+
+    // 2. Opaque filled meshes
+    pass.set_pipeline(pipeline_opaque);
+    pass.set_bind_group(0, bind_group, &[]);
+    for i in &opaque_idx {
+        let ma = &mesh_actors[*i];
+        if let (Some(vs), Some(is)) = (ma.vbuf.slice(), ma.ibuf.slice()) {
+            pass.set_vertex_buffer(0, vs);
+            pass.set_index_buffer(is, wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..ma.index_count, 0, 0..1);
+        }
+    }
+
+    // 3. Transparent filled meshes — back-to-front (highest NDC depth drawn first)
+    transp_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    pass.set_pipeline(pipeline_transparent);
+    pass.set_bind_group(0, bind_group, &[]);
+    for (i, _) in &transp_idx {
+        let ma = &mesh_actors[*i];
+        if let (Some(vs), Some(is)) = (ma.vbuf.slice(), ma.ibuf.slice()) {
+            pass.set_vertex_buffer(0, vs);
+            pass.set_index_buffer(is, wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..ma.index_count, 0, 0..1);
+        }
+    }
+}
+
+// ── Mesh geometry helpers ─────────────────────────────────────────────────────
+
+fn mesh_bounds(vertices: &[[f32; 3]]) -> (Vec3, Vec3) {
+    let mut bmin = Vec3::splat(f32::INFINITY);
+    let mut bmax = Vec3::splat(f32::NEG_INFINITY);
+    for &[x, y, z] in vertices {
+        let v = Vec3::new(x, y, z);
+        bmin = bmin.min(v);
+        bmax = bmax.max(v);
+    }
+    if bmin.x > bmax.x { (Vec3::ZERO, Vec3::ZERO) } else { (bmin, bmax) }
+}
+
+fn triangles_to_wireframe_indices(indices: &[[u32; 3]]) -> Vec<u32> {
+    let mut wire = Vec::with_capacity(indices.len() * 6);
+    for &[a, b, c] in indices {
+        wire.extend_from_slice(&[a, b, b, c, c, a]);
+    }
+    wire
 }
 
 // ── Unit tests (no GPU required) ─────────────────────────────────────────────

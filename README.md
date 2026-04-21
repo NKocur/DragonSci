@@ -9,9 +9,17 @@ layout — no separate window or subprocess.
 
 ## Installation
 
+**Tkinter** (default):
 ```bash
 pip install dragonsci
 ```
+
+**JupyterLab / Jupyter Notebook**:
+```bash
+pip install "dragonsci[notebook]"
+```
+
+The `[notebook]` extra adds `jupyter_rfb`, `ipywidgets`, and `Pillow`.
 
 Pre-built wheels will be published to PyPI for Python 3.9–3.12 on Windows,
 macOS, and Linux once a CI release pipeline is in place. Until then, install
@@ -42,6 +50,8 @@ run, or enable it to upload to PyPI.
 
 ## Quick start
 
+### Tkinter
+
 ```python
 import tkinter as tk
 import numpy as np
@@ -55,6 +65,37 @@ pts = np.random.default_rng(0).standard_normal((250_000, 3)).astype(np.float32)
 widget.set_points(pts, colormap="plasma")
 
 root.mainloop()
+```
+
+### JupyterLab / Jupyter Notebook
+
+```python
+from dragonsci import scatter3d   # requires dragonsci[notebook]
+import numpy as np
+
+w = scatter3d(width=800, height=600)
+w.set_points(np.random.randn(50_000, 3).astype("f4"), colormap="viridis")
+w  # display in cell
+```
+
+For 2-D scatter plots pass `(N, 2)` or `(N, 3)` arrays to `JupyterScatter2D`:
+
+```python
+from dragonsci import JupyterScatter2D
+import numpy as np
+
+w = JupyterScatter2D(width=700, height=500)
+w.set_points(np.random.randn(20_000, 2).astype("f4"), colormap="plasma")
+w
+```
+
+Point picking is available via callback:
+
+```python
+def on_hit(result):
+    print(result["actor"], result["index"], result["point"])
+
+w.enable_point_picking(on_pick=on_hit)
 ```
 
 ## API

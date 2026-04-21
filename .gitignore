@@ -5,6 +5,7 @@
 python/dragonsci/*.pyd
 python/dragonsci/*.so
 python/dragonsci/*.dylib
+python/dragonsci/*.pdb
 
 # Python packaging artifacts
 dist/

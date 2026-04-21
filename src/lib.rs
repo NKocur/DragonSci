@@ -326,6 +326,33 @@ impl PyScatterRenderer {
         })
     }
 
+    /// Create a headless offscreen renderer for use in Jupyter / server-side rendering.
+    /// No OS window handle is required.
+    #[staticmethod]
+    #[pyo3(signature = (width, height))]
+    fn create_offscreen(width: u32, height: u32) -> PyResult<Self> {
+        let inner = Renderer::new_offscreen(width, height)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(Self {
+            inner,
+            camera_fitted: false,
+            scalar_bar_visible: false,
+            scalar_bar_vmin: 0.0,
+            scalar_bar_vmax: 1.0,
+            scalar_bar_log: false,
+            scalar_bar_cmap: "viridis".to_string(),
+            scalar_bar_title: String::new(),
+        })
+    }
+
+    /// Render one frame and return raw RGBA bytes (width × height × 4).
+    /// Only valid for renderers created with `create_offscreen()`.
+    fn render_offscreen(&mut self, _py: Python<'_>) -> PyResult<Vec<u8>> {
+        self.inner
+            .render_offscreen()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     /// Upload point cloud data, replacing any previous scene content.
     ///
     /// Priority: explicit ``colors`` > ``scalars`` mapped through ``colormap`` > Z-position mapped through ``colormap``.
@@ -528,8 +555,8 @@ impl PyScatterRenderer {
                 Some((inst, cpu, _, mn, mx)) => (inst, cpu, mn, mx),
             };
 
-        let ok = self.inner.append_to_stream(handle, &instances, &pos_cpu, bmin, bmax);
-        if ok { self.refresh_scene_bounds(false); }
+        let (ok, bounds_grew) = self.inner.append_to_stream(handle, &instances, &pos_cpu, bmin, bmax);
+        if ok && bounds_grew { self.refresh_scene_bounds(false); }
         Ok(ok)
     }
 
@@ -540,6 +567,14 @@ impl PyScatterRenderer {
         let ok = self.inner.clear_stream(handle);
         if ok { self.refresh_scene_bounds(false); }
         ok
+    }
+
+    /// Enable or disable CPU-side position storage used for picking and hover.
+    ///
+    /// When disabled, pick/hover operations silently find nothing, saving
+    /// one full-sized `Vec<[f32;3]>` per actor.  Call before adding points.
+    fn set_pick_storage(&mut self, enabled: bool) {
+        self.inner.set_pick_storage(enabled);
     }
 
     fn render(&mut self) -> PyResult<()> {
@@ -646,6 +681,19 @@ impl PyScatterRenderer {
         })
     }
 
+    /// Return [xmin, ymin, xmax, ymax] world-space view bounds for the 2D parallel view.
+    fn get_view_bounds_2d(&self) -> [f32; 4] {
+        let cam = &self.inner.camera;
+        let half_h = cam.distance * (cam.fov_y * 0.5).tan();
+        let half_w = half_h * cam.aspect;
+        [
+            cam.target.x - half_w,
+            cam.target.y - half_h,
+            cam.target.x + half_w,
+            cam.target.y + half_h,
+        ]
+    }
+
     /// Restore a camera state previously returned by ``get_camera()``.
     fn set_camera(&mut self, state: &pyo3::Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
         use pyo3::types::PyAnyMethods;
@@ -750,33 +798,23 @@ impl PyScatterRenderer {
 
     /// Return all points inside a screen-space rectangle.
     ///
-    /// Returns a list of ``{"actor": int, "index": int}`` dicts.
-    fn pick_rectangle(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<pyo3::Py<pyo3::types::PyDict>> {
+    /// Returns ``(actor_ids, point_indices)`` — two parallel ``list[int]`` arrays.
+    fn pick_rectangle(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) -> (Vec<u32>, Vec<u32>) {
         let hits = self.inner.pick_rectangle(x0, y0, x1, y1);
-        Python::with_gil(|py| {
-            hits.into_iter().map(|(actor_id, idx)| {
-                let d = pyo3::types::PyDict::new_bound(py);
-                d.set_item("actor", actor_id).ok();
-                d.set_item("index", idx).ok();
-                d.into()
-            }).collect()
-        })
+        let actors: Vec<u32> = hits.iter().map(|(a, _)| *a).collect();
+        let indices: Vec<u32> = hits.iter().map(|(_, i)| *i).collect();
+        (actors, indices)
     }
 
     /// Return all points inside a screen-space polygon.
     ///
     /// `verts` is a list of ``[x, y]`` screen-coordinate pairs (pixels).
-    /// Returns a list of ``{"actor": int, "index": int}`` dicts.
-    fn pick_polygon(&mut self, verts: Vec<[f32; 2]>) -> Vec<pyo3::Py<pyo3::types::PyDict>> {
+    /// Returns ``(actor_ids, point_indices)`` — two parallel ``list[int]`` arrays.
+    fn pick_polygon(&mut self, verts: Vec<[f32; 2]>) -> (Vec<u32>, Vec<u32>) {
         let hits = self.inner.pick_polygon(&verts);
-        Python::with_gil(|py| {
-            hits.into_iter().map(|(actor_id, idx)| {
-                let d = pyo3::types::PyDict::new_bound(py);
-                d.set_item("actor", actor_id).ok();
-                d.set_item("index", idx).ok();
-                d.into()
-            }).collect()
-        })
+        let actors: Vec<u32> = hits.iter().map(|(a, _)| *a).collect();
+        let indices: Vec<u32> = hits.iter().map(|(_, i)| *i).collect();
+        (actors, indices)
     }
 
     /// Show an in-progress selection rectangle (screen coords, pixels).
@@ -815,17 +853,12 @@ impl PyScatterRenderer {
     }
 
     /// Finish the lasso: run polygon picking against the recorded path,
-    /// clear the overlay, and return matching ``{"actor": int, "index": int}`` dicts.
-    fn lasso_end(&mut self) -> Vec<pyo3::Py<pyo3::types::PyDict>> {
+    /// clear the overlay, and return ``(actor_ids, point_indices)`` arrays.
+    fn lasso_end(&mut self) -> (Vec<u32>, Vec<u32>) {
         let hits = self.inner.lasso_end();
-        Python::with_gil(|py| {
-            hits.into_iter().map(|(actor_id, idx)| {
-                let d = pyo3::types::PyDict::new_bound(py);
-                d.set_item("actor", actor_id).ok();
-                d.set_item("index", idx).ok();
-                d.into()
-            }).collect()
-        })
+        let actors: Vec<u32> = hits.iter().map(|(a, _)| *a).collect();
+        let indices: Vec<u32> = hits.iter().map(|(_, i)| *i).collect();
+        (actors, indices)
     }
 
     /// Cancel the active lasso without picking.
@@ -964,6 +997,100 @@ impl PyScatterRenderer {
     #[pyo3(signature = (x=true, y=true, z=true))]
     fn set_axis_visible(&mut self, x: bool, y: bool, z: bool) {
         self.inner.set_axis_visible(x, y, z);
+    }
+
+    // ── User label API ─────────────────────────────────────────────────────────
+
+    /// Add a world-space text label.  Returns an opaque handle (u64).
+    /// `anchor`: 0=Center, 1=Left, 2=Right, 3=Top, 4=Bottom
+    #[pyo3(signature = (x, y, z, text, color, size, anchor=0))]
+    fn add_user_label(
+        &mut self,
+        x: f32, y: f32, z: f32,
+        text: &str,
+        color: [f32; 4],
+        size: f32,
+        anchor: u8,
+    ) -> u64 {
+        self.inner.add_user_label(x, y, z, text, color, size, anchor)
+    }
+
+    /// Update fields of an existing label.  Pass ``None`` to keep the current value.
+    #[pyo3(signature = (id, pos=None, text=None, color=None, size=None, anchor=None))]
+    fn update_user_label(
+        &mut self,
+        id: u64,
+        pos: Option<[f32; 3]>,
+        text: Option<&str>,
+        color: Option<[f32; 4]>,
+        size: Option<f32>,
+        anchor: Option<u8>,
+    ) {
+        self.inner.update_user_label(id, pos, text, color, size, anchor);
+    }
+
+    fn remove_user_label(&mut self, id: u64) {
+        self.inner.remove_user_label(id);
+    }
+
+    fn set_user_label_visible(&mut self, id: u64, visible: bool) {
+        self.inner.set_user_label_visible(id, visible);
+    }
+
+    fn clear_user_labels(&mut self) {
+        self.inner.clear_user_labels();
+    }
+
+    // ── Mesh overlay API ───────────────────────────────────────────────────────
+
+    fn add_mesh(
+        &mut self,
+        vertices: PyReadonlyArray2<f32>,
+        indices: PyReadonlyArray2<u32>,
+        color: [f32; 4],
+        wireframe: bool,
+    ) -> PyResult<u64> {
+        let v = vertices.as_array();
+        let nv = v.nrows();
+        let verts: Vec<[f32; 3]> = (0..nv).map(|i| [v[[i,0]], v[[i,1]], v[[i,2]]]).collect();
+        let idx = indices.as_array();
+        let nf = idx.nrows();
+        let idxs: Vec<[u32; 3]> = (0..nf).map(|i| [idx[[i,0]], idx[[i,1]], idx[[i,2]]]).collect();
+        let handle = self.inner.add_mesh_actor(&verts, &idxs, color, wireframe);
+        self.refresh_scene_bounds(true);
+        Ok(handle)
+    }
+
+    fn update_mesh(
+        &mut self,
+        handle: u64,
+        vertices: PyReadonlyArray2<f32>,
+        indices: PyReadonlyArray2<u32>,
+        color: [f32; 4],
+        wireframe: bool,
+    ) {
+        let v = vertices.as_array();
+        let nv = v.nrows();
+        let verts: Vec<[f32; 3]> = (0..nv).map(|i| [v[[i,0]], v[[i,1]], v[[i,2]]]).collect();
+        let idx = indices.as_array();
+        let nf = idx.nrows();
+        let idxs: Vec<[u32; 3]> = (0..nf).map(|i| [idx[[i,0]], idx[[i,1]], idx[[i,2]]]).collect();
+        self.inner.update_mesh_actor(handle, &verts, &idxs, color, wireframe);
+        self.refresh_scene_bounds(false);
+    }
+
+    fn remove_mesh(&mut self, handle: u64) {
+        self.inner.remove_mesh_actor(handle);
+        self.refresh_scene_bounds(false);
+    }
+
+    fn set_mesh_visibility(&mut self, handle: u64, visible: bool) {
+        self.inner.set_mesh_actor_visibility(handle, visible);
+    }
+
+    fn clear_meshes(&mut self) {
+        self.inner.clear_mesh_actors();
+        self.refresh_scene_bounds(false);
     }
 
     #[staticmethod]

@@ -146,12 +146,12 @@ def _clamp_sizes(arr: "np.ndarray") -> "np.ndarray":
 def _try_encode_categorical(
     values: np.ndarray,
 ) -> "tuple[np.ndarray, list[tuple[str, tuple[float, float, float]]]] | None":
-    """Single-pass categorical detection + encoding.
+    """Vectorized categorical detection + encoding.
 
     Returns ``(rgb_array, legend_items)`` when ``values`` looks categorical,
-    ``None`` otherwise.  Stops early when the cardinality exceeds
-    ``_CATEGORICAL_THRESHOLD`` (so non-categorical integer columns pay at most
-    that many iterations instead of a full double-scan).
+    ``None`` otherwise.  Uses numpy factorization so the Python loop runs
+    over unique values only (bounded by ``_CATEGORICAL_THRESHOLD``), not
+    over every row.
     """
     arr = np.asarray(values).reshape(-1)
     dtype = arr.dtype
@@ -161,22 +161,48 @@ def _try_encode_categorical(
     if not always_categorical and not np.issubdtype(dtype, np.integer):
         return None
 
-    colors = np.empty((arr.shape[0], 3), dtype=np.float32)
-    key_to_index: dict[object, int] = {}
-    legend_items: list[tuple[str, tuple[float, float, float]]] = []
+    # np.unique gives sorted unique values + inverse indices for free.
+    # For very large integer arrays that are unlikely to be categorical, do a
+    # cheap cardinality probe on a prefix before paying the full sort cost.
+    if not always_categorical and arr.shape[0] > 1000:
+        probe = np.unique(arr[:1000])
+        if len(probe) > _CATEGORICAL_THRESHOLD:
+            return None
 
-    for i, raw in enumerate(arr):
-        key, label = _normalize_category_value(raw)
-        idx = key_to_index.get(key)
-        if idx is None:
-            if not always_categorical and len(legend_items) >= _CATEGORICAL_THRESHOLD:
-                return None   # too many distinct values — not categorical
-            idx = len(legend_items)
-            key_to_index[key] = idx
-            legend_items.append((label, _categorical_palette_color(idx)))
-        colors[i] = legend_items[idx][1]
+    unique_vals, inverse = np.unique(arr, return_inverse=True)
+    if not always_categorical and len(unique_vals) > _CATEGORICAL_THRESHOLD:
+        return None
+
+    # Build legend items for unique values only (max _CATEGORICAL_THRESHOLD iterations).
+    legend_items: list[tuple[str, tuple[float, float, float]]] = []
+    for raw in unique_vals:
+        _, label = _normalize_category_value(raw)
+        legend_items.append((label, _categorical_palette_color(len(legend_items))))
+
+    # Vectorized color assignment via numpy advanced indexing.
+    palette = np.array([c for _, c in legend_items], dtype=np.float32)
+    colors = palette[inverse]
 
     return colors, legend_items
+
+
+def _factorize_labels(
+    lbl_arr: "np.ndarray",
+) -> "list[object]":
+    """Return unique label values in the same order as ``_try_encode_categorical``.
+
+    Mirrors ``np.unique`` (sorted) so overlay palette slots match point colors.
+    Falls back to first-seen order only when labels are not sortable (e.g. mixed
+    int/str), which is the same situation where ``np.unique`` would also fail.
+    """
+    try:
+        unique_vals = np.unique(lbl_arr).tolist()
+    except TypeError:
+        seen: "dict[object, None]" = {}
+        for v in lbl_arr.tolist():
+            seen[v] = None
+        unique_vals = list(seen)
+    return unique_vals
 
 
 def _rgb01_to_hex(color: tuple[float, float, float]) -> str:
@@ -413,6 +439,104 @@ def _platform_name() -> str:
 _DISPLAY_ID: int = _get_display_id()
 _HOVER_DEBOUNCE_MS: int = 30
 
+_LABEL_ANCHOR_MAP: "dict[str, int]" = {
+    "center": 0, "left": 1, "right": 2, "top": 3, "bottom": 4,
+}
+
+
+def _parse_label_position(position) -> "tuple[float, float, float]":
+    import numpy as _np
+    if isinstance(position, _np.ndarray):
+        position = position.flatten()
+    x, y, z = float(position[0]), float(position[1]), float(position[2])
+    return (x, y, z)
+
+
+def _parse_label_color(color) -> "list[float]":
+    if isinstance(color, str):
+        color = color.lstrip("#")
+        r, g, b = int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+        return [r / 255.0, g / 255.0, b / 255.0, 1.0]
+    if len(color) == 3:
+        return [float(color[0]), float(color[1]), float(color[2]), 1.0]
+    return [float(color[0]), float(color[1]), float(color[2]), float(color[3])]
+
+
+def _compute_convex_hull(
+    points: "np.ndarray",
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Return (vertices float32 Nx3, triangle_indices uint32 Mx3) for the convex hull of *points*."""
+    try:
+        from scipy.spatial import ConvexHull
+    except ImportError as exc:
+        raise ImportError(
+            "scipy is required for convex hull overlays. "
+            "Install it with: pip install dragonsci[stats]"
+        ) from exc
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 4:
+        raise ValueError(
+            f"convex hull requires at least 4 points with shape (N, 3); "
+            f"got shape {pts.shape}"
+        )
+    try:
+        hull = ConvexHull(pts)
+    except Exception as exc:
+        raise ValueError(f"convex hull computation failed: {exc}") from exc
+    verts = pts[hull.vertices].astype(np.float32)
+    # hull.simplices index into hull.vertices, not pts directly — remap
+    old_to_new = {old: new for new, old in enumerate(hull.vertices)}
+    idxs = np.array(
+        [[old_to_new[i] for i in tri] for tri in hull.simplices], dtype=np.uint32
+    )
+    return verts, idxs
+
+
+def _compute_ellipsoid(
+    center: "np.ndarray",
+    covariance: "np.ndarray",
+    n_std: float = 2.0,
+    u_res: int = 20,
+    v_res: int = 10,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Return (vertices float32 Nx3, triangle_indices uint32 Mx3) for an ellipsoid.
+
+    The ellipsoid is derived by eigendecomposing *covariance* and scaling a UV
+    sphere by ``n_std * sqrt(eigenvalues)`` along the principal axes.
+    """
+    vals, vecs = np.linalg.eigh(np.asarray(covariance, dtype=np.float64))
+    vals = np.maximum(vals, 0.0)  # numerical safety
+    radii = n_std * np.sqrt(vals)
+
+    # UV sphere in [-pi,pi] x [-pi/2,pi/2]
+    u = np.linspace(0, 2 * np.pi, u_res + 1)
+    v = np.linspace(-np.pi / 2, np.pi / 2, v_res + 1)
+    uu, vv = np.meshgrid(u, v)
+    sx = np.cos(vv) * np.cos(uu)
+    sy = np.cos(vv) * np.sin(uu)
+    sz = np.sin(vv)
+    sphere = np.stack([sx.ravel(), sy.ravel(), sz.ravel()], axis=1)  # Nx3
+
+    # Transform: center + vecs @ diag(radii) @ sphere.T → Nx3
+    pts = (vecs * radii) @ sphere.T  # 3×N
+    pts = pts.T + np.asarray(center, dtype=np.float64)
+    verts = pts.astype(np.float32)
+
+    # Build triangle indices for the UV grid
+    nv1 = v_res + 1
+    nu1 = u_res + 1
+    tris = []
+    for row in range(v_res):
+        for col in range(u_res):
+            a = row * nu1 + col
+            b = a + 1
+            c = a + nu1
+            d = c + 1
+            tris.append([a, c, b])
+            tris.append([b, c, d])
+    idxs = np.array(tris, dtype=np.uint32)
+    return verts, idxs
+
 
 class Scatter3D(tk.Frame):
     """A Tkinter widget that renders a 3-D scatter plot using wgpu (Rust).
@@ -463,6 +587,19 @@ class Scatter3D(tk.Frame):
         self._next_phandle: int = 0
         self._phandle_map: "dict[int, int]" = {}   # virtual → real actor handle
         self._pending_ticks: Optional[tuple] = None
+
+        # User label pre-map state (virtual handle system mirrors actor handles)
+        self._next_lhandle: int = 0
+        self._lhandle_map: "dict[int, int]" = {}   # virtual → real (u64) Rust handle
+        self._label_handles: "set[int]" = set()    # live virtual handles
+        self._pending_labels: "list[tuple[int, str, dict]]" = []
+
+        # Mesh overlay pre-map state (convex hulls, ellipsoids)
+        self._next_mhandle: int = 0
+        self._mhandle_map: "dict[int, int]" = {}   # virtual → real (u64) Rust handle
+        self._mesh_handles: "set[int]" = set()
+        self._pending_meshes: "list[tuple[int, str, dict]]" = []
+        self._mesh_meta: "dict[int, dict]" = {}    # handle → {"color", "wireframe", ...}
         # Python-side shadow so parallel_projection is readable before renderer init
         self._parallel_projection: bool = False
 
@@ -559,6 +696,11 @@ class Scatter3D(tk.Frame):
         self._after_id: Optional[str] = None
         self._resize_after_id: Optional[str] = None
 
+        # Sub-classes can point this at a child widget to redirect the renderer
+        # HWND, winfo_width/height queries, and configure-driven resizes to a
+        # different surface than the outer frame.  Defaults to self.
+        self._render_target_widget: tk.Misc = self
+
         self.pack_propagate(False)
         self.grid_propagate(False)
 
@@ -583,15 +725,16 @@ class Scatter3D(tk.Frame):
     def _on_map(self, _event: tk.Event) -> None:
         if self._renderer is not None:
             return
-        self.update_idletasks()
+        self._render_target_widget.update_idletasks()
         self._init_renderer()
 
     def _init_renderer(self) -> None:
-        w = max(self.winfo_width(), 1)
-        h = max(self.winfo_height(), 1)
+        tgt = self._render_target_widget
+        w = max(tgt.winfo_width(), 1)
+        h = max(tgt.winfo_height(), 1)
         try:
             self._renderer = ScatterRenderer(
-                self.winfo_id(),
+                tgt.winfo_id(),
                 _DISPLAY_ID,
                 w,
                 h,
@@ -682,17 +825,73 @@ class Scatter3D(tk.Frame):
             self._pending_streams.clear()
             self._mark_dirty()
             did_something = True
+        if self._pending_labels:
+            for vhandle, action, payload in self._pending_labels:
+                if action == "add":
+                    real = int(self._renderer.add_user_label(**payload))
+                    self._lhandle_map[vhandle] = real
+                    self._label_handles.add(vhandle)
+                elif action in ("update", "remove", "visibility", "clear"):
+                    real = self._lhandle_map.get(vhandle)
+                    if action == "update" and real is not None:
+                        self._renderer.update_user_label(real, **payload)
+                    elif action == "remove" and real is not None:
+                        self._renderer.remove_user_label(real)
+                        self._label_handles.discard(vhandle)
+                    elif action == "visibility" and real is not None:
+                        self._renderer.set_user_label_visible(real, payload["visible"])
+                    elif action == "clear":
+                        self._renderer.clear_user_labels()
+                        self._lhandle_map.clear()
+                        self._label_handles.clear()
+            self._pending_labels.clear()
+            self._mark_dirty()
+            did_something = True
+        if self._pending_meshes:
+            for vhandle, action, payload in self._pending_meshes:
+                if action == "add":
+                    real = int(self._renderer.add_mesh(**payload))
+                    self._mhandle_map[vhandle] = real
+                    self._mesh_handles.add(vhandle)
+                elif action == "update":
+                    real = self._mhandle_map.get(vhandle)
+                    if real is not None:
+                        self._renderer.update_mesh(real, **payload)
+                elif action == "remove":
+                    real = self._mhandle_map.get(vhandle)
+                    if real is not None:
+                        self._renderer.remove_mesh(real)
+                        self._mesh_handles.discard(vhandle)
+                        self._mesh_meta.pop(vhandle, None)
+                elif action == "visibility":
+                    real = self._mhandle_map.get(vhandle)
+                    if real is not None:
+                        self._renderer.set_mesh_visibility(real, payload["visible"])
+                elif action == "clear":
+                    self._renderer.clear_meshes()
+                    self._mhandle_map.clear()
+                    self._mesh_handles.clear()
+                    self._mesh_meta.clear()
+            self._pending_meshes.clear()
+            self._mark_dirty()
+            did_something = True
         if not did_something:
             self._schedule_render()
 
     def _on_configure(self, event: tk.Event) -> None:
         if self._renderer is None:
             return
-        # Debounce: resize is expensive — only execute 50 ms after the last event
+        # Debounce: resize is expensive — only execute 50 ms after the last event.
+        # Always query the render-target widget directly so sub-class overrides
+        # (e.g. Scatter2D with a _render_frame sub-frame) get the correct size.
         if self._resize_after_id is not None:
             self.after_cancel(self._resize_after_id)
+        tgt = self._render_target_widget
         self._resize_after_id = self.after(
-            50, lambda: self._do_resize(event.width, event.height)
+            50, lambda: self._do_resize(
+                max(tgt.winfo_width(), 1),
+                max(tgt.winfo_height(), 1),
+            )
         )
 
     def _do_resize(self, w: int, h: int) -> None:
@@ -1377,10 +1576,412 @@ class Scatter3D(tk.Frame):
         self._pending_overlay_visibility.clear()
         self._vhandle_map.clear()
         self._next_vhandle = 0
+        self._pending_labels.clear()
+        self._label_handles.clear()
+        self._lhandle_map.clear()
+        self._pending_meshes.clear()
+        self._mesh_handles.clear()
+        self._mhandle_map.clear()
+        self._mesh_meta.clear()
         if self._renderer is not None:
             self._renderer.clear_actors()
             self._renderer.clear_overlays()
+            self._renderer.clear_user_labels()
+            self._renderer.clear_meshes()
             self._mark_dirty()
+
+    # ── User-defined world-space text labels ──────────────────────────────────
+
+    def add_label(
+        self,
+        position: "tuple[float, float, float] | np.ndarray",
+        text: str,
+        *,
+        color: "tuple[float, float, float] | str" = (1.0, 1.0, 1.0),
+        size: float = 14.0,
+        anchor: str = "center",
+    ) -> int:
+        """Pin a text label at a 3-D world-space position.
+
+        Returns a handle that can be passed to :meth:`update_label`,
+        :meth:`remove_label`, and :meth:`set_label_visibility`.
+        """
+        pos3 = _parse_label_position(position)
+        rgba = _parse_label_color(color)
+        anch = _LABEL_ANCHOR_MAP.get(anchor.lower(), 0)
+        payload = dict(x=pos3[0], y=pos3[1], z=pos3[2], text=text,
+                       color=rgba, size=float(size), anchor=anch)
+        if self._renderer is None:
+            vhandle = self._next_lhandle
+            self._next_lhandle += 1
+            self._pending_labels.append((vhandle, "add", payload))
+            self._label_handles.add(vhandle)
+            return vhandle
+        real = int(self._renderer.add_user_label(**payload))
+        self._label_handles.add(real)
+        self._mark_dirty()
+        return real
+
+    def update_label(
+        self,
+        handle: int,
+        position: "tuple[float, float, float] | np.ndarray | None" = None,
+        text: "str | None" = None,
+        *,
+        color: "tuple[float, float, float] | str | None" = None,
+        size: "float | None" = None,
+        anchor: "str | None" = None,
+    ) -> None:
+        """Update one or more fields of an existing label in-place."""
+        pos3 = _parse_label_position(position) if position is not None else None
+        rgba = _parse_label_color(color) if color is not None else None
+        anch = _LABEL_ANCHOR_MAP.get(anchor.lower(), 0) if anchor is not None else None
+        payload = dict(pos=pos3, text=text, color=rgba, size=size, anchor=anch)
+        if self._renderer is None:
+            self._pending_labels.append((handle, "update", payload))
+            return
+        real = self._lhandle_map.get(handle, handle)
+        self._renderer.update_user_label(real, **payload)
+        self._mark_dirty()
+
+    def remove_label(self, handle: int) -> None:
+        """Remove a label by handle."""
+        if self._renderer is None:
+            self._pending_labels.append((handle, "remove", {}))
+            self._label_handles.discard(handle)
+            return
+        real = self._lhandle_map.get(handle, handle)
+        self._renderer.remove_user_label(real)
+        self._label_handles.discard(handle)
+        self._mark_dirty()
+
+    def set_label_visibility(self, handle: int, visible: bool) -> None:
+        """Show or hide a label without removing it."""
+        if self._renderer is None:
+            self._pending_labels.append((handle, "visibility", {"visible": visible}))
+            return
+        real = self._lhandle_map.get(handle, handle)
+        self._renderer.set_user_label_visible(real, visible)
+        self._mark_dirty()
+
+    def clear_labels(self) -> None:
+        """Remove all user-defined labels."""
+        self._pending_labels.clear()
+        self._label_handles.clear()
+        if self._renderer is not None:
+            self._renderer.clear_user_labels()
+            self._mark_dirty()
+        else:
+            # Pre-map: single sentinel so _init_renderer replays the clear.
+            self._pending_labels.append((-1, "clear", {}))
+
+    # ── Mesh overlays (convex hulls, ellipsoids) ──────────────────────────────
+
+    def add_convex_hull(
+        self,
+        points: "np.ndarray",
+        *,
+        color: "tuple[float, float, float] | str" = (1.0, 1.0, 0.0),
+        opacity: float = 0.3,
+        wireframe: bool = False,
+    ) -> int:
+        """Add a convex hull overlay around *points*.
+
+        Requires ``scipy``:  ``pip install dragonsci[stats]``.
+
+        Parameters
+        ----------
+        points : (N, 3) float32 array  — N ≥ 4.
+        color  : RGB tuple or ``"#RRGGBB"`` hex string.
+        opacity: alpha in [0, 1].
+        wireframe : draw edges only instead of filled faces.
+
+        Returns
+        -------
+        int — handle for update / remove.
+        """
+        verts, idxs = _compute_convex_hull(points)
+        rgba = list(_parse_label_color(color))[:3] + [float(opacity)]
+        return self._add_mesh_actor(verts, idxs, rgba, wireframe,
+                                    meta={"color": rgba, "wireframe": wireframe})
+
+    def update_convex_hull(
+        self,
+        handle: int,
+        points: "np.ndarray | None" = None,
+        *,
+        color: "tuple[float, float, float] | str | None" = None,
+        opacity: "float | None" = None,
+        wireframe: "bool | None" = None,
+    ) -> None:
+        """Update an existing convex hull's geometry and/or style.
+
+        All parameters are optional.  Omitting *points* performs a style-only
+        update without recomputing the geometry.
+        """
+        meta = self._mesh_meta.get(handle, {})
+        cur_color = meta.get("color", [1.0, 1.0, 0.0, 0.3])
+        if color is not None:
+            rgb = list(_parse_label_color(color))[:3]
+            alpha = float(opacity) if opacity is not None else cur_color[3]
+            rgba = rgb + [alpha]
+        elif opacity is not None:
+            rgba = cur_color[:3] + [float(opacity)]
+        else:
+            rgba = list(cur_color)
+        wf = wireframe if wireframe is not None else meta.get("wireframe", False)
+
+        if points is not None:
+            verts, idxs = _compute_convex_hull(points)
+            self._update_mesh_actor(handle, verts, idxs, rgba, wf)
+        else:
+            # Style-only: reuse existing geometry, just push new color/wireframe.
+            self._update_mesh_actor(handle, None, None, rgba, wf)
+        if handle in self._mesh_meta:
+            self._mesh_meta[handle].update({"color": rgba, "wireframe": wf})
+
+    def add_ellipsoid(
+        self,
+        center: "np.ndarray | tuple",
+        covariance: "np.ndarray",
+        *,
+        color: "tuple[float, float, float] | str" = (1.0, 0.2, 0.2),
+        opacity: float = 0.3,
+        n_std: float = 2.0,
+        wireframe: bool = False,
+    ) -> int:
+        """Add an ellipsoid overlay defined by *center* and *covariance*.
+
+        Parameters
+        ----------
+        center     : (3,) world-space centroid.
+        covariance : (3, 3) covariance matrix; axes from eigendecomposition.
+        n_std      : number of standard deviations (default 2 ≈ 95 % of a Gaussian).
+        color, opacity, wireframe : same as :meth:`add_convex_hull`.
+        """
+        verts, idxs = _compute_ellipsoid(center, covariance, n_std)
+        rgba = list(_parse_label_color(color))[:3] + [float(opacity)]
+        return self._add_mesh_actor(verts, idxs, rgba, wireframe,
+                                    meta={"color": rgba, "wireframe": wireframe,
+                                          "n_std": float(n_std),
+                                          "_center": np.asarray(center, dtype=np.float64).copy(),
+                                          "_covariance": np.asarray(covariance, dtype=np.float64).copy()})
+
+    def update_ellipsoid(
+        self,
+        handle: int,
+        center: "np.ndarray | tuple | None" = None,
+        covariance: "np.ndarray | None" = None,
+        *,
+        color: "tuple[float, float, float] | str | None" = None,
+        opacity: "float | None" = None,
+        n_std: "float | None" = None,
+        wireframe: "bool | None" = None,
+    ) -> None:
+        """Update an existing ellipsoid's geometry and/or style.
+
+        All parameters are optional.  Omitting *center* and *covariance*
+        performs a style-only update without recomputing the geometry.
+        If either *center* or *covariance* is supplied, both must be supplied.
+        """
+        if (center is None) != (covariance is None):
+            raise ValueError("supply both center and covariance, or neither")
+        meta = self._mesh_meta.get(handle, {})
+        cur_color = meta.get("color", [1.0, 0.2, 0.2, 0.3])
+        if color is not None:
+            rgb = list(_parse_label_color(color))[:3]
+            alpha = float(opacity) if opacity is not None else cur_color[3]
+            rgba = rgb + [alpha]
+        elif opacity is not None:
+            rgba = cur_color[:3] + [float(opacity)]
+        else:
+            rgba = list(cur_color)
+        wf = wireframe if wireframe is not None else meta.get("wireframe", False)
+        std = float(n_std) if n_std is not None else meta.get("n_std", 2.0)
+
+        if center is not None:
+            # Full geometry update with new center + covariance.
+            verts, idxs = _compute_ellipsoid(center, covariance, std)
+            self._update_mesh_actor(handle, verts, idxs, rgba, wf)
+            if handle in self._mesh_meta:
+                self._mesh_meta[handle]["_center"]     = np.asarray(center,     dtype=np.float64).copy()
+                self._mesh_meta[handle]["_covariance"] = np.asarray(covariance, dtype=np.float64).copy()
+        elif n_std is not None:
+            # n_std changed — recompute geometry using cached center + covariance.
+            c_cached   = meta.get("_center")
+            cov_cached = meta.get("_covariance")
+            if c_cached is not None and cov_cached is not None:
+                verts, idxs = _compute_ellipsoid(c_cached, cov_cached, std)
+                self._update_mesh_actor(handle, verts, idxs, rgba, wf)
+            else:
+                self._update_mesh_actor(handle, None, None, rgba, wf)
+        else:
+            # Style-only (color / opacity / wireframe).
+            self._update_mesh_actor(handle, None, None, rgba, wf)
+        if handle in self._mesh_meta:
+            self._mesh_meta[handle].update({"color": rgba, "wireframe": wf, "n_std": std})
+
+    def set_mesh_visibility(self, handle: int, visible: bool) -> None:
+        """Show or hide a convex hull or ellipsoid by its handle."""
+        if self._renderer is not None:
+            real = self._mhandle_map.get(handle)
+            if real is not None:
+                self._renderer.set_mesh_visibility(real, visible)
+                self._mark_dirty()
+        else:
+            self._pending_meshes.append((handle, "visibility", {"visible": visible}))
+
+    def remove_mesh(self, handle: int) -> None:
+        """Remove any mesh overlay (hull or ellipsoid) by its handle."""
+        if self._renderer is not None:
+            real = self._mhandle_map.pop(handle, None)
+            if real is not None:
+                self._renderer.remove_mesh(real)
+                self._mesh_handles.discard(handle)
+                self._mesh_meta.pop(handle, None)
+                self._mark_dirty()
+        else:
+            self._pending_meshes.append((handle, "remove", {}))
+            self._mesh_handles.discard(handle)
+            self._mesh_meta.pop(handle, None)
+
+    # Convenience aliases kept for backward-compat with plan API
+    remove_convex_hull = remove_mesh
+    remove_ellipsoid   = remove_mesh
+
+    def clear_meshes(self) -> None:
+        """Remove all mesh overlays (hulls and ellipsoids)."""
+        self._pending_meshes.clear()
+        self._mesh_handles.clear()
+        self._mhandle_map.clear()
+        self._mesh_meta.clear()
+        if self._renderer is not None:
+            self._renderer.clear_meshes()
+            self._mark_dirty()
+        else:
+            self._pending_meshes.append((-1, "clear", {}))
+
+    def add_cluster_hulls(
+        self,
+        positions: "np.ndarray",
+        labels: "list | np.ndarray",
+        *,
+        colormap: str = "tab10",
+        opacity: float = 0.25,
+    ) -> "list[int]":
+        """Add one convex hull per unique label value.
+
+        Parameters
+        ----------
+        positions : (N, 3) float32 array.
+        labels    : length-N sequence of category values (ints, strings, …).
+        colormap  : ignored in v1; uses the built-in categorical palette.
+        opacity   : alpha for all hulls.
+
+        Returns
+        -------
+        list[int] — one handle per unique label (skips groups with < 4 points).
+        """
+        pts = np.asarray(positions, dtype=np.float32)
+        lbl_arr = np.asarray(labels)
+        unique = _factorize_labels(lbl_arr)
+        handles = []
+        for i, lbl in enumerate(unique):
+            mask = lbl_arr == lbl
+            grp = pts[mask]
+            if len(grp) < 4:
+                continue
+            color = _CATEGORICAL_PALETTE[i % len(_CATEGORICAL_PALETTE)]
+            handles.append(self.add_convex_hull(grp, color=color, opacity=opacity))
+        return handles
+
+    def add_cluster_ellipsoids(
+        self,
+        positions: "np.ndarray",
+        labels: "list | np.ndarray",
+        *,
+        colormap: str = "tab10",
+        opacity: float = 0.25,
+        n_std: float = 2.0,
+    ) -> "list[int]":
+        """Add one ellipsoid per unique label value.
+
+        Parameters
+        ----------
+        positions, labels, colormap, opacity : same as :meth:`add_cluster_hulls`.
+        n_std : number of standard deviations for the ellipsoid axes.
+
+        Returns
+        -------
+        list[int] — one handle per unique label (skips groups with < 4 points).
+        """
+        pts = np.asarray(positions, dtype=np.float64)
+        lbl_arr = np.asarray(labels)
+        unique = _factorize_labels(lbl_arr)
+        handles = []
+        for i, lbl in enumerate(unique):
+            mask = lbl_arr == lbl
+            grp = pts[mask]
+            if len(grp) < 4:
+                continue
+            center = grp.mean(axis=0)
+            cov = np.cov(grp.T)
+            if cov.ndim == 0:
+                cov = np.diag([float(cov)] * 3)
+            color = _CATEGORICAL_PALETTE[i % len(_CATEGORICAL_PALETTE)]
+            handles.append(self.add_ellipsoid(center, cov, color=color,
+                                              opacity=opacity, n_std=n_std))
+        return handles
+
+    # ── Internal mesh helpers ─────────────────────────────────────────────────
+
+    def _add_mesh_actor(self, verts, idxs, rgba, wireframe, *, meta) -> int:
+        vhandle = self._next_mhandle
+        self._next_mhandle += 1
+        self._mesh_handles.add(vhandle)
+        meta["_verts"] = np.ascontiguousarray(verts, dtype=np.float32)
+        meta["_idxs"]  = np.ascontiguousarray(idxs,  dtype=np.uint32)
+        self._mesh_meta[vhandle] = meta
+        payload = {
+            "vertices": np.ascontiguousarray(verts, dtype=np.float32),
+            "indices":  np.ascontiguousarray(idxs,  dtype=np.uint32),
+            "color":    list(rgba),
+            "wireframe": wireframe,
+        }
+        if self._renderer is not None:
+            real = int(self._renderer.add_mesh(**payload))
+            self._mhandle_map[vhandle] = real
+            self._mark_dirty()
+        else:
+            self._pending_meshes.append((vhandle, "add", payload))
+        return vhandle
+
+    def _update_mesh_actor(self, handle, verts, idxs, rgba, wireframe) -> None:
+        # Style-only path: verts/idxs are None — reuse geometry stored in meta.
+        if verts is None or idxs is None:
+            meta = self._mesh_meta.get(handle, {})
+            verts = meta.get("_verts")
+            idxs  = meta.get("_idxs")
+            if verts is None or idxs is None:
+                return  # geometry not yet known (pre-map, will be replayed correctly)
+        else:
+            # Persist geometry in meta so future style-only updates can reuse it.
+            if handle in self._mesh_meta:
+                self._mesh_meta[handle]["_verts"] = np.ascontiguousarray(verts, dtype=np.float32)
+                self._mesh_meta[handle]["_idxs"]  = np.ascontiguousarray(idxs,  dtype=np.uint32)
+        payload = {
+            "vertices": np.ascontiguousarray(verts, dtype=np.float32),
+            "indices":  np.ascontiguousarray(idxs,  dtype=np.uint32),
+            "color":    list(rgba),
+            "wireframe": wireframe,
+        }
+        if self._renderer is not None:
+            real = self._mhandle_map.get(handle)
+            if real is not None:
+                self._renderer.update_mesh(real, **payload)
+                self._mark_dirty()
+        else:
+            self._pending_meshes.append((handle, "update", payload))
 
     # ── Line / overlay actors ─────────────────────────────────────────────────
 
@@ -2007,8 +2608,8 @@ class Scatter3D(tk.Frame):
 
     # ── Picking helpers ───────────────────────────────────────────────────────
 
-    def _translate_hits(self, hits: list) -> "tuple[list[int], list | None]":
-        """Translate raw (actor, index) hits to (row_positions, index_labels).
+    def _translate_hits(self, actor_ids, point_indices) -> "tuple[list[int], list | None]":
+        """Translate raw (actor_ids, point_indices) hit arrays to (row_positions, index_labels).
 
         ``row_positions`` are plotted row positions suitable for ``df.iloc[...]``.
         For numpy-only actors the raw per-actor buffer index is returned.
@@ -2018,9 +2619,8 @@ class Scatter3D(tk.Frame):
         indices: list = []
         labels: list = []
         any_labels = False
-        for h in hits:
-            actor = h["actor"]
-            idx = int(h["index"])
+        for actor, idx in zip(actor_ids, point_indices):
+            idx = int(idx)
             # Actor-level metadata (add_points path).
             row_pos = self._actor_row_positions.get(actor)
             if row_pos is not None and idx < len(row_pos):
@@ -2045,10 +2645,12 @@ class Scatter3D(tk.Frame):
                 labels.append(None)
         return indices, (labels if any_labels else None)
 
-    def _fire_selection(self, hits: list) -> None:
+    def _fire_selection(self, actor_ids, point_indices) -> None:
         """Store translated selection results and fire ``<<SelectionChanged>>``."""
-        self.selected = hits
-        self.selected_indices, self.selected_index_values = self._translate_hits(hits)
+        # Reconstruct self.selected as list-of-dicts for backward compatibility.
+        self.selected = [{"actor": int(a), "index": int(i)}
+                         for a, i in zip(actor_ids, point_indices)]
+        self.selected_indices, self.selected_index_values = self._translate_hits(actor_ids, point_indices)
         self.event_generate("<<SelectionChanged>>")
 
     # ── Picking API ───────────────────────────────────────────────────────────
@@ -2292,9 +2894,9 @@ class Scatter3D(tk.Frame):
         if not self._lasso_active:
             return False
         self._lasso_active = False
-        # lasso_end() picks the accumulated polygon, clears the overlay, and returns hits.
+        # lasso_end() returns (actor_ids, point_indices) arrays.
         hits = self._renderer.lasso_end()
-        self._fire_selection(hits)
+        self._fire_selection(*hits)
         self._mark_dirty()
         self._disengage_lod()
         self._drag_btn = None
@@ -2339,7 +2941,7 @@ class Scatter3D(tk.Frame):
                 x1, y1 = float(event.x), float(event.y)
                 if abs(x1 - x0) > 2 and abs(y1 - y0) > 2:
                     hits = self._renderer.pick_rectangle(x0, y0, x1, y1)
-                    self._fire_selection(hits)
+                    self._fire_selection(*hits)
                 self._mark_dirty()
             self._disengage_lod()
             self._drag_btn = None
@@ -2440,31 +3042,99 @@ class Scatter2D(Scatter3D):
         self._axis_labels = ("X", "Y", "")
         self._axis_visible = (True, True, False)  # hide Z axis entirely
 
+        # ── Marginal histogram state ──────────────────────────────────────
+        self._marginal_coords: "dict[int, tuple[np.ndarray, np.ndarray]]" = {}
+        self._hidden_actors: "set[int]" = set()
+        self._marginals_visible: bool = False
+        self._marginals_bins: "int | str" = 50
+        self._marginals_color: str = "#4c8eff"
+        self._marginals_alpha: float = 0.7
+        self._marginals_size: int = 80
+        self._marginals_orientation: str = "both"
+        self._x_hist_canvas: "tk.Canvas | None" = None
+        self._y_hist_canvas: "tk.Canvas | None" = None
+        self._last_bounds_hash: "tuple | None" = None
+        self._marginal_stream_cap: int = 50_000
+        self._last_prep_pos: "np.ndarray | None" = None  # set by _prepare_point_inputs
+
+        # ── Sub-frame layout ──────────────────────────────────────────────
+        # Renderer draws into _render_frame (row=1, col=0).  Marginal canvases
+        # occupy row=0 (X hist) and col=1 (Y hist) when visible, shrinking the
+        # scatter area rather than overlaying it.
+        self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=0)   # Y hist column — sized by minsize
+        self.rowconfigure(0, weight=0)       # X hist row  — sized by minsize
+        self.rowconfigure(1, weight=1)       # scatter row
+
+        self._render_frame = tk.Frame(self, bg="black")
+        self._render_frame.grid(row=1, column=0, sticky="nsew")
+
+        # Redirect renderer to the inner frame.
+        self._render_target_widget = self._render_frame
+
+        # Bind render-frame Configure so the renderer resizes when the panel
+        # area changes (e.g. marginals shown/hidden or outer widget resized).
+        self._render_frame.bind("<Configure>", self._on_configure, add="+")
+
+        # Rebind input events from outer frame to the inner render frame so
+        # event.x/y coords are in renderer-surface space (origin = top-left of
+        # _render_frame, matching the wgpu surface origin).
+        _INPUT_EVENTS = (
+            "<ButtonPress-1>", "<ButtonPress-2>",
+            "<B1-Motion>", "<B2-Motion>",
+            "<ButtonRelease-1>", "<ButtonRelease-2>",
+            "<MouseWheel>", "<Button-4>", "<Button-5>",
+            "<Double-Button-1>", "<Motion>", "<Leave>",
+        )
+        for ev in _INPUT_EVENTS:
+            self.unbind(ev)
+        self._render_frame.bind("<ButtonPress-1>",   lambda e: self._drag_start(e, 1))
+        self._render_frame.bind("<ButtonPress-2>",   lambda e: self._drag_start(e, 2))
+        self._render_frame.bind("<B1-Motion>",       lambda e: self._drag_move(e, 1))
+        self._render_frame.bind("<B2-Motion>",       lambda e: self._drag_move(e, 2))
+        self._render_frame.bind("<ButtonRelease-1>", self._drag_end)
+        self._render_frame.bind("<ButtonRelease-2>", self._drag_end)
+        self._render_frame.bind("<MouseWheel>",      self._on_scroll)
+        self._render_frame.bind("<Button-4>",        self._on_scroll_up_x11)
+        self._render_frame.bind("<Button-5>",        self._on_scroll_down_x11)
+        self._render_frame.bind("<Double-Button-1>", lambda _e: self.reset_camera())
+        self._render_frame.bind("<Motion>",          self._on_hover_motion, add="+")
+        self._render_frame.bind("<Leave>",           self._on_hover_leave, add="+")
+
     # ── Lifecycle override ────────────────────────────────────────────────
 
     def _init_renderer(self) -> None:
+        # Save pre-map add_points state BEFORE parent replays it directly via
+        # self._renderer.add_points() (bypassing our add_points hook).
+        saved_actors = list(self._pending_actors)
+        saved_vis    = dict(self._pending_actor_visibility)
+
         super()._init_renderer()
         if self._renderer is None:
             return
-        # Snap to front view (camera at +Z, looking at the XY plane) after
-        # all pending data has been replayed so the auto-fit is correct first.
+
+        # Snap to front view after data replay so auto-fit is 2D-correct.
         self._renderer.view_xz()
         self._mark_dirty()
 
-    # ── Data overrides ────────────────────────────────────────────────────
+        # Sync _marginal_coords for actors that were replayed by the parent.
+        # _phandle_map is now fully populated: vhandle → real handle.
+        for kwargs, vhandle in saved_actors:
+            real = self._phandle_map.get(vhandle)
+            if real is None:
+                continue
+            pos = kwargs.get("positions")
+            if (pos is not None and hasattr(pos, "ndim")
+                    and pos.ndim == 2 and pos.shape[1] >= 2):
+                self._marginal_coords[real] = (pos[:, 0].copy(), pos[:, 1].copy())
 
-    def update_actor(
-        self,
-        handle: int,
-        positions: "np.ndarray",
-        **kwargs,
-    ) -> None:
-        """Flatten z to 0 then delegate to the parent update path."""
-        pos = np.ascontiguousarray(positions, dtype=np.float32)
-        if pos.ndim == 2 and pos.shape[1] >= 3:
-            pos = pos.copy()
-            pos[:, 2] = 0.0
-        super().update_actor(handle, pos, **kwargs)
+        # Mirror the visibility replay into _hidden_actors.
+        for vhandle, visible in saved_vis.items():
+            real = self._phandle_map.get(vhandle, vhandle)
+            if not visible:
+                self._hidden_actors.add(real)
+
+    # ── Data overrides ────────────────────────────────────────────────────
 
     def _prepare_point_inputs(
         self,
@@ -2494,14 +3164,11 @@ class Scatter2D(Scatter3D):
         if not is_df:
             pos = pos.copy()
             pos[:, 2] = 0.0
+        # Save the normalised (x,y,z) array so set_points/add_points can extract
+        # the correct x/y columns for marginals without re-touching the raw
+        # positions argument (which may be a DataFrame with non-numeric columns).
+        self._last_prep_pos = pos
         return pos, clr, scl, sizes, meta
-
-    def set_points(self, positions, **kwargs) -> None:
-        """Load a point cloud and snap the camera to the 2D front view."""
-        super().set_points(positions, **kwargs)
-        if self._renderer is not None:
-            self._renderer.view_xz()
-            self._mark_dirty()
 
     # ── Camera overrides ──────────────────────────────────────────────────
 
@@ -2565,6 +3232,348 @@ class Scatter2D(Scatter3D):
     @parallel_projection.setter
     def parallel_projection(self, on: bool) -> None:
         pass  # no-op: cannot disable orthographic in 2D mode
+
+    # ── Marginal histogram API ────────────────────────────────────────────
+
+    def show_marginals(
+        self,
+        visible: bool = True,
+        *,
+        bins: "int | str" = 50,
+        color: str = "#4c8eff",
+        alpha: float = 0.7,
+        size: int = 80,
+        orientation: str = "both",
+    ) -> None:
+        """Show or hide marginal histograms above (X) and to the right (Y) of the scatter.
+
+        Parameters
+        ----------
+        visible : bool
+            Whether to display the marginals.
+        bins : int or "auto"
+            Number of histogram bins.
+        color : str
+            Bar fill color as a hex string.
+        alpha : float
+            Bar opacity in [0, 1].
+        size : int
+            Height of the X histogram / width of the Y histogram in pixels.
+        orientation : {"both", "x", "y"}
+            Which marginals to show.
+        """
+        self._marginals_bins = bins
+        self._marginals_color = color
+        self._marginals_alpha = float(alpha)
+        self._marginals_size = int(size)
+        self._marginals_orientation = orientation
+        self._marginals_visible = bool(visible)
+
+        if not visible:
+            self._destroy_marginal_canvases()
+            return
+
+        self._create_marginal_canvases()
+        # Defer drawing until after Tk processes the grid placement so the
+        # canvases have their final sizes.  Camera-hash polling in _render_tick
+        # will keep histograms in sync with subsequent pan/zoom/resize.
+        self.after_idle(self.update_marginals)
+
+    def update_marginals(self) -> None:
+        """Recompute histograms from current point data and redraw the canvases."""
+        if not self._marginals_visible:
+            return
+        self._draw_x_hist()
+        self._draw_y_hist()
+
+    def _create_marginal_canvases(self) -> None:
+        """Create/destroy histogram canvases and apply grid layout."""
+        s = self._marginals_size
+        if self._marginals_orientation in ("x", "both"):
+            if self._x_hist_canvas is None:
+                # height= pins the canvas's requested height so the grid row
+                # is exactly s pixels tall; width=1 lets sticky="nsew" expand
+                # it horizontally without requesting extra space.
+                self._x_hist_canvas = tk.Canvas(
+                    self, bg="#1a1a2e", highlightthickness=0, height=s, width=1
+                )
+            else:
+                self._x_hist_canvas.configure(height=s)
+        else:
+            if self._x_hist_canvas is not None:
+                self._x_hist_canvas.grid_remove()
+                self._x_hist_canvas.destroy()
+                self._x_hist_canvas = None
+
+        if self._marginals_orientation in ("y", "both"):
+            if self._y_hist_canvas is None:
+                # width= pins the canvas's requested width so the grid column
+                # is exactly s pixels wide; height=1 lets sticky="nsew" expand.
+                self._y_hist_canvas = tk.Canvas(
+                    self, bg="#1a1a2e", highlightthickness=0, width=s, height=1
+                )
+            else:
+                self._y_hist_canvas.configure(width=s)
+        else:
+            if self._y_hist_canvas is not None:
+                self._y_hist_canvas.grid_remove()
+                self._y_hist_canvas.destroy()
+                self._y_hist_canvas = None
+
+        self._place_marginal_canvases()
+
+    def _place_marginal_canvases(self) -> None:
+        """Apply grid geometry to the histogram canvases."""
+        s = self._marginals_size
+        if self._x_hist_canvas is not None:
+            # Sync canvas height in case size= changed since creation.
+            self._x_hist_canvas.configure(height=s)
+            self._x_hist_canvas.grid(row=0, column=0, sticky="nsew")
+            self.rowconfigure(0, weight=0)
+        else:
+            self.rowconfigure(0, weight=0, minsize=0)
+
+        if self._y_hist_canvas is not None:
+            self._y_hist_canvas.configure(width=s)
+            self._y_hist_canvas.grid(row=0, column=1, rowspan=2, sticky="nsew")
+            self.columnconfigure(1, weight=0)
+        else:
+            self.columnconfigure(1, weight=0, minsize=0)
+
+    def _destroy_marginal_canvases(self) -> None:
+        for cv in (self._x_hist_canvas, self._y_hist_canvas):
+            if cv is not None:
+                cv.grid_remove()
+                cv.destroy()
+        self._x_hist_canvas = None
+        self._y_hist_canvas = None
+        self.rowconfigure(0, weight=0, minsize=0)
+        self.columnconfigure(1, weight=0, minsize=0)
+
+    def _aggregate_marginal_coords(self) -> "tuple[np.ndarray, np.ndarray]":
+        xs, ys = [], []
+        for h, (x, y) in self._marginal_coords.items():
+            if h not in self._hidden_actors:
+                xs.append(x)
+                ys.append(y)
+        return (
+            np.concatenate(xs) if xs else np.empty(0, dtype=np.float32),
+            np.concatenate(ys) if ys else np.empty(0, dtype=np.float32),
+        )
+
+    @staticmethod
+    def _blend_color(hex_color: str, alpha: float, bg: str = "#1a1a2e") -> str:
+        """Alpha-blend hex_color over bg and return a hex color string."""
+        def _parse(h: str) -> "tuple[int, int, int]":
+            h = h.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+        fr, fg, fb = _parse(hex_color)
+        br, bg_, bb = _parse(bg)
+        a = max(0.0, min(1.0, alpha))
+        r = int(fr * a + br * (1 - a))
+        g = int(fg * a + bg_ * (1 - a))
+        b = int(fb * a + bb * (1 - a))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_x_hist(self) -> None:
+        cv = self._x_hist_canvas
+        if cv is None or self._renderer is None:
+            return
+        cw = cv.winfo_width()
+        ch = cv.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+
+        bounds = self._renderer.get_view_bounds_2d()
+        xmin, xmax = bounds[0], bounds[2]
+        if xmax <= xmin:
+            return
+
+        xs, _ = self._aggregate_marginal_coords()
+        cv.delete("all")
+        if xs.size == 0:
+            return
+
+        bins = self._marginals_bins
+        counts, edges = np.histogram(xs, bins=bins, range=(xmin, xmax))
+        max_count = counts.max()
+        if max_count == 0:
+            return
+
+        fill = self._blend_color(self._marginals_color, self._marginals_alpha)
+        x_range = xmax - xmin
+        for i, count in enumerate(counts):
+            x0_w = edges[i]
+            x1_w = edges[i + 1]
+            px0 = int((x0_w - xmin) / x_range * cw)
+            px1 = int((x1_w - xmin) / x_range * cw)
+            bar_h = int(count / max_count * (ch - 4))
+            if bar_h < 1:
+                continue
+            cv.create_rectangle(px0, ch - bar_h, px1, ch, fill=fill, outline="")
+
+    def _draw_y_hist(self) -> None:
+        cv = self._y_hist_canvas
+        if cv is None or self._renderer is None:
+            return
+        cw = cv.winfo_width()
+        ch = cv.winfo_height()
+        if cw <= 1 or ch <= 1:
+            return
+
+        bounds = self._renderer.get_view_bounds_2d()
+        ymin, ymax = bounds[1], bounds[3]
+        if ymax <= ymin:
+            return
+
+        _, ys = self._aggregate_marginal_coords()
+        cv.delete("all")
+        if ys.size == 0:
+            return
+
+        bins = self._marginals_bins
+        counts, edges = np.histogram(ys, bins=bins, range=(ymin, ymax))
+        max_count = counts.max()
+        if max_count == 0:
+            return
+
+        fill = self._blend_color(self._marginals_color, self._marginals_alpha)
+        y_range = ymax - ymin
+        for i, count in enumerate(counts):
+            y0_w = edges[i]
+            y1_w = edges[i + 1]
+            # In canvas coords: y=0 is top; ymax world = canvas top
+            py0 = int((ymax - y1_w) / y_range * ch)
+            py1 = int((ymax - y0_w) / y_range * ch)
+            bar_w = int(count / max_count * (cw - 4))
+            if bar_w < 1:
+                continue
+            cv.create_rectangle(0, py0, bar_w, py1, fill=fill, outline="")
+
+    def _check_camera_changed_for_marginals(self) -> None:
+        if not self._marginals_visible or self._renderer is None:
+            return
+        # Hash the actual world-space view bounds so that both pan/zoom AND
+        # aspect-ratio changes (from widget resize) trigger a redraw.
+        bounds = tuple(self._renderer.get_view_bounds_2d())
+        if bounds != self._last_bounds_hash:
+            self._last_bounds_hash = bounds
+            self._update_marginals_async()
+
+    def _update_marginals_async(self) -> None:
+        self.after_idle(self.update_marginals)
+
+    # ── Lifecycle overrides ───────────────────────────────────────────────
+
+    def destroy(self) -> None:
+        self._destroy_marginal_canvases()
+        super().destroy()
+
+    def _render_tick(self) -> None:
+        self._after_id = None
+        if self._renderer is not None and self._dirty:
+            try:
+                self._renderer.render()
+                self._dirty = False
+                self._check_camera_changed_for_marginals()
+            except Exception:
+                pass
+        if self._dirty and self._after_id is None:
+            self._schedule_render()
+
+    # ── Data lifecycle hooks ──────────────────────────────────────────────
+
+    def set_points(self, positions, **kwargs) -> None:
+        """Load a point cloud, snap to front view, and update marginal coords."""
+        self._marginal_coords.clear()
+        self._hidden_actors.clear()
+        self._last_prep_pos = None
+        super().set_points(positions, **kwargs)
+        if self._renderer is not None:
+            self._renderer.view_xz()
+            self._mark_dirty()
+            h = self._scene_actor_handle
+            pos = self._last_prep_pos  # normalised by _prepare_point_inputs
+            if h is not None and pos is not None and pos.ndim == 2 and pos.shape[1] >= 2:
+                self._marginal_coords[h] = (pos[:, 0].copy(), pos[:, 1].copy())
+            if self._marginals_visible:
+                self._update_marginals_async()
+
+    def add_points(self, positions, **kwargs) -> int:
+        """Add a point cloud actor and register its coords for marginals."""
+        self._last_prep_pos = None
+        handle = super().add_points(positions, **kwargs)
+        pos = self._last_prep_pos  # normalised by _prepare_point_inputs
+        if handle >= 0 and pos is not None and pos.ndim == 2 and pos.shape[1] >= 2:
+            self._marginal_coords[handle] = (pos[:, 0].copy(), pos[:, 1].copy())
+        if handle >= 0 and self._marginals_visible:
+            self._update_marginals_async()
+        return handle
+
+    def update_actor(self, handle: int, positions: "np.ndarray", **kwargs) -> None:
+        """Flatten z to 0, update actor data, and refresh marginal coords."""
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        if pos.ndim == 2 and pos.shape[1] >= 3:
+            pos = pos.copy()
+            pos[:, 2] = 0.0
+        super().update_actor(handle, pos, **kwargs)
+        real = self._resolve_actor_handle(handle)
+        if pos.ndim == 2 and pos.shape[1] >= 2:
+            self._marginal_coords[real] = (pos[:, 0].copy(), pos[:, 1].copy())
+        if self._marginals_visible:
+            self._update_marginals_async()
+
+    def remove_actor(self, handle: int) -> None:
+        """Remove an actor and drop its marginal coords."""
+        real = self._resolve_actor_handle(handle)
+        super().remove_actor(handle)
+        self._marginal_coords.pop(real, None)
+        self._marginal_coords.pop(handle, None)
+        self._hidden_actors.discard(real)
+        self._hidden_actors.discard(handle)
+        if self._marginals_visible:
+            self._update_marginals_async()
+
+    def set_actor_visibility(self, handle: int, visible: bool) -> None:
+        """Show/hide an actor and update marginal exclusion set."""
+        super().set_actor_visibility(handle, visible)
+        real = self._resolve_actor_handle(handle)
+        if visible:
+            self._hidden_actors.discard(real)
+        else:
+            self._hidden_actors.add(real)
+        if self._marginals_visible:
+            self._update_marginals_async()
+
+    def stream(self, handle: int, positions, **kwargs) -> None:
+        """Stream new points into an actor and update marginal coords (capped)."""
+        super().stream(handle, positions, **kwargs)
+        real = self._resolve_actor_handle(handle)
+        pos = np.ascontiguousarray(positions, dtype=np.float32)
+        if pos.ndim == 2 and pos.shape[1] >= 2:
+            new_x = pos[:, 0].copy()
+            new_y = pos[:, 1].copy()
+            if real in self._marginal_coords:
+                existing_x, existing_y = self._marginal_coords[real]
+                combined_x = np.concatenate([existing_x, new_x])
+                combined_y = np.concatenate([existing_y, new_y])
+                if len(combined_x) > self._marginal_stream_cap:
+                    combined_x = combined_x[-self._marginal_stream_cap:]
+                    combined_y = combined_y[-self._marginal_stream_cap:]
+                self._marginal_coords[real] = (combined_x, combined_y)
+            else:
+                self._marginal_coords[real] = (new_x, new_y)
+        if self._marginals_visible:
+            self._update_marginals_async()
+
+    def clear(self) -> None:
+        """Clear the scene and drop all marginal coords."""
+        self._marginal_coords.clear()
+        self._hidden_actors.clear()
+        super().clear()
+        if self._marginals_visible:
+            self._update_marginals_async()
 
     # ── Mouse override ────────────────────────────────────────────────────
 

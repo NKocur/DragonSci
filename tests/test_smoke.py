@@ -735,7 +735,7 @@ def test_selected_indices_populated_after_lasso(widget):
     widget.set_points(np.random.default_rng(41).standard_normal((100, 3)).astype(np.float32))
     # When renderer is absent _scene_actor_handle is None; use raw-index fallback path.
     fake_hits = [{"actor": 0, "index": 0}, {"actor": 0, "index": 5}]
-    widget._fire_selection(fake_hits)
+    widget._fire_selection([h["actor"] for h in fake_hits], [h["index"] for h in fake_hits])
     assert widget.selected_indices == [0, 5]
     assert widget.selected_index_values is None   # numpy array — no pandas labels
 
@@ -770,7 +770,7 @@ def test_selected_index_values_with_dataframe(root):
     w.set_points(df, x="x", y="y", z="z")
     assert w._scene_actor_handle == 7
     fake_hits = [{"actor": 7, "index": 2}, {"actor": 7, "index": 9}]
-    indices, labels = w._translate_hits(fake_hits)
+    indices, labels = w._translate_hits([h["actor"] for h in fake_hits], [h["index"] for h in fake_hits])
     assert indices == [2, 9]             # iloc positions (identity mapping)
     assert labels is not None
     assert list(labels) == ["row_2", "row_9"]
@@ -827,7 +827,7 @@ def test_deferred_set_points_preserves_scene_handle(root):
         "_scene_actor_handle was reset by the metadata overwrite"
     )
     fake_hits = [{"actor": 99, "index": 3}, {"actor": 99, "index": 7}]
-    indices, labels = w._translate_hits(fake_hits)
+    indices, labels = w._translate_hits([h["actor"] for h in fake_hits], [h["index"] for h in fake_hits])
     assert indices == [3, 7]
     assert labels is not None, "pandas labels lost after deferred replay"
     assert list(labels) == ["item_3", "item_7"]

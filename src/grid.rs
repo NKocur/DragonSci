@@ -231,22 +231,26 @@ pub fn build_grid(
     // never share a corner and collide.
     // (center was computed earlier for the back-corner edge filter)
 
-    // X-axis ticks (along X): anchor on the near Y-face, push further in ±Y.
+    // X-axis ticks (along X): anchor on the far Y-face (floor when camera above,
+    // ceiling when camera below) and push further outward so labels project
+    // outside the box silhouette in screen space.
     let (x_y_edge, x_y_sign): (f32, f32) = if camera_eye.y >= center.y {
         (nice_min.y, -1.0)   // camera above → anchor at floor (y=min), push −Y
     } else {
         (nice_max.y,  1.0)   // camera below → anchor at ceiling (y=max), push +Y
     };
-    // Also snap to the near Z-face so X ticks sit on the visible box edge.
-    let x_z_edge: f32 = if camera_eye.z >= center.z { nice_min.z } else { nice_max.z };
+    // Near Z-face: tick marks and labels sit on the visible front edge.
+    let x_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
+    // Far Z-face: the back-wall grid plane is drawn on the opposite side.
+    let z_wall_edge: f32 = if camera_eye.z >= center.z { nice_min.z } else { nice_max.z };
 
-    // Y-axis ticks (along Y): anchor on the near X-face, push further in ±X.
+    // Y-axis ticks (along Y): anchor on the far X-face, push further outward in ±X.
     let (y_x_edge, y_x_sign): (f32, f32) = if camera_eye.x >= center.x {
         (nice_min.x, -1.0)   // camera at +X → anchor at left wall (x=min), push −X
     } else {
         (nice_max.x,  1.0)   // camera at −X → anchor at right wall (x=max), push +X
     };
-    let y_z_edge: f32 = if camera_eye.z >= center.z { nice_min.z } else { nice_max.z };
+    let y_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
 
     // Z-axis ticks (along Z): anchor on the near X-face, but *opposite* from Y-axis.
     // Swapping faces guarantees Y and Z labels land on different X-faces and
@@ -367,10 +371,10 @@ pub fn build_grid(
             }
         }
 
-        // Back wall (z = x_z_edge): X lines at each Y tick, Y lines at each X tick.
-        // Only meaningful in 3D mode.
+        // Back wall (z = z_wall_edge): X lines at each Y tick, Y lines at each X tick.
+        // Drawn on the far Z-face so the grid sits behind the data.
         if axis_visible[2] && (x_show || y_show) {
-            let z = x_z_edge;
+            let z = z_wall_edge;
             if show_major_planes {
                 for &x in &x_vals {
                     seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), major_col);
@@ -520,8 +524,8 @@ fn format_tick(v: f32) -> String {
 /// rebuilt whenever this value changes.
 ///
 /// Bit layout:
-///   bit 0 — camera.y < center.y       (below  → X ticks flip to ceiling)
-///   bit 1 — camera.z < center.z       (behind → X/Y ticks flip to back face)
+///   bit 0 — camera.y < center.y       (below  → X ticks flip to floor)
+///   bit 1 — camera.z < center.z       (behind → X/Y ticks flip to back Z-face)
 ///   bit 2 — camera.x < center.x       (left   → Y/Z ticks flip X-face)
 ///   bit 3 — depth axis is X  (|cam_dir.x| > 0.97 → X ticks/grid suppressed)
 ///   bit 4 — depth axis is Y  (|cam_dir.y| > 0.97 → Y ticks/grid suppressed)
