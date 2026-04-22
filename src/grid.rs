@@ -26,25 +26,40 @@ pub fn nice_bounds(min: Vec3, max: Vec3) -> (Vec3, Vec3) {
     (Vec3::new(x0, y0, z0), Vec3::new(x1, y1, z1))
 }
 
+/// Return the nice tick step for a given range — identical logic to axis_ticks()
+/// including the step-up loop, so the step always matches what axis_ticks() produces.
+pub fn tick_step(lo: f32, hi: f32, max_ticks: usize) -> f32 {
+    let range = hi - lo;
+    if range < 1e-10 || max_ticks == 0 { return 1.0; }
+    let rough = range / max_ticks as f32;
+    let mag = 10_f32.powf(rough.log10().floor());
+    let norm = rough / mag;
+    let mut step = (if norm <= 1.0 { 1.0 } else if norm <= 2.0 { 2.0 } else if norm <= 5.0 { 5.0 } else { 10.0 }) * mag;
+    // Step up until the tick count fits within max_ticks (mirrors axis_ticks loop).
+    loop {
+        let first = (lo / step).ceil() * step;
+        let mut count = 0usize;
+        let mut t = first;
+        while t <= hi + step * 1e-4 { count += 1; t += step; }
+        if count <= max_ticks { return step; }
+        let m = 10_f32.powf(step.log10().floor());
+        let n = (step / m).round() as i32;
+        step = match n { 1 => 2.0, 2 => 5.0, _ => 10.0 } * m;
+    }
+}
+
 /// Generate tick positions at multiples of the nice step for [lo, hi].
 /// Targets ~5 ticks and caps at MAX_TICKS; steps up to the next nice
 /// increment if the initial step produces too many.
 /// Returns an empty vec for degenerate ranges.
 /// `max_ticks` is the caller-supplied cap; never exceeds this count.
-fn axis_ticks(lo: f32, hi: f32, max_ticks: usize) -> Vec<f32> {
+pub fn axis_ticks(lo: f32, hi: f32, max_ticks: usize) -> Vec<f32> {
     let range = hi - lo;
     if range < 1e-10 || max_ticks == 0 {
         return vec![];
     }
 
-    let initial_step = {
-        let rough = range / max_ticks as f32;
-        let mag = 10_f32.powf(rough.log10().floor());
-        let norm = rough / mag;
-        (if norm <= 1.0 { 1.0 } else if norm <= 2.0 { 2.0 } else if norm <= 5.0 { 5.0 } else { 10.0 }) * mag
-    };
-
-    let mut step = initial_step;
+    let mut step = tick_step(lo, hi, max_ticks);
     loop {
         let first = (lo / step).ceil() * step;
         let mut ticks = Vec::with_capacity(max_ticks + 1);
@@ -125,6 +140,12 @@ pub struct GridGeometry {
 ///
 /// `axis_texts` are the axis title strings (e.g. `["X", "Y", "Z"]`).  An empty
 /// string suppresses the title for that axis.
+///
+/// `ortho_scale` — when `Some((half_w, half_h))`, the renderer is using
+/// independent X/Y orthographic extents (e.g. for 2-D line charts).  In that
+/// case tick lengths and label offsets are derived from the *visible* range of
+/// each axis rather than the scene diagonal, so ticks stay proportional
+/// regardless of how wide the data aspect ratio is.
 pub fn build_grid(
     data_min: Vec3,
     data_max: Vec3,
@@ -136,6 +157,7 @@ pub fn build_grid(
     axis_texts: &[String; 3],
     show_major_planes: bool,
     show_minor_planes: bool,
+    ortho_scale: Option<(f32, f32)>,
 ) -> GridGeometry {
     let mut verts: Vec<LineVertex> = Vec::new();
     let mut labels: Vec<LabelAnchor> = Vec::new();
@@ -200,68 +222,104 @@ pub fn build_grid(
     let flat_y = data_range.y.abs() / diagonal < 0.01;
     let flat_z = data_range.z.abs() / diagonal < 0.01;
 
-    let tick_len = extent.length() * 0.025;
+    // ── Tick geometry sizing ──────────────────────────────────────────────────
+    // In normal 3-D mode all axes use the same tick length (2.5 % of the scene
+    // diagonal).  In 2-D scale mode (set_parallel_scale) each axis's tick
+    // length is proportional to the *visible* range of its push direction so
+    // that tick marks always appear at a consistent screen fraction regardless
+    // of how extreme the data aspect ratio is (e.g. x=[0,5000], y=[-2,2]).
+    //
+    //  X-axis tick marks are pushed in the ±Y direction → sized by half_h.
+    //  Y-axis tick marks are pushed in the ±X direction → sized by half_w.
+    let (tick_len_y_dir, tick_len_x_dir) = if let Some((hw, hh)) = ortho_scale {
+        (hh * 2.0 * 0.025, hw * 2.0 * 0.025)
+    } else {
+        let tl = extent.length() * 0.025;
+        (tl, tl)
+    };
+    // Keep a scalar tick_len for the Z axis and backward-compat branches.
+    let tick_len    = tick_len_y_dir;
     let label_offset = tick_len * 2.0;
-    let pad = extent.length() * 0.12;
+    let pad          = extent.length() * 0.12;
 
     // Scale max ticks per axis by its fraction of the longest axis.
+    // In 2-D scale mode both visible axes fill the viewport → always 5 ticks.
     let max_ne = extent.x.max(extent.y).max(extent.z).max(1e-10);
     let ticks_for = |e: f32| -> usize {
         let r = e / max_ne;
         if r < 0.15 { 2 } else if r < 0.40 { 3 } else { 5 }
     };
-    let x_ticks = tick_override[0].unwrap_or_else(|| ticks_for(extent.x));
-    let y_ticks = tick_override[1].unwrap_or_else(|| ticks_for(extent.y));
+    let (x_ticks_default, y_ticks_default) = if ortho_scale.is_some() {
+        (5_usize, 5_usize)
+    } else {
+        (ticks_for(extent.x), ticks_for(extent.y))
+    };
+    let x_ticks = tick_override[0].unwrap_or(x_ticks_default);
+    let y_ticks = tick_override[1].unwrap_or(y_ticks_default);
     let z_ticks = tick_override[2].unwrap_or_else(|| ticks_for(extent.z));
 
     // ── Dynamic face selection ────────────────────────────────────────────────
-    // For each axis we pick the bounding-box edge (face) on which tick marks and
-    // labels are anchored.  Rule: choose the face on the *near* side of the camera
-    // (minimum world-space distance), so labels project outside the box silhouette
-    // in screen space regardless of viewing angle.
-    //
-    // Concretely: if the camera is above center (eye.y ≥ center.y) we place X-axis
-    // ticks on the floor (y = nice_min) and push them further downward (−Y sign),
-    // so they appear below the box in screen space.  Mirroring happens in every
-    // other axis/face pair by the same logic.
-    //
-    // Each axis uses ONE perpendicular direction for the offset (±Y for X-axis ticks;
-    // ±X for Y- and Z-axis ticks) to keep labels tidy and non-overlapping.
-    // The Z-axis always uses the *opposite* X-face from the Y-axis so they can
-    // never share a corner and collide.
-    // (center was computed earlier for the back-corner edge filter)
-
-    // X-axis ticks (along X): anchor on the far Y-face (floor when camera above,
-    // ceiling when camera below) and push further outward so labels project
-    // outside the box silhouette in screen space.
-    let (x_y_edge, x_y_sign): (f32, f32) = if camera_eye.y >= center.y {
-        (nice_min.y, -1.0)   // camera above → anchor at floor (y=min), push −Y
+    // In free 3D mode the active faces follow the camera so ticks/labels stay on
+    // the visible silhouette. In locked 2D mode (Z hidden) that behavior is
+    // undesirable for charts: even if the camera target is shifted to reserve
+    // left/bottom gutters, the axes should stay anchored to the bottom and left
+    // edges like a conventional plot.
+    let (
+        x_y_edge,
+        x_y_sign,
+        x_z_edge,
+        z_wall_edge,
+        y_x_edge,
+        y_x_sign,
+        y_z_edge,
+        z_x_edge,
+        z_x_sign,
+        z_y_edge,
+    ): (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) = if !axis_visible[2] {
+        (
+            nice_min.y, -1.0, nice_min.z, nice_min.z,  // X axis: bottom
+            nice_min.x, -1.0, nice_min.z,              // Y axis: left
+            nice_max.x,  1.0, nice_min.y,              // Z hidden in 2D, values unused
+        )
     } else {
-        (nice_max.y,  1.0)   // camera below → anchor at ceiling (y=max), push +Y
-    };
-    // Near Z-face: tick marks and labels sit on the visible front edge.
-    let x_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
-    // Far Z-face: the back-wall grid plane is drawn on the opposite side.
-    let z_wall_edge: f32 = if camera_eye.z >= center.z { nice_min.z } else { nice_max.z };
+        // For each axis we pick the bounding-box edge (face) on which tick marks
+        // and labels are anchored. Rule: choose the face on the *near* side of
+        // the camera (minimum world-space distance), so labels project outside
+        // the box silhouette in screen space regardless of viewing angle.
 
-    // Y-axis ticks (along Y): anchor on the far X-face, push further outward in ±X.
-    let (y_x_edge, y_x_sign): (f32, f32) = if camera_eye.x >= center.x {
-        (nice_min.x, -1.0)   // camera at +X → anchor at left wall (x=min), push −X
-    } else {
-        (nice_max.x,  1.0)   // camera at −X → anchor at right wall (x=max), push +X
-    };
-    let y_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
+        // X-axis ticks (along X): anchor on the far Y-face (floor when camera
+        // above, ceiling when camera below) and push further outward so labels
+        // project outside the box silhouette in screen space.
+        let (x_y_edge, x_y_sign): (f32, f32) = if camera_eye.y >= center.y {
+            (nice_min.y, -1.0)   // camera above → anchor at floor (y=min), push −Y
+        } else {
+            (nice_max.y,  1.0)   // camera below → anchor at ceiling (y=max), push +Y
+        };
+        // Near Z-face: tick marks and labels sit on the visible front edge.
+        let x_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
+        // Far Z-face: the back-wall grid plane is drawn on the opposite side.
+        let z_wall_edge: f32 = if camera_eye.z >= center.z { nice_min.z } else { nice_max.z };
 
-    // Z-axis ticks (along Z): anchor on the near X-face, but *opposite* from Y-axis.
-    // Swapping faces guarantees Y and Z labels land on different X-faces and
-    // can never pile up at the same corner.
-    let (z_x_edge, z_x_sign): (f32, f32) = if camera_eye.x >= center.x {
-        (nice_max.x,  1.0)   // camera at +X → anchor at right wall (x=max), push +X
-    } else {
-        (nice_min.x, -1.0)   // camera at −X → anchor at left wall (x=min), push −X
+        // Y-axis ticks (along Y): anchor on the far X-face, push further outward in ±X.
+        let (y_x_edge, y_x_sign): (f32, f32) = if camera_eye.x >= center.x {
+            (nice_min.x, -1.0)   // camera at +X → anchor at left wall (x=min), push −X
+        } else {
+            (nice_max.x,  1.0)   // camera at −X → anchor at right wall (x=max), push +X
+        };
+        let y_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
+
+        // Z-axis ticks (along Z): anchor on the near X-face, but *opposite* from Y-axis.
+        // Swapping faces guarantees Y and Z labels land on different X-faces and
+        // can never pile up at the same corner.
+        let (z_x_edge, z_x_sign): (f32, f32) = if camera_eye.x >= center.x {
+            (nice_max.x,  1.0)   // camera at +X → anchor at right wall (x=max), push +X
+        } else {
+            (nice_min.x, -1.0)   // camera at −X → anchor at left wall (x=min), push −X
+        };
+        // Z ticks share the same Y-face choice as X-axis for consistent appearance.
+        let z_y_edge = x_y_edge;
+        (x_y_edge, x_y_sign, x_z_edge, z_wall_edge, y_x_edge, y_x_sign, y_z_edge, z_x_edge, z_x_sign, z_y_edge)
     };
-    // Z ticks share the same Y-face choice as X-axis for consistent appearance.
-    let z_y_edge = x_y_edge;
 
     // ── Depth-axis detection ──────────────────────────────────────────────────
     // When the camera is near-axis-aligned (e.g. after flatten_view), the depth
@@ -273,11 +331,24 @@ pub fn build_grid(
     let depth_y = cam_dir.y.abs() > 0.97;
     let depth_z = cam_dir.z.abs() > 0.97;
     // Sign for Z-direction fallback push (used when X or Y is the depth axis).
-    let z_out: f32 = if camera_eye.z >= center.z { -1.0 } else { 1.0 };
+    // When camera is at z >= center.z the near Z-face is nice_max.z; push in +Z
+    // (toward the camera) so labels project outside the data volume.
+    let z_out: f32 = if camera_eye.z >= center.z { 1.0 } else { -1.0 };
 
     // ── Pre-compute tick value vectors (reused for grid planes and tick marks) ─
-    let x_show = axis_visible[0] && !depth_x && (!flat_x || tick_override[0].is_some());
-    let y_show = axis_visible[1] && !depth_y && (!flat_y || tick_override[1].is_some());
+    // The flat-axis suppression heuristic is useful for 3D point clouds where an
+    // almost-zero span axis would collapse labels onto one edge. In 2D chart
+    // mode (Z hidden) that heuristic is wrong: a time-series such as
+    // x=[0, 3000], y=[-2, 2] is intentionally high-aspect, and the Y axis must
+    // still render ticks/labels. So only apply flat suppression while the Z axis
+    // is visible (true 3D mode).
+    let suppress_flat = axis_visible[2];
+    let x_show = axis_visible[0]
+        && !depth_x
+        && (!suppress_flat || !flat_x || tick_override[0].is_some());
+    let y_show = axis_visible[1]
+        && !depth_y
+        && (!suppress_flat || !flat_y || tick_override[1].is_some());
     let z_show = axis_visible[2] && !depth_z && (!flat_z || tick_override[2].is_some());
 
     let x_vals = if x_show { axis_ticks(nice_min.x, nice_max.x, x_ticks) } else { vec![] };
@@ -396,12 +467,15 @@ pub fn build_grid(
 
     // ── X ticks ───────────────────────────────────────────────────────────────
     if x_show {
+        // X-axis ticks are pushed in the ±Y direction; use tick_len_y_dir.
+        let x_label_off_y = tick_len_y_dir * 2.0;
+        let x_pad_y       = tick_len_y_dir * 4.8;
         // When depth_y (camera along Y, viewing XZ plane) the normal ±Y push
         // goes into the depth — switch to ±Z so labels remain visible.
         let (x_tick_off, x_label_off, x_pad_off) = if !depth_y {
-            (Vec3::new(0.0, x_y_sign * tick_len,     0.0),
-             Vec3::new(0.0, x_y_sign * label_offset, 0.0),
-             Vec3::new(0.0, x_y_sign * pad,           0.0))
+            (Vec3::new(0.0, x_y_sign * tick_len_y_dir, 0.0),
+             Vec3::new(0.0, x_y_sign * x_label_off_y,  0.0),
+             Vec3::new(0.0, x_y_sign * x_pad_y,         0.0))
         } else {
             (Vec3::new(0.0, 0.0, z_out * tick_len),
              Vec3::new(0.0, 0.0, z_out * label_offset),
@@ -432,12 +506,15 @@ pub fn build_grid(
 
     // ── Y ticks ───────────────────────────────────────────────────────────────
     if y_show {
+        // Y-axis ticks are pushed in the ±X direction; use tick_len_x_dir.
+        let y_label_off_x = tick_len_x_dir * 2.0;
+        let y_pad_x       = tick_len_x_dir * 4.8;
         // When depth_x (camera along X, viewing YZ plane) the normal ±X push
         // goes into the depth — switch to ±Z so labels remain visible.
         let (y_tick_off, y_label_off, y_pad_off) = if !depth_x {
-            (Vec3::new(y_x_sign * tick_len,     0.0, 0.0),
-             Vec3::new(y_x_sign * label_offset, 0.0, 0.0),
-             Vec3::new(y_x_sign * pad,          0.0, 0.0))
+            (Vec3::new(y_x_sign * tick_len_x_dir, 0.0, 0.0),
+             Vec3::new(y_x_sign * y_label_off_x,  0.0, 0.0),
+             Vec3::new(y_x_sign * y_pad_x,         0.0, 0.0))
         } else {
             (Vec3::new(0.0, 0.0, z_out * tick_len),
              Vec3::new(0.0, 0.0, z_out * label_offset),
@@ -541,4 +618,66 @@ pub fn face_bits(camera_eye: Vec3, center: Vec3) -> u8 {
         | ((cam_dir.y.abs() > 0.97) as u8) << 4
         | ((cam_dir.z.abs() > 0.97) as u8) << 5;
     side | depth
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_d_extreme_aspect_keeps_y_axis_labels() {
+        let data_min = Vec3::new(0.0, -2.0, -0.001);
+        let data_max = Vec3::new(3000.0, 2.0, 0.001);
+        let (nice_min, nice_max) = nice_bounds(data_min, data_max);
+        let center = (nice_min + nice_max) * 0.5;
+        let geo = build_grid(
+            data_min,
+            data_max,
+            nice_min,
+            nice_max,
+            [None, None, None],
+            [true, true, false],
+            center + Vec3::new(0.0, 0.0, 10.0),
+            &["X".to_string(), "Y".to_string(), "".to_string()],
+            true,
+            false,
+            Some(((nice_max.x - nice_min.x) * 0.5, (nice_max.y - nice_min.y) * 0.5)),
+        );
+
+        assert!(
+            geo.labels.iter().any(|l| l.is_axis_title && l.text == "Y"),
+            "Y axis title should remain visible in 2D high-aspect plots",
+        );
+        assert!(
+            geo.labels.iter().any(|l| !l.is_axis_title && l.tick_pos.y != center.y),
+            "Y axis tick labels should remain visible in 2D high-aspect plots",
+        );
+    }
+
+    #[test]
+    fn two_d_axes_stay_bottom_and_left_when_camera_is_offset() {
+        let data_min = Vec3::new(0.0, -2.0, -0.001);
+        let data_max = Vec3::new(100.0, 2.0, 0.001);
+        let (nice_min, nice_max) = nice_bounds(data_min, data_max);
+        let center = (nice_min + nice_max) * 0.5;
+        let geo = build_grid(
+            data_min,
+            data_max,
+            nice_min,
+            nice_max,
+            [None, None, None],
+            [true, true, false],
+            center + Vec3::new(-50.0, -10.0, 10.0),
+            &["X".to_string(), "Y".to_string(), "".to_string()],
+            true,
+            false,
+            Some(((nice_max.x - nice_min.x) * 0.5, (nice_max.y - nice_min.y) * 0.5)),
+        );
+
+        let x_title = geo.labels.iter().find(|l| l.is_axis_title && l.text == "X").unwrap();
+        let y_title = geo.labels.iter().find(|l| l.is_axis_title && l.text == "Y").unwrap();
+
+        assert_eq!(x_title.tick_pos.y, nice_min.y, "2D X axis should stay on the bottom edge");
+        assert_eq!(y_title.tick_pos.x, nice_min.x, "2D Y axis should stay on the left edge");
+    }
 }

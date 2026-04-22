@@ -21,10 +21,10 @@ Quick start
     root.mainloop()
 """
 
-from .widget import Scatter3D, Scatter2D, link_cameras, unlink_cameras
+from .widget import Scatter3D, Scatter2D, Line2D, link_cameras, unlink_cameras
 from .figure import Figure
 
-__all__ = ["Scatter3D", "Scatter2D", "Figure", "link_cameras", "unlink_cameras", "scatter3d"]
+__all__ = ["Scatter3D", "Scatter2D", "Line2D", "Figure", "link_cameras", "unlink_cameras", "scatter3d"]
 
 try:
     from .jupyter_widget import JupyterScatter3D, JupyterScatter2D

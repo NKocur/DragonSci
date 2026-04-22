@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use bytemuck::{Pod, Zeroable};
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -9,7 +9,7 @@ use glyphon::{
 use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraState};
-use crate::grid::{build_grid, face_bits, LineVertex};
+use crate::grid::{build_grid, face_bits, format_tick_pub, tick_step, LineVertex};
 
 // ── GPU data structures ───────────────────────────────────────────────────────
 
@@ -100,6 +100,17 @@ struct LineActor {
     visible: bool,
     data_min: Vec3,
     data_max: Vec3,
+}
+
+struct Chart2DLineActor {
+    id: u32,
+    buf: GrowableBuffer,
+    vertex_count: u32,
+    visible: bool,
+    x: Vec<f32>,
+    y: Vec<f32>,
+    color: [f32; 3],
+    line_width: f32,
 }
 
 // ── Mesh overlay actor (convex hulls, ellipsoids) ────────────────────────────
@@ -393,6 +404,78 @@ fn build_label_buffer(font_system: &mut FontSystem, text: &str, size: f32) -> Bu
     buf
 }
 
+// ── Chart2D dedicated rendering path ─────────────────────────────────────────
+
+/// Which role a chart2d text label plays (determines pixel-position formula).
+#[derive(Clone, Copy, PartialEq)]
+enum Chart2DLabelKind { XTick, YTick, XTitle, YTitle }
+
+/// A pre-shaped text label for the chart2d axis system.
+/// Pixel positions are computed each frame from the stored chart state + window size,
+/// so the labels stay correct across window resizes without re-shaping.
+struct Chart2DLabel {
+    /// NDC x (for XTick/XTitle) or NDC y (for YTick/YTitle) of the label's anchor.
+    ndc_val: f32,
+    glyph_buf: Buffer,
+    kind: Chart2DLabelKind,
+}
+
+/// Describes the 2D chart frame: data domain, viewport fractions, axis titles.
+struct Chart2DState {
+    plot_left:   f32,   // viewport fraction [0,1], left edge of the plot area
+    plot_right:  f32,   // viewport fraction [0,1], right edge
+    plot_top:    f32,   // viewport fraction [0,1], top edge (smaller = closer to top of window)
+    plot_bottom: f32,   // viewport fraction [0,1], bottom edge
+    x0: f32, x1: f32,  // xlim (data domain)
+    y0: f32, y1: f32,  // ylim (data domain)
+    x_label: String,
+    y_label: String,
+    /// Cached tick values for x axis — used to skip glyph reshaping when unchanged.
+    x_tick_cache: Vec<f32>,
+    /// Stable major-step interval for X ticks/grid during animated x-range updates.
+    x_tick_step: f32,
+    /// Stable major-step interval for Y ticks/grid during autoscaled y-range updates.
+    y_tick_step: f32,
+}
+
+impl Chart2DState {
+    /// NDC x = scale_x * data_x + offset_x
+    fn scale_x(&self) -> f32 {
+        2.0 * (self.plot_right - self.plot_left) / (self.x1 - self.x0).max(1e-10)
+    }
+    fn offset_x(&self) -> f32 {
+        (2.0 * self.plot_left - 1.0) - self.x0 * self.scale_x()
+    }
+    /// NDC y = scale_y * data_y + offset_y  (positive because NDC Y↑ and data Y↑)
+    fn scale_y(&self) -> f32 {
+        2.0 * (self.plot_bottom - self.plot_top) / (self.y1 - self.y0).max(1e-10)
+    }
+    fn offset_y(&self) -> f32 {
+        (1.0 - 2.0 * self.plot_bottom) - self.y0 * self.scale_y()
+    }
+    /// Pack the 2D affine transform as a full Uniforms struct so the same line
+    /// pipeline and bind-group layout can be reused without a new pipeline.
+    /// The view_proj matrix encodes: ndc = M * [data_x, data_y, 0, 1]^T
+    fn as_uniforms(&self, screen_w: f32, screen_h: f32) -> Uniforms {
+        let sx = self.scale_x();
+        let sy = self.scale_y();
+        let ox = self.offset_x();
+        let oy = self.offset_y();
+        // Column-major 4×4: col[i][j] = row j of column i
+        Uniforms {
+            view_proj: [
+                [sx,  0.0, 0.0, 0.0],  // col 0
+                [0.0, sy,  0.0, 0.0],  // col 1
+                [0.0, 0.0, 1.0, 0.0],  // col 2
+                [ox,  oy,  0.0, 1.0],  // col 3 (translation)
+            ],
+            screen_size: [screen_w, screen_h],
+            style: 0,
+            _pad: 0.0,
+        }
+    }
+}
+
 // ── Renderer ─────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
@@ -510,6 +593,25 @@ pub struct Renderer {
     mesh_pipeline_opaque: wgpu::RenderPipeline,
     mesh_pipeline_transparent: wgpu::RenderPipeline,
     mesh_pipeline_wireframe: wgpu::RenderPipeline,
+    chart2d_line_pipeline: wgpu::RenderPipeline,
+
+    // ── Chart2D dedicated rendering path ─────────────────────────────────────
+    /// When Some, the renderer is in 2D chart mode: world-space grid/scatter is
+    /// replaced by NDC-space axis geometry + chart-transform data lines.
+    chart2d_state: Option<Chart2DState>,
+    /// Uniform buffer holding the chart2d 4×4 affine transform (same Uniforms
+    /// layout as the main buffer — reuses the existing pipeline/bind-group layout).
+    chart2d_uniform_buf: wgpu::Buffer,
+    /// Bind group pointing at chart2d_uniform_buf (same layout as uniform_bind_group).
+    chart2d_bind_group: wgpu::BindGroup,
+    /// NDC-space chart chrome: frame, X/Y grid lines, and X/Y tick marks.
+    chart2d_axis_buf: GrowableBuffer,
+    chart2d_axis_count: u32,
+    /// Data-space chart lines rendered as thick triangle meshes.
+    chart2d_line_actors: Vec<Chart2DLineActor>,
+    next_chart2d_line_id: u32,
+    /// Pre-shaped text labels for the chart2d axis; positions computed each frame.
+    chart2d_text_labels: Vec<Chart2DLabel>,
 }
 
 impl Renderer {
@@ -622,6 +724,21 @@ impl Renderer {
             }],
         });
 
+        // Chart2D uniform: same layout, but COPY_DST so set_chart2d() can update it.
+        let chart2d_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chart2d_uniforms"),
+            contents: bytemuck::bytes_of(&dummy_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let chart2d_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chart2d_bg"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: chart2d_uniform_buf.as_entire_binding(),
+            }],
+        });
+
         let point_pipeline = build_point_pipeline(
             &device,
             &uniform_layout,
@@ -661,6 +778,9 @@ impl Renderer {
         let mesh_pipeline_opaque      = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
         let mesh_pipeline_transparent = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
         let mesh_pipeline_wireframe   = build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
+        let chart2d_line_pipeline = build_chart2d_line_pipeline(
+            &device, &uniform_layout, surface_format, mesh_wgsl,
+        );
 
         Ok(Self {
             device,
@@ -736,6 +856,15 @@ impl Renderer {
             mesh_pipeline_opaque,
             mesh_pipeline_transparent,
             mesh_pipeline_wireframe,
+            chart2d_line_pipeline,
+            chart2d_state: None,
+            chart2d_uniform_buf,
+            chart2d_bind_group,
+            chart2d_axis_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            chart2d_axis_count: 0,
+            chart2d_line_actors: Vec::new(),
+            next_chart2d_line_id: 0,
+            chart2d_text_labels: Vec::new(),
         })
     }
 
@@ -822,6 +951,20 @@ impl Renderer {
             }],
         });
 
+        let chart2d_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chart2d_uniforms"),
+            contents: bytemuck::bytes_of(&dummy_uniforms),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let chart2d_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chart2d_bg"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: chart2d_uniform_buf.as_entire_binding(),
+            }],
+        });
+
         let point_pipeline = build_point_pipeline(
             &device, &uniform_layout, surface_format,
             include_str!("shaders/points.wgsl"),
@@ -859,6 +1002,9 @@ impl Renderer {
         let mesh_pipeline_opaque      = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
         let mesh_pipeline_transparent = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
         let mesh_pipeline_wireframe   = build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
+        let chart2d_line_pipeline = build_chart2d_line_pipeline(
+            &device, &uniform_layout, surface_format, mesh_wgsl,
+        );
 
         Ok(Self {
             device,
@@ -934,6 +1080,15 @@ impl Renderer {
             mesh_pipeline_opaque,
             mesh_pipeline_transparent,
             mesh_pipeline_wireframe,
+            chart2d_line_pipeline,
+            chart2d_state: None,
+            chart2d_uniform_buf,
+            chart2d_bind_group,
+            chart2d_axis_buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            chart2d_axis_count: 0,
+            chart2d_line_actors: Vec::new(),
+            next_chart2d_line_id: 0,
+            chart2d_text_labels: Vec::new(),
         })
     }
 
@@ -1804,6 +1959,310 @@ impl Renderer {
         result
     }
 
+    // ── Chart2D rendering path ────────────────────────────────────────────────
+
+    /// Enable chart2D mode.  All subsequent renders use a dedicated 2D transform
+    /// instead of the 3D camera.  Call again whenever xlim/ylim/labels change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_chart2d(
+        &mut self,
+        plot_left:   f32, plot_right: f32,
+        plot_top:    f32, plot_bottom: f32,
+        x0: f32, x1: f32,
+        y0: f32, y1: f32,
+        x_label: String, y_label: String,
+        y_tick_step_override: Option<f32>,
+    ) {
+        let x_step = tick_step(x0, x1, 5);
+        let y_step = y_tick_step_override
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or_else(|| tick_step(y0, y1, 5));
+        let mut state = Chart2DState { plot_left, plot_right, plot_top, plot_bottom,
+                                       x0, x1, y0, y1, x_label, y_label,
+                                       x_tick_cache: Vec::new(),
+                                       x_tick_step: x_step,
+                                       y_tick_step: y_step };
+
+        // Update the chart2d uniform buffer with the new affine transform.
+        let u = state.as_uniforms(self.width as f32, self.height as f32);
+        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+
+        // Rebuild NDC-space axis geometry (frame, Y grid, tick marks).
+        let verts = build_chart2d_axis_verts(&state, self.width, self.height);
+        self.chart2d_axis_count = verts.len() as u32;
+        if !verts.is_empty() {
+            self.chart2d_axis_buf.upload(
+                &self.device, &self.queue, bytemuck::cast_slice(&verts));
+        }
+
+        // Rebuild pre-shaped text labels for ticks + axis titles.
+        self.chart2d_text_labels.clear();
+        let sz_tick  = 11.0_f32;
+        let sz_title = 13.0_f32;
+        let sx = state.scale_x();
+        let ox = state.offset_x();
+        let sy = state.scale_y();
+        let oy = state.offset_y();
+
+        // X tick labels — save values in cache for future xlim-only updates.
+        let x_ticks = axis_ticks_fixed_step(x0, x1, state.x_tick_step);
+        state.x_tick_cache = x_ticks.clone();
+        for &xt in &x_ticks {
+            let ndc_x = sx * xt + ox;
+            if ndc_x < -1.05 || ndc_x > 1.05 { continue; }
+            let buf = build_label_buffer(&mut self.font_system, &format_tick_pub(xt), sz_tick);
+            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: ndc_x, glyph_buf: buf, kind: Chart2DLabelKind::XTick });
+        }
+        // Y tick labels
+        for &yt in &axis_ticks_fixed_step(y0, y1, state.y_tick_step) {
+            let ndc_y = sy * yt + oy;
+            if ndc_y < -1.05 || ndc_y > 1.05 { continue; }
+            let buf = build_label_buffer(&mut self.font_system, &format_tick_pub(yt), sz_tick);
+            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: ndc_y, glyph_buf: buf, kind: Chart2DLabelKind::YTick });
+        }
+        // X axis title
+        if !state.x_label.is_empty() {
+            let buf = build_label_buffer(&mut self.font_system, &state.x_label, sz_title);
+            let mid_ndc = (state.scale_x() * (x0 + x1) * 0.5 + state.offset_x())
+                            .clamp(-1.0, 1.0);
+            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: mid_ndc, glyph_buf: buf, kind: Chart2DLabelKind::XTitle });
+        }
+        // Y axis title
+        if !state.y_label.is_empty() {
+            let buf = build_label_buffer(&mut self.font_system, &state.y_label, sz_title);
+            let mid_ndc = (state.scale_y() * (y0 + y1) * 0.5 + state.offset_y())
+                            .clamp(-1.0, 1.0);
+            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: mid_ndc, glyph_buf: buf, kind: Chart2DLabelKind::YTitle });
+        }
+
+        self.chart2d_state = Some(state);
+        self.rebuild_all_chart2d_lines();
+    }
+
+    /// Fast path: slide xlim without touching y-tick / title glyphs.
+    /// Called at animation rate (≈60 fps) while a time-series stream is scrolling.
+    ///
+    /// Cost breakdown:
+    ///   Always:   uniform buffer write + chart chrome rebuild (cheap).
+    ///   When tick values change: x-tick glyph reshape.
+    pub fn chart2d_update_xlim(&mut self, x0: f32, x1: f32) {
+        if self.chart2d_state.is_none() { return; }
+
+        // Keep the X tick interval stable during animated x-range updates.
+        let step = self.chart2d_state.as_ref().unwrap().x_tick_step;
+        let new_ticks = axis_ticks_fixed_step(x0, x1, step);
+        let ticks_changed = new_ticks != self.chart2d_state.as_ref().unwrap().x_tick_cache;
+
+        // Update state.
+        {
+            let s = self.chart2d_state.as_mut().unwrap();
+            s.x0 = x0;
+            s.x1 = x1;
+            s.x_tick_cache = new_ticks.clone();
+        }
+
+        // Always: update the affine transform.
+        let u = self.chart2d_state.as_ref().unwrap()
+            .as_uniforms(self.width as f32, self.height as f32);
+        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+
+        // Always: rebuild axis geometry so X tick marks track the new xlim.
+        // This is cheap (a few dozen vertices) and avoids stale tick-mark positions.
+        let frame_verts = build_chart2d_axis_verts(
+            self.chart2d_state.as_ref().unwrap(), self.width, self.height);
+        self.chart2d_axis_count = frame_verts.len() as u32;
+        if !frame_verts.is_empty() {
+            self.chart2d_axis_buf.upload(
+                &self.device, &self.queue, bytemuck::cast_slice(&frame_verts));
+        }
+
+        // Only when tick values change: reshape glyphs.
+        if ticks_changed {
+            self.chart2d_text_labels.retain(|l| !matches!(l.kind, Chart2DLabelKind::XTick));
+            let sx = self.chart2d_state.as_ref().unwrap().scale_x();
+            let ox = self.chart2d_state.as_ref().unwrap().offset_x();
+            let sz_tick = 11.0_f32;
+            for &xt in &new_ticks {
+                let ndc_x = sx * xt + ox;
+                if ndc_x < -1.05 || ndc_x > 1.05 { continue; }
+                let buf = build_label_buffer(&mut self.font_system, &format_tick_pub(xt), sz_tick);
+                self.chart2d_text_labels.push(Chart2DLabel {
+                    ndc_val: ndc_x, glyph_buf: buf, kind: Chart2DLabelKind::XTick,
+                });
+            }
+        } else {
+            // Tick values unchanged — just recompute NDC positions in-place.
+            let sx = self.chart2d_state.as_ref().unwrap().scale_x();
+            let ox = self.chart2d_state.as_ref().unwrap().offset_x();
+            let mut i = 0;
+            for label in self.chart2d_text_labels.iter_mut() {
+                if !matches!(label.kind, Chart2DLabelKind::XTick) { continue; }
+                if i < new_ticks.len() {
+                    label.ndc_val = sx * new_ticks[i] + ox;
+                    i += 1;
+                }
+            }
+        }
+        self.rebuild_all_chart2d_lines();
+    }
+
+    /// Fast path: update only the y data-range while keeping the Y tick interval fixed.
+    pub fn chart2d_update_ylim(&mut self, y0: f32, y1: f32) {
+        if self.chart2d_state.is_none() { return; }
+
+        let step = self.chart2d_state.as_ref().unwrap().y_tick_step;
+        let new_ticks = axis_ticks_fixed_step(y0, y1, step);
+
+        {
+            let s = self.chart2d_state.as_mut().unwrap();
+            s.y0 = y0;
+            s.y1 = y1;
+        }
+
+        let u = self.chart2d_state.as_ref().unwrap()
+            .as_uniforms(self.width as f32, self.height as f32);
+        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+
+        let frame_verts = build_chart2d_axis_verts(
+            self.chart2d_state.as_ref().unwrap(), self.width, self.height);
+        self.chart2d_axis_count = frame_verts.len() as u32;
+        if !frame_verts.is_empty() {
+            self.chart2d_axis_buf.upload(
+                &self.device, &self.queue, bytemuck::cast_slice(&frame_verts));
+        }
+
+        self.chart2d_text_labels
+            .retain(|l| !matches!(l.kind, Chart2DLabelKind::YTick));
+        let sy = self.chart2d_state.as_ref().unwrap().scale_y();
+        let oy = self.chart2d_state.as_ref().unwrap().offset_y();
+        let sz_tick = 11.0_f32;
+        for &yt in &new_ticks {
+            let ndc_y = sy * yt + oy;
+            if ndc_y < -1.05 || ndc_y > 1.05 { continue; }
+            let buf = build_label_buffer(&mut self.font_system, &format_tick_pub(yt), sz_tick);
+            self.chart2d_text_labels.push(Chart2DLabel {
+                ndc_val: ndc_y, glyph_buf: buf, kind: Chart2DLabelKind::YTick,
+            });
+        }
+
+        let mid_ndc = (self.chart2d_state.as_ref().unwrap().scale_y() * (y0 + y1) * 0.5
+                        + self.chart2d_state.as_ref().unwrap().offset_y())
+                        .clamp(-1.0, 1.0);
+        for label in self.chart2d_text_labels.iter_mut() {
+            if matches!(label.kind, Chart2DLabelKind::YTitle) {
+                label.ndc_val = mid_ndc;
+            }
+        }
+        self.rebuild_all_chart2d_lines();
+    }
+
+    fn rebuild_chart2d_line_actor(&self, actor: &mut Chart2DLineActor) {
+        let verts = xy_to_thick_line_vertices(
+            &actor.x,
+            &actor.y,
+            actor.color,
+            actor.line_width,
+            self.chart2d_state.as_ref(),
+            self.width,
+            self.height,
+        );
+        actor.vertex_count = verts.len() as u32;
+        if verts.is_empty() {
+            actor.buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
+        } else {
+            actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        }
+    }
+
+    fn rebuild_all_chart2d_lines(&mut self) {
+        if self.chart2d_state.is_none() {
+            return;
+        }
+        let mut actors = std::mem::take(&mut self.chart2d_line_actors);
+        for actor in &mut actors {
+            self.rebuild_chart2d_line_actor(actor);
+        }
+        self.chart2d_line_actors = actors;
+    }
+
+    /// Add a polyline in data space; returns a handle.  The chart2d affine
+    /// transform converts data (x,y) → NDC at render time.
+    pub fn chart2d_add_line(
+        &mut self,
+        x: &[f32],
+        y: &[f32],
+        color: [f32; 3],
+        line_width: f32,
+    ) -> u32 {
+        let id = self.next_chart2d_line_id;
+        self.next_chart2d_line_id += 1;
+        let mut actor = Chart2DLineActor {
+            id,
+            buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            vertex_count: 0,
+            visible: true,
+            x: x.to_vec(),
+            y: y.to_vec(),
+            color,
+            line_width,
+        };
+        self.rebuild_chart2d_line_actor(&mut actor);
+        self.chart2d_line_actors.push(actor);
+        id
+    }
+
+    /// Replace a chart2d polyline's geometry.
+    pub fn chart2d_update_line(
+        &mut self,
+        id: u32,
+        x: &[f32],
+        y: &[f32],
+        color: [f32; 3],
+        line_width: f32,
+    ) -> bool {
+        if let Some(a) = self.chart2d_line_actors.iter_mut().find(|a| a.id == id) {
+            a.x.clear();
+            a.x.extend_from_slice(x);
+            a.y.clear();
+            a.y.extend_from_slice(y);
+            a.color = color;
+            a.line_width = line_width;
+            let verts = xy_to_thick_line_vertices(
+                &a.x,
+                &a.y,
+                a.color,
+                a.line_width,
+                self.chart2d_state.as_ref(),
+                self.width,
+                self.height,
+            );
+            a.vertex_count = verts.len() as u32;
+            if verts.is_empty() {
+                a.buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
+            } else {
+                a.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a chart2d polyline by handle.
+    pub fn chart2d_remove_line(&mut self, id: u32) -> bool {
+        if let Some(pos) = self.chart2d_line_actors.iter().position(|a| a.id == id) {
+            self.chart2d_line_actors.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove all chart2d polylines.
+    pub fn chart2d_clear_lines(&mut self) {
+        self.chart2d_line_actors.clear();
+    }
+
     // ── Line overlay actors ───────────────────────────────────────────────────
 
     pub fn add_line_actor(&mut self, vertices: &[LineVertex]) -> u32 {
@@ -1978,10 +2437,18 @@ impl Renderer {
 
         let eye = self.camera.position();
         let axis_texts = self.axis_label_texts.clone();
+        // Pass the independent ortho extents when set_parallel_scale is active so
+        // build_grid can size tick marks relative to the visible range of each axis.
+        let ortho_scale = if self.camera.ortho_half_w > 0.0 && self.camera.ortho_half_h > 0.0 {
+            Some((self.camera.ortho_half_w, self.camera.ortho_half_h))
+        } else {
+            None
+        };
         let geo = build_grid(dmin, dmax, nmin, nmax,
                              self.tick_override, self.axis_visible,
                              eye, &axis_texts,
-                             self.major_grid_planes, self.minor_grid_planes);
+                             self.major_grid_planes, self.minor_grid_planes,
+                             ortho_scale);
 
         self.line_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&geo.vertices));
         self.line_count = geo.vertices.len() as u32;
@@ -2094,6 +2561,17 @@ impl Renderer {
         self.camera.parallel = on;
     }
 
+    /// Set independent half-extents for the orthographic projection.
+    /// When called, the camera shows exactly [-half_w, half_w] × [-half_h, half_h]
+    /// centred on `camera.target`, regardless of the data aspect ratio.
+    /// Implicitly enables parallel projection.
+    /// Cleared by any `fit_camera` call (e.g. on `add_points` with unfitted camera).
+    pub fn set_parallel_scale(&mut self, half_w: f32, half_h: f32) {
+        self.camera.ortho_half_w = half_w.max(1e-6);
+        self.camera.ortho_half_h = half_h.max(1e-6);
+        self.camera.parallel = true;
+    }
+
     /// Reorient camera to a preset view direction, preserving target and distance.
     /// `yaw` and `pitch` are the spherical angles for the desired look direction.
     pub fn set_view_direction(&mut self, yaw: f32, pitch: f32) {
@@ -2189,37 +2667,78 @@ impl Renderer {
                 timestamp_writes: None,
             });
 
-            pass.set_pipeline(&self.line_pipeline);
-            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            if self.grid_visible {
-                if let Some(slice) = self.line_buf.slice() {
+            if self.chart2d_state.is_some() {
+                pass.set_pipeline(&self.line_pipeline_nodepth);
+
+                let (sc_x, sc_y, sc_w, sc_h) = if let Some(ref state) = self.chart2d_state {
+                    let sx = (state.plot_left * self.width as f32).floor() as u32;
+                    let sy = (state.plot_top * self.height as f32).floor() as u32;
+                    let sw = ((state.plot_right - state.plot_left) * self.width as f32).ceil() as u32 + 1;
+                    let sh = ((state.plot_bottom - state.plot_top) * self.height as f32).ceil() as u32 + 1;
+                    (
+                        sx.min(self.width.saturating_sub(1)),
+                        sy.min(self.height.saturating_sub(1)),
+                        sw.min(self.width.saturating_sub(sx)),
+                        sh.min(self.height.saturating_sub(sy)),
+                    )
+                } else {
+                    (0, 0, self.width, self.height)
+                };
+
+                pass.set_bind_group(0, &self.overlay_bind_group, &[]);
+                if self.chart2d_axis_count > 0 {
+                    if let Some(slice) = self.chart2d_axis_buf.slice() {
+                        pass.set_vertex_buffer(0, slice);
+                        pass.draw(0..self.chart2d_axis_count, 0..1);
+                    }
+                }
+
+                pass.set_pipeline(&self.chart2d_line_pipeline);
+                pass.set_bind_group(0, &self.chart2d_bind_group, &[]);
+                pass.set_scissor_rect(sc_x, sc_y, sc_w, sc_h);
+                for la in &self.chart2d_line_actors {
+                    if la.visible && la.vertex_count > 0 {
+                        if let Some(slice) = la.buf.slice() {
+                            pass.set_vertex_buffer(0, slice);
+                            pass.draw(0..la.vertex_count, 0..1);
+                        }
+                    }
+                }
+                pass.set_scissor_rect(0, 0, self.width, self.height);
+            } else {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                if self.grid_visible {
+                    if let Some(slice) = self.line_buf.slice() {
                     pass.set_vertex_buffer(0, slice);
                     pass.draw(0..self.line_count, 0..1);
+                    }
                 }
-            }
-            for la in &self.line_actors {
-                if la.visible && la.vertex_count > 0 {
-                    if let Some(slice) = la.buf.slice() {
+                for la in &self.line_actors {
+                    if la.visible && la.vertex_count > 0 {
+                        if let Some(slice) = la.buf.slice() {
                         pass.set_vertex_buffer(0, slice);
                         pass.draw(0..la.vertex_count, 0..1);
+                        }
                     }
                 }
-            }
-            pass.set_pipeline(&self.point_pipeline);
-            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            for actor in &self.actors {
-                if actor.visible && actor.count > 0 {
-                    if let Some(slice) = actor.buf.slice() {
+                pass.set_pipeline(&self.point_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                for actor in &self.actors {
+                    if actor.visible && actor.count > 0 {
+                        if let Some(slice) = actor.buf.slice() {
                         pass.set_vertex_buffer(0, slice);
                         pass.draw(0..6, 0..actor.count);
+                        }
                     }
                 }
-            }
 
             // ── Mesh actors (convex hulls, ellipsoids) ─────────────────────────
             draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
                              &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
                              &self.uniform_bind_group, view_proj, &mut pass);
+
+            }
 
             pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(0, &self.overlay_bind_group, &[]);
@@ -2328,9 +2847,10 @@ impl Renderer {
         };
 
         // Rebuild grid geometry if the camera has crossed an axis midplane since
-        // the last frame.  This is cheap (small vertex/label counts) and only
-        // fires on the handful of frames where the face selection changes.
-        self.update_grid_for_camera();
+        // the last frame.  Skipped in chart2d mode (no world-space grid).
+        if self.chart2d_state.is_none() {
+            self.update_grid_for_camera();
+        }
 
         let view_proj = self.camera.view_proj();
         let uniforms = Uniforms {
@@ -2376,41 +2896,79 @@ impl Renderer {
                 timestamp_writes: None,
             });
 
-            pass.set_pipeline(&self.line_pipeline);
-            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            if self.grid_visible {
-                if let Some(slice) = self.line_buf.slice() {
-                    pass.set_vertex_buffer(0, slice);
-                    pass.draw(0..self.line_count, 0..1);
-                }
-            }
-            // User-defined line overlay actors (depth-tested)
-            for la in &self.line_actors {
-                if la.visible && la.vertex_count > 0 {
-                    if let Some(slice) = la.buf.slice() {
+            if self.chart2d_state.is_some() {
+                // ── Chart2D path ───────────────────────────────────────────────
+                pass.set_pipeline(&self.line_pipeline_nodepth);
+
+                // Compute scissor rect for plot area.
+                let (sc_x, sc_y, sc_w, sc_h) = if let Some(ref state) = self.chart2d_state {
+                    let sx = (state.plot_left   * self.width  as f32).floor() as u32;
+                    let sy = (state.plot_top     * self.height as f32).floor() as u32;
+                    let sw = ((state.plot_right  - state.plot_left)   * self.width  as f32).ceil() as u32 + 1;
+                    let sh = ((state.plot_bottom - state.plot_top)    * self.height as f32).ceil() as u32 + 1;
+                    (sx.min(self.width.saturating_sub(1)),
+                     sy.min(self.height.saturating_sub(1)),
+                     sw.min(self.width.saturating_sub(sx)),
+                     sh.min(self.height.saturating_sub(sy)))
+                } else { (0, 0, self.width, self.height) };
+
+                // Frame + grid lines + tick marks (NDC space, identity bind group).
+                pass.set_bind_group(0, &self.overlay_bind_group, &[]);
+                if self.chart2d_axis_count > 0 {
+                    if let Some(slice) = self.chart2d_axis_buf.slice() {
                         pass.set_vertex_buffer(0, slice);
-                        pass.draw(0..la.vertex_count, 0..1);
+                        pass.draw(0..self.chart2d_axis_count, 0..1);
                     }
                 }
-            }
 
-            pass.set_pipeline(&self.point_pipeline);
-            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            let lod = self.lod_factor.max(1);
-            for actor in &self.actors {
-                if actor.visible && actor.count > 0 {
-                    if let Some(slice) = actor.buf.slice() {
-                        pass.set_vertex_buffer(0, slice);
-                        pass.draw(0..6, 0..(actor.count / lod).max(1));
+                // Data lines: chart2d transform, clipped to plot area.
+                pass.set_pipeline(&self.chart2d_line_pipeline);
+                pass.set_bind_group(0, &self.chart2d_bind_group, &[]);
+                pass.set_scissor_rect(sc_x, sc_y, sc_w, sc_h);
+                for la in &self.chart2d_line_actors {
+                    if la.visible && la.vertex_count > 0 {
+                        if let Some(slice) = la.buf.slice() {
+                            pass.set_vertex_buffer(0, slice);
+                            pass.draw(0..la.vertex_count, 0..1);
+                        }
                     }
                 }
+                pass.set_scissor_rect(0, 0, self.width, self.height);
+            } else {
+                // ── Normal 3D path ─────────────────────────────────────────────
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                if self.grid_visible {
+                    if let Some(slice) = self.line_buf.slice() {
+                        pass.set_vertex_buffer(0, slice);
+                        pass.draw(0..self.line_count, 0..1);
+                    }
+                }
+                for la in &self.line_actors {
+                    if la.visible && la.vertex_count > 0 {
+                        if let Some(slice) = la.buf.slice() {
+                            pass.set_vertex_buffer(0, slice);
+                            pass.draw(0..la.vertex_count, 0..1);
+                        }
+                    }
+                }
+                pass.set_pipeline(&self.point_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                let lod = self.lod_factor.max(1);
+                for actor in &self.actors {
+                    if actor.visible && actor.count > 0 {
+                        if let Some(slice) = actor.buf.slice() {
+                            pass.set_vertex_buffer(0, slice);
+                            pass.draw(0..6, 0..(actor.count / lod).max(1));
+                        }
+                    }
+                }
+                draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
+                                 &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
+                                 &self.uniform_bind_group, view_proj, &mut pass);
             }
 
-            // ── Mesh actors (convex hulls, ellipsoids) ─────────────────────────
-            draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
-                             &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
-                             &self.uniform_bind_group, view_proj, &mut pass);
-
+            // ── Screen-space overlays (always drawn regardless of mode) ────────
             // Scalar bar: screen-space overlay drawn with identity view_proj.
             pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(0, &self.overlay_bind_group, &[]);
@@ -2659,14 +3217,17 @@ impl Renderer {
             let mut sy = (1.0 - ndc.y) * 0.5 * h as f32;
 
             if label.is_axis_title {
-                // Axis titles: push 24px away from the grid center (screen mid).
-                let cx = w as f32 * 0.5;
-                let cy = h as f32 * 0.5;
-                let dx = sx - cx;
-                let dy = sy - cy;
-                let len = (dx * dx + dy * dy).sqrt().max(1.0);
-                sx += dx / len * 24.0;
-                sy += dy / len * 24.0;
+                if self.axis_visible[2] {
+                    // 3D mode: titles sit slightly farther from the cube so they
+                    // clear the silhouette across viewing angles.
+                    let cx = w as f32 * 0.5;
+                    let cy = h as f32 * 0.5;
+                    let dx = sx - cx;
+                    let dy = sy - cy;
+                    let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                    sx += dx / len * 24.0;
+                    sy += dy / len * 24.0;
+                }
             } else {
                 // Tick labels: push away from their tick mark; suppress when depth-aligned.
                 let tick_clip = vp * label.tick_pos.extend(1.0);
@@ -2702,6 +3263,77 @@ impl Renderer {
             });
         }
         } // end grid_visible guard
+
+        // Chart2D axis labels — pixel positions computed dynamically from state + w/h.
+        if let Some(ref state) = self.chart2d_state {
+            let pl_px  = state.plot_left   * w as f32;
+            let pb_px  = state.plot_bottom * h as f32;
+            let pt_px  = state.plot_top    * h as f32;
+            let line_h = 11.0_f32 * 1.4;  // matches sz_tick * 1.4 from build_label_buffer
+
+            // Pre-compute max Y-tick label width so the Y-axis title can be
+            // placed to the left of the widest tick without overlapping.
+            let max_ytick_w: f32 = self.chart2d_text_labels.iter()
+                .filter(|l| matches!(l.kind, Chart2DLabelKind::YTick))
+                .map(|l| l.glyph_buf.layout_runs()
+                    .flat_map(|r| r.glyphs.iter())
+                    .fold(0.0_f32, |acc, g| acc.max(g.x + g.w)))
+                .fold(0.0_f32, f32::max);
+
+            for label in &self.chart2d_text_labels {
+                let (sx, sy, color) = match label.kind {
+                    Chart2DLabelKind::XTick => {
+                        let px = (label.ndc_val + 1.0) * 0.5 * w as f32;
+                        let text_w: f32 = label.glyph_buf.layout_runs()
+                            .flat_map(|r| r.glyphs.iter())
+                            .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
+                        (px - text_w * 0.5, pb_px + 6.0, Color::rgb(190, 190, 195))
+                    }
+                    Chart2DLabelKind::YTick => {
+                        let py = (1.0 - label.ndc_val) * 0.5 * h as f32;
+                        let text_w: f32 = label.glyph_buf.layout_runs()
+                            .flat_map(|r| r.glyphs.iter())
+                            .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
+                        (pl_px - 8.0 - text_w, py - line_h * 0.5, Color::rgb(190, 190, 195))
+                    }
+                    Chart2DLabelKind::XTitle => {
+                        let px = (label.ndc_val + 1.0) * 0.5 * w as f32;
+                        let text_w: f32 = label.glyph_buf.layout_runs()
+                            .flat_map(|r| r.glyphs.iter())
+                            .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
+                        (px - text_w * 0.5, pb_px + 28.0, Color::rgb(210, 210, 230))
+                    }
+                    Chart2DLabelKind::YTitle => {
+                        let py = (1.0 - label.ndc_val) * 0.5 * h as f32;
+                        let text_w: f32 = label.glyph_buf.layout_runs()
+                            .flat_map(|r| r.glyphs.iter())
+                            .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
+                        let title_h = 13.0_f32 * 1.4;
+                        // Place to the left of the widest tick label (8px gap + 6px gap).
+                        let right_edge = pl_px - 8.0 - max_ytick_w - 6.0;
+                        (right_edge - text_w, py - title_h * 0.5, Color::rgb(210, 210, 230))
+                    }
+                };
+                // Suppress labels that would fall outside the window.
+                if sx < -100.0 || sy < -100.0 || sx > w as f32 + 100.0 || sy > h as f32 + 100.0 {
+                    continue;
+                }
+                // In 2D chart mode also suppress Y labels that are too close to
+                // the top or bottom of the plot area (would overlap the frame).
+                if matches!(label.kind, Chart2DLabelKind::YTick) {
+                    if sy < pt_px - 4.0 || sy + line_h > pb_px + 4.0 { continue; }
+                }
+                text_areas.push(TextArea {
+                    buffer: &label.glyph_buf,
+                    left: sx,
+                    top: sy,
+                    scale: 1.0,
+                    bounds: TextBounds::default(),
+                    default_color: color,
+                    custom_glyphs: &[],
+                });
+            }
+        }
 
         // Scalar bar text labels (screen-space, pixel positions already known).
         for lbl in &self.scalar_bar_labels {
@@ -2787,6 +3419,179 @@ impl Renderer {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn push_chart2d_tri(
+    out: &mut Vec<MeshVertex>,
+    a: Vec2,
+    b: Vec2,
+    c: Vec2,
+    color: [f32; 3],
+) {
+    let rgba = [color[0], color[1], color[2], 1.0];
+    out.push(MeshVertex { position: [a.x, a.y, 0.0], color: rgba });
+    out.push(MeshVertex { position: [b.x, b.y, 0.0], color: rgba });
+    out.push(MeshVertex { position: [c.x, c.y, 0.0], color: rgba });
+}
+
+fn xy_to_thick_line_vertices(
+    x: &[f32],
+    y: &[f32],
+    color: [f32; 3],
+    line_width: f32,
+    state: Option<&Chart2DState>,
+    width: u32,
+    height: u32,
+) -> Vec<MeshVertex> {
+    let Some(state) = state else { return vec![]; };
+    let n = x.len().min(y.len());
+    if n < 2 || !line_width.is_finite() || line_width <= 0.0 {
+        return vec![];
+    }
+
+    let px_per_x = (state.plot_right - state.plot_left) * width.max(1) as f32
+        / (state.x1 - state.x0).abs().max(1e-10);
+    let px_per_y = (state.plot_bottom - state.plot_top) * height.max(1) as f32
+        / (state.y1 - state.y0).abs().max(1e-10);
+    if px_per_x <= 0.0 || px_per_y <= 0.0 {
+        return vec![];
+    }
+
+    let mut pts: Vec<Vec2> = Vec::with_capacity(n);
+    for i in 0..n {
+        let xi = x[i];
+        let yi = y[i];
+        if !xi.is_finite() || !yi.is_finite() {
+            continue;
+        }
+        let p = Vec2::new(xi, yi);
+        if pts.last().is_some_and(|q| (*q - p).length_squared() < 1e-12) {
+            continue;
+        }
+        pts.push(p);
+    }
+    if pts.len() < 2 {
+        return vec![];
+    }
+
+    let mut seg_normals: Vec<Vec2> = Vec::with_capacity(pts.len() - 1);
+    for win in pts.windows(2) {
+        let d = win[1] - win[0];
+        let d_screen = Vec2::new(d.x * px_per_x, d.y * px_per_y);
+        let len = d_screen.length();
+        if len < 1e-6 {
+            continue;
+        }
+        let dir = d_screen / len;
+        seg_normals.push(Vec2::new(-dir.y, dir.x));
+    }
+    if seg_normals.is_empty() {
+        return vec![];
+    }
+
+    let half_w = line_width * 0.5;
+    let last = pts.len() - 1;
+    let mut offsets_screen = vec![Vec2::ZERO; pts.len()];
+    offsets_screen[0] = seg_normals[0] * half_w;
+    offsets_screen[last] = seg_normals[seg_normals.len() - 1] * half_w;
+    for i in 1..last {
+        let n_prev = seg_normals[i - 1];
+        let n_next = seg_normals[i.min(seg_normals.len() - 1)];
+        let sum = n_prev + n_next;
+        if sum.length_squared() < 1e-6 {
+            offsets_screen[i] = n_next * half_w;
+            continue;
+        }
+        let miter = sum.normalize();
+        let denom = miter.dot(n_next).abs();
+        let scale = if denom < 0.25 {
+            half_w
+        } else {
+            (half_w / denom).min(half_w * 4.0)
+        };
+        offsets_screen[i] = miter * scale;
+    }
+
+    let mut out = Vec::with_capacity((pts.len() - 1) * 6);
+    for i in 0..last {
+        let off0 = Vec2::new(offsets_screen[i].x / px_per_x, offsets_screen[i].y / px_per_y);
+        let off1 = Vec2::new(
+            offsets_screen[i + 1].x / px_per_x,
+            offsets_screen[i + 1].y / px_per_y,
+        );
+        let p0 = pts[i];
+        let p1 = pts[i + 1];
+        let l0 = p0 + off0;
+        let r0 = p0 - off0;
+        let l1 = p1 + off1;
+        let r1 = p1 - off1;
+        push_chart2d_tri(&mut out, l0, r0, l1, color);
+        push_chart2d_tri(&mut out, l1, r0, r1, color);
+    }
+    out
+}
+
+/// Build NDC-space geometry for: 4-side frame, X/Y grid lines, and X/Y tick marks.
+fn build_chart2d_axis_verts(state: &Chart2DState, width: u32, height: u32) -> Vec<LineVertex> {
+    let (pl, pr, pt, pb) = (state.plot_left, state.plot_right, state.plot_top, state.plot_bottom);
+    let ndc_l = pl * 2.0 - 1.0;
+    let ndc_r = pr * 2.0 - 1.0;
+    let ndc_t = 1.0 - 2.0 * pt;
+    let ndc_b = 1.0 - 2.0 * pb;
+
+    let frame_col: [f32; 3] = [0.55, 0.55, 0.60];
+    let grid_col:  [f32; 3] = [0.18, 0.18, 0.22];
+
+    let tick_y = 7.0 / height.max(1) as f32 * 2.0;
+    let tick_x = 7.0 / width.max(1)  as f32 * 2.0;
+
+    let sx = state.scale_x(); let ox = state.offset_x();
+    let sy = state.scale_y(); let oy = state.offset_y();
+
+    let mut v: Vec<LineVertex> = Vec::new();
+    let mut seg = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
+        v.push(LineVertex { position: a, color: c });
+        v.push(LineVertex { position: b, color: c });
+    };
+
+    // Frame (4 edges)
+    seg([ndc_l, ndc_b, 0.0], [ndc_r, ndc_b, 0.0], frame_col);
+    seg([ndc_l, ndc_b, 0.0], [ndc_l, ndc_t, 0.0], frame_col);
+    seg([ndc_l, ndc_t, 0.0], [ndc_r, ndc_t, 0.0], frame_col);
+    seg([ndc_r, ndc_t, 0.0], [ndc_r, ndc_b, 0.0], frame_col);
+
+    // X grid lines + tick marks
+    for &xt in &axis_ticks_fixed_step(state.x0, state.x1, state.x_tick_step) {
+        let nx = sx * xt + ox;
+        if nx < ndc_l - 0.002 || nx > ndc_r + 0.002 { continue; }
+        seg([nx, ndc_b, 0.0], [nx, ndc_t, 0.0], grid_col);
+        seg([nx, ndc_b, 0.0], [nx, ndc_b - tick_y, 0.0], frame_col);
+    }
+
+    // Y tick marks + Y grid lines
+    for &yt in &axis_ticks_fixed_step(state.y0, state.y1, state.y_tick_step) {
+        let ny = sy * yt + oy;
+        if ny < ndc_b - 0.002 || ny > ndc_t + 0.002 { continue; }
+        seg([ndc_l, ny, 0.0], [ndc_l - tick_x, ny, 0.0], frame_col);
+        seg([ndc_l, ny, 0.0], [ndc_r,  ny, 0.0], grid_col);
+    }
+
+    v
+}
+
+fn axis_ticks_fixed_step(lo: f32, hi: f32, step: f32) -> Vec<f32> {
+    let range = hi - lo;
+    if range < 1e-10 || step <= 0.0 {
+        return vec![];
+    }
+    let first = (lo / step).ceil() * step;
+    let mut ticks = Vec::new();
+    let mut t = first;
+    while t <= hi + step * 1e-4 {
+        ticks.push(t);
+        t += step;
+    }
+    ticks
+}
 
 /// Ray-casting point-in-polygon test (screen space, Y-down).
 fn point_in_polygon(px: f32, py: f32, poly: &[[f32; 2]]) -> bool {
@@ -3000,6 +3805,66 @@ fn build_mesh_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: if transparent { Some(wgpu::BlendState::ALPHA_BLENDING) } else { None },
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+fn build_chart2d_line_pipeline(
+    device: &wgpu::Device,
+    uniform_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+    wgsl: &str,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("chart2d_line_shader"),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("chart2d_line_layout"),
+        bind_group_layouts: &[uniform_layout],
+        push_constant_ranges: &[],
+    });
+    let stride = std::mem::size_of::<MeshVertex>() as u64;
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("chart2d_line_pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: stride,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                ],
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -3290,6 +4155,140 @@ mod tests {
         assert!(dist_a_sq > R * R,
             "A's dist² ({dist_a_sq}) must exceed R² ({}) so the fallback fires", R * R);
     }
+
+    #[test]
+    fn chart2d_fixed_step_ticks_do_not_flip_between_nice_intervals() {
+        let t0 = axis_ticks_fixed_step(0.0, 10.0, 2.0);
+        let t1 = axis_ticks_fixed_step(0.001, 10.001, 2.0);
+        let t2 = axis_ticks_fixed_step(1.999, 11.999, 2.0);
+
+        assert_eq!(t0, vec![0.0, 2.0, 4.0, 6.0, 8.0, 10.0]);
+        assert_eq!(t1, vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+        assert_eq!(t2, vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn chart2d_fixed_step_y_ticks_do_not_flip_between_nice_intervals() {
+        let t0 = axis_ticks_fixed_step(-2.0, 2.0, 1.0);
+        let t1 = axis_ticks_fixed_step(-1.99, 2.01, 1.0);
+        let t2 = axis_ticks_fixed_step(-1.01, 2.99, 1.0);
+
+        assert_eq!(t0, vec![-2.0, -1.0, 0.0, 1.0, 2.0]);
+        assert_eq!(t1, vec![-1.0, 0.0, 1.0, 2.0]);
+        assert_eq!(t2, vec![-1.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn chart2d_thick_line_generates_triangle_mesh() {
+        let x = [0.0, 10.0];
+        let y = [0.0, 0.0];
+        let color = [1.0, 0.0, 0.0];
+        let state = Chart2DState {
+            plot_left: 0.1,
+            plot_right: 0.9,
+            plot_top: 0.1,
+            plot_bottom: 0.9,
+            x0: 0.0,
+            x1: 10.0,
+            y0: -1.0,
+            y1: 1.0,
+            x_label: String::new(),
+            y_label: String::new(),
+            x_tick_cache: Vec::new(),
+            x_tick_step: 2.0,
+            y_tick_step: 1.0,
+        };
+
+        let verts = xy_to_thick_line_vertices(&x, &y, color, 4.0, Some(&state), 800, 600);
+
+        assert_eq!(verts.len(), 6);
+        let y_span = verts
+            .iter()
+            .map(|v| v.position[1])
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| (mn.min(yv), mx.max(yv)));
+        assert!(y_span.1 > y_span.0);
+    }
+
+    #[test]
+    fn chart2d_wider_lines_produce_larger_mesh_span() {
+        let color = [1.0, 1.0, 1.0];
+        let x = [0.0, 10.0];
+        let y = [0.0, 0.0];
+        let state = Chart2DState {
+            plot_left: 0.1,
+            plot_right: 0.9,
+            plot_top: 0.1,
+            plot_bottom: 0.9,
+            x0: 0.0,
+            x1: 10.0,
+            y0: -1.0,
+            y1: 1.0,
+            x_label: String::new(),
+            y_label: String::new(),
+            x_tick_cache: Vec::new(),
+            x_tick_step: 2.0,
+            y_tick_step: 1.0,
+        };
+
+        let narrow = xy_to_thick_line_vertices(&x, &y, color, 2.0, Some(&state), 800, 600);
+        let wide = xy_to_thick_line_vertices(&x, &y, color, 8.0, Some(&state), 800, 600);
+
+        let span = |verts: &[MeshVertex]| {
+            let (mn, mx) = verts
+                .iter()
+                .map(|v| v.position[1])
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| (mn.min(yv), mx.max(yv)));
+            mx - mn
+        };
+        assert!(span(&wide) > span(&narrow));
+    }
+
+    #[test]
+    fn chart2d_line_width_in_data_units_tracks_y_scale() {
+        let color = [1.0, 1.0, 1.0];
+        let state0 = Chart2DState {
+            plot_left: 0.1,
+            plot_right: 0.9,
+            plot_top: 0.1,
+            plot_bottom: 0.9,
+            x0: 0.0,
+            x1: 10.0,
+            y0: -1.0,
+            y1: 1.0,
+            x_label: String::new(),
+            y_label: String::new(),
+            x_tick_cache: Vec::new(),
+            x_tick_step: 2.0,
+            y_tick_step: 1.0,
+        };
+        let state1 = Chart2DState {
+            plot_left: 0.1,
+            plot_right: 0.9,
+            plot_top: 0.1,
+            plot_bottom: 0.9,
+            x0: 0.0,
+            x1: 10.0,
+            y0: -10.0,
+            y1: 10.0,
+            x_label: String::new(),
+            y_label: String::new(),
+            x_tick_cache: Vec::new(),
+            x_tick_step: 2.0,
+            y_tick_step: 5.0,
+        };
+        let line_x = [0.0, 10.0];
+        let y = [0.0, 0.0];
+
+        let line0 = xy_to_thick_line_vertices(&line_x, &y, color, 4.0, Some(&state0), 800, 600);
+        let line1 = xy_to_thick_line_vertices(&line_x, &y, color, 4.0, Some(&state1), 800, 600);
+
+        let span = |verts: &[MeshVertex]| {
+            let (mn, mx) = verts
+                .iter()
+                .map(|v| v.position[1])
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| (mn.min(yv), mx.max(yv)));
+            mx - mn
+        };
+        assert!(span(&line1) > span(&line0));
+    }
 }
-
-

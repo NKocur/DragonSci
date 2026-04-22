@@ -11,11 +11,12 @@ Usage
 """
 from __future__ import annotations
 
+import time
 import tkinter as tk
 import tkinter.filedialog as fd
 import numpy as np
 
-from dragonsci import Scatter3D, Scatter2D, Figure, link_cameras, unlink_cameras
+from dragonsci import Scatter3D, Scatter2D, Line2D, Figure, link_cameras, unlink_cameras
 
 # ── Theme ──────────────────────────────────────────────────────────────────────
 
@@ -134,6 +135,7 @@ class DemoApp(tk.Tk):
         ("── planned ──",    "",                 True),   # separator
         ("Lasso Selection",   "_sec_lasso",       False),
         ("Streaming",         "_sec_streaming",   False),
+        ("Line2D",            "_sec_line2d",      False),
     ]
 
     def __init__(self):
@@ -225,6 +227,14 @@ class DemoApp(tk.Tk):
         self.scatter = cls(self._scatter_parent, fps=60, bg="#0d0d0d")
         self.scatter.pack(fill="both", expand=True)
 
+    def _scatter_class_for_section(self, method: str):
+        """Return the widget class the target section expects."""
+        if method == "_sec_line2d":
+            return Line2D
+        if method in ("_sec_2dmode", "_sec_marginals"):
+            return Scatter2D
+        return Scatter3D
+
     def _switch(self, method: str) -> None:
         # Tear down Figure if leaving that section.
         if self._figure is not None and method != "_sec_figure":
@@ -232,9 +242,10 @@ class DemoApp(tk.Tk):
             self._figure = None
             self.scatter.pack(fill="both", expand=True)
 
-        # If leaving 2D mode, restore the Scatter3D widget.
-        if isinstance(self.scatter, Scatter2D) and method not in ("_sec_2dmode", "_sec_marginals"):
-            self._swap_scatter(Scatter3D)
+        # Ensure the shared widget type matches the section we're entering.
+        target_cls = self._scatter_class_for_section(method)
+        if type(self.scatter) is not target_cls:
+            self._swap_scatter(target_cls)
 
         # Reset scatter state that may have been changed by previous section
         self.scatter.disable_picking()
@@ -1746,6 +1757,367 @@ class DemoApp(tk.Tk):
         _label(p, textvariable=info_var, fg=ACT)
 
         _load_clusters()
+
+    def _sec_line2d(self, p: tk.Frame) -> None:
+        self._swap_scatter(Line2D)
+        w = self.scatter          # type: Line2D
+
+        # ── State ────────────────────────────────────────────────────────────
+        running:   "list[bool]"       = [False]
+        after_id:  "list[str | None]" = [None]
+        total_pts: "list[int]"        = [0]
+
+        color_map = {
+            "Blue":   (0.3,  0.7,  1.0),
+            "Orange": (1.0,  0.55, 0.1),
+            "Green":  (0.2,  0.9,  0.4),
+            "Pink":   (0.95, 0.4,  0.75),
+        }
+
+        n_var     = tk.IntVar(value=50)
+        rate_var  = tk.IntVar(value=30)
+        max_var   = tk.IntVar(value=3_000)
+        shape_var = tk.StringVar(value="sine")
+        line_a_color_var = tk.StringVar(value="Blue")
+        line_b_color_var = tk.StringVar(value="Orange")
+        line_c_color_var = tk.StringVar(value="Green")
+        stream_color_var = tk.StringVar(value="Blue")
+        line_a_width_var = tk.DoubleVar(value=2.5)
+        line_b_width_var = tk.DoubleVar(value=2.5)
+        line_c_width_var = tk.DoubleVar(value=2.5)
+        stream_width_var = tk.DoubleVar(value=2.5)
+        y_tick_var = tk.DoubleVar(value=1.0)
+        current_plot: "list[str]" = ["static"]
+        count_var = tk.StringVar(value="—")
+
+        # ── Helpers ───────────────────────────────────────────────────────────
+        def _color_dropdown(parent: tk.Frame, label: str, var: tk.StringVar, cmd) -> None:
+            row = tk.Frame(parent, bg=PANEL)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, bg=PANEL, fg=FG, font=FM,
+                     anchor="w").pack(side="left")
+            menu = tk.OptionMenu(row, var, *color_map.keys(), command=lambda *_: cmd())
+            menu.configure(bg="#222", fg=FG, activebackground="#333",
+                           activeforeground=ACT, relief="flat", bd=0,
+                           font=FM, highlightthickness=0)
+            menu["menu"].configure(bg="#222", fg=FG, activebackground="#333",
+                                   activeforeground=ACT, font=FM)
+            menu.pack(side="right", fill="x", expand=True)
+
+        def _reset_widget():
+            """Clear all line geometry and reset axis state."""
+            _stop_stream()
+            # Remove the active time-series stream if there is one.
+            if ts_handle[0] is not None:
+                try:
+                    w.remove_line_stream(ts_handle[0])
+                except Exception:
+                    pass
+                ts_handle[0] = None
+            w.clear_overlays()
+            # Remove primary line from renderer if present.
+            if w._primary_handle is not None:
+                if w._renderer is not None:
+                    w._renderer.chart2d_remove_line(w._primary_handle)
+                w._primary_handle = None
+            w._pending_primary = None
+            # Remove named lines from renderer.
+            if w._renderer is not None:
+                for h in list(w._named_lines):
+                    w._renderer.chart2d_remove_line(h)
+            w._named_lines.clear()
+            w._pending_named_lines.clear()
+            w._nhandle_map.clear()
+            w._xlim = None
+            w._ylim = None
+            w._x_limits_frozen = False
+            w._y_limits_frozen = False
+            w._limits_frozen = False
+            w._chart2d_sent = False
+            w.set_y_tick_interval(y_tick_var.get())
+
+        # ── Static examples ───────────────────────────────────────────────────
+        def _load_static(*_):
+            _reset_widget()
+            current_plot[0] = "static"
+            x = np.linspace(0, 4 * np.pi, 1_000, dtype=np.float32)
+            # set_line triggers _auto_fit on first call → derives xlim/ylim from data
+            w.set_line(
+                x,
+                np.sin(x),
+                color=color_map[line_a_color_var.get()],
+                line_width=line_a_width_var.get(),
+            )
+            w.add_line(
+                x,
+                np.cos(x),
+                color=color_map[line_b_color_var.get()],
+                line_width=line_b_width_var.get(),
+            )
+            w.add_line(
+                x,
+                np.sin(2 * x) * 0.5,
+                color=color_map[line_c_color_var.get()],
+                line_width=line_c_width_var.get(),
+            )
+            count_var.set("3 static lines")
+            self._status("Line2D — static plot loaded")
+
+        def _load_lissajous(*_):
+            _reset_widget()
+            current_plot[0] = "lissajous"
+            t = np.linspace(0, 2 * np.pi, 2_000, dtype=np.float32)
+            colors = [
+                color_map[line_a_color_var.get()],
+                color_map[line_b_color_var.get()],
+                color_map[line_c_color_var.get()],
+            ]
+            widths = [
+                line_a_width_var.get(),
+                line_b_width_var.get(),
+                line_c_width_var.get(),
+            ]
+            for i, (a, b, delta) in enumerate([(3, 2, np.pi / 4),
+                                               (5, 4, np.pi / 2),
+                                               (7, 6, np.pi / 3)]):
+                w.add_line(np.sin(a * t + delta), np.sin(b * t),
+                           color=colors[i],
+                           line_width=widths[i])
+            count_var.set("3 Lissajous curves")
+            self._status("Line2D — Lissajous curves")
+
+        # ── Streaming ─────────────────────────────────────────────────────────
+        def _apply_static_appearance() -> None:
+            if running[0]:
+                return
+            if current_plot[0] == "static":
+                _load_static()
+            elif current_plot[0] == "lissajous":
+                _load_lissajous()
+
+        # Time-series style: x = elapsed wall time (seconds), sliding window.
+        # Data tick: emits sample batches at the requested callback cadence.
+        # Axis tick: slides xlim at ~60 fps using the same wall-clock origin.
+        ts_handle:         "list[int | None]" = [None]
+        ts_start_wall:     "list[float]"      = [0.0]
+        ts_last_batch_wall:"list[float]"      = [0.0]
+        noise_y_last:      "list[float]"      = [0.0]
+        anim_id:           "list[str | None]" = [None]
+        max_scale:         list               = [None]  # Scale widget ref for disable during stream
+        WINDOW_SEC = 10.0
+
+        def _gen_samples(n: int):
+            """Return (x_times, y_values) for the elapsed wall-time since the last batch."""
+            now_wall = time.monotonic()
+            t0_wall = ts_last_batch_wall[0]
+            t1_wall = max(now_wall, t0_wall + 1e-6)
+            dt_sample = (t1_wall - t0_wall) / max(n, 1)
+            t0 = t0_wall - ts_start_wall[0]
+            times = (t0 + (np.arange(n, dtype=np.float64) + 1.0) * dt_sample).astype(np.float32)
+            ts_last_batch_wall[0] = t1_wall
+            shape = shape_var.get()
+            if shape == "sine":
+                y = np.sin(times * 4).astype(np.float32)
+            elif shape == "sawtooth":
+                y = ((times % 1.0) * 2 - 1).astype(np.float32)
+            else:  # noise / random walk
+                steps = RNG.standard_normal(n).astype(np.float32) * 0.08
+                y = np.cumsum(steps, dtype=np.float32) + noise_y_last[0]
+                noise_y_last[0] = float(y[-1])
+            return times, y
+
+        def _make_stream():
+            if ts_handle[0] is not None:
+                w.remove_line_stream(ts_handle[0])
+                ts_handle[0] = None
+            current_plot[0] = "stream"
+            seed_now = time.monotonic()
+            seed_dt = rate_var.get() / 1000.0
+            ts_start_wall[0] = seed_now - seed_dt
+            ts_last_batch_wall[0] = ts_start_wall[0]
+            noise_y_last[0] = 0.0
+            clr = color_map[stream_color_var.get()]
+            ts_handle[0] = w.add_line_stream(
+                max_points=max_var.get(),
+                mode="ring",
+                color=clr,
+                line_width=stream_width_var.get(),
+            )
+            w.set_y_tick_interval(y_tick_var.get())
+            w.set_xlim(0.0, WINDOW_SEC)
+            count_var.set("0 pts")
+
+        def _apply_stream_appearance() -> None:
+            if ts_handle[0] is None:
+                return
+            st = w._line_streams.get(ts_handle[0])
+            if st is None:
+                return
+            st["color"] = color_map[stream_color_var.get()]
+            st["line_width"] = float(stream_width_var.get())
+            if st["render_handle"] is None or w._renderer is None:
+                return
+            xs, ys = w._stream_ordered(st)
+            if xs is None:
+                return
+            w._renderer.chart2d_update_line(
+                st["render_handle"], xs, ys, st["color"], st["line_width"])
+            w._mark_dirty()
+            self._status("Line2D stream appearance updated")
+
+        def _axis_animate():
+            """Runs at ~60 fps to slide xlim smoothly, independent of data rate."""
+            if not running[0]:
+                anim_id[0] = None
+                return
+            t_now = time.monotonic() - ts_start_wall[0]
+            w.set_xlim(max(0.0, t_now - WINDOW_SEC), max(WINDOW_SEC, t_now))
+            anim_id[0] = w.after(16, _axis_animate)
+
+        def _tick():
+            if not running[0] or ts_handle[0] is None:
+                after_id[0] = None
+                return
+            n  = n_var.get()
+            ms = rate_var.get()
+            xs, ys = _gen_samples(n)
+            w.stream_line(ts_handle[0], xs, ys)
+            total_pts[0] += n
+            count_var.set(f"{total_pts[0]:,} pts streamed")
+            after_id[0] = w.after(ms, _tick)
+
+        def _set_stream_controls(streaming: bool) -> None:
+            if max_scale[0] is not None:
+                max_scale[0].configure(state="disabled" if streaming else "normal")
+
+        def _start_stream():
+            if running[0]:
+                return
+            _reset_widget()
+            _make_stream()
+            running[0] = True
+            _tick()
+            _axis_animate()
+            _set_stream_controls(True)
+            self._status("Line2D stream running")
+
+        def _stop_stream():
+            running[0] = False
+            for id_cell in (after_id, anim_id):
+                if id_cell[0] is not None:
+                    try:
+                        w.after_cancel(id_cell[0])
+                    except Exception:
+                        pass
+                    id_cell[0] = None
+            _set_stream_controls(False)
+
+        def _restart_stream():
+            _stop_stream()
+            _make_stream()
+            running[0] = True
+            _tick()
+            _axis_animate()
+            _set_stream_controls(True)
+
+        def _clear_stream():
+            if ts_handle[0] is not None:
+                w.clear_line_stream(ts_handle[0])
+                seed_now = time.monotonic()
+                seed_dt = rate_var.get() / 1000.0
+                ts_start_wall[0] = seed_now - seed_dt
+                ts_last_batch_wall[0] = ts_start_wall[0]
+                noise_y_last[0] = 0.0
+                total_pts[0] = 0
+                w.set_xlim(0.0, WINDOW_SEC)
+                count_var.set("cleared")
+
+        # Stop timers both when the widget itself is replaced and when the
+        # section controls are torn down during navigation.
+        w.bind("<Destroy>", lambda _: _stop_stream(), add="+")
+        p.bind("<Destroy>", lambda e: _stop_stream() if e.widget is p else None, add="+")
+
+        # ── Controls ──────────────────────────────────────────────────────────
+        _head(p, "STATIC PLOTS")
+        _btn(p, "sin / cos / sin(2x)", _load_static)
+        _btn(p, "Lissajous curves",    _load_lissajous)
+
+        _head(p, "STATIC LINE COLORS")
+        _color_dropdown(p, "Line A", line_a_color_var, _apply_static_appearance)
+        _color_dropdown(p, "Line B", line_b_color_var, _apply_static_appearance)
+        _color_dropdown(p, "Line C", line_c_color_var, _apply_static_appearance)
+
+        _head(p, "STATIC LINE WIDTHS")
+        for label, var in [
+            ("Line A", line_a_width_var),
+            ("Line B", line_b_width_var),
+            ("Line C", line_c_width_var),
+        ]:
+            row = tk.Frame(p, bg=PANEL)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=label, bg=PANEL, fg=FG, font=FM,
+                     anchor="w").pack(fill="x")
+            tk.Scale(
+                row, variable=var, from_=1.0, to=10.0, resolution=0.5,
+                orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                highlightthickness=0,
+                command=lambda _v, cmd=_apply_static_appearance: cmd(),
+            ).pack(fill="x")
+
+        _head(p, "STREAM CONTROLS")
+        _btn(p, "Start stream",  _start_stream)
+        _btn(p, "Stop",          _stop_stream)
+        _btn(p, "Restart",       _restart_stream)
+        _btn(p, "Clear buffer",  _clear_stream)
+
+        _head(p, "SHAPE")
+        _radio_group(p, shape_var,
+                     [("Sine",     "sine"),
+                      ("Sawtooth", "sawtooth"),
+                      ("Noise",    "noise")],
+                     lambda *_: None)
+
+        _head(p, "COLOR")
+        _radio_group(p, stream_color_var,
+                     [("Blue",   "Blue"),
+                      ("Orange", "Orange"),
+                      ("Green",  "Green"),
+                      ("Pink",   "Pink")],
+                     _apply_stream_appearance)
+
+        _head(p, "STREAM LINE WIDTH")
+        tk.Scale(p, variable=stream_width_var, from_=1.0, to=10.0, resolution=0.5,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0,
+                 command=lambda _v: _apply_stream_appearance()).pack(fill="x")
+
+        _head(p, "SAMPLES / UPDATE")
+        tk.Scale(p, variable=n_var, from_=1, to=500, resolution=1,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0).pack(fill="x")
+
+        _head(p, "UPDATE EVERY (ms)")
+        tk.Scale(p, variable=rate_var, from_=16, to=200, resolution=4,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0).pack(fill="x")
+
+        _head(p, "MAX POINTS (restart to apply)")
+        _s = tk.Scale(p, variable=max_var, from_=100, to=20_000, resolution=100,
+                      orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                      highlightthickness=0)
+        _s.pack(fill="x")
+        max_scale[0] = _s
+
+        _head(p, "Y GRID INTERVAL")
+        tk.Scale(p, variable=y_tick_var, from_=0.1, to=5.0, resolution=0.1,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0,
+                 command=lambda v: w.set_y_tick_interval(float(v))).pack(fill="x")
+
+        _head(p, "STATUS")
+        _label(p, textvariable=count_var, fg=ACT)
+
+        _load_static()
 
 
 if __name__ == "__main__":

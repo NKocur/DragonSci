@@ -21,7 +21,7 @@ pytest.importorskip(
     reason="Rust extension not built — run: maturin develop --release",
 )
 import dragonsci
-from dragonsci import Scatter3D, Scatter2D, link_cameras, unlink_cameras
+from dragonsci import Line2D, Scatter3D, Scatter2D, link_cameras, unlink_cameras
 
 
 def _scene_metadata(widget):
@@ -1380,6 +1380,15 @@ def widget2d(root):
     w.destroy()
 
 
+@pytest.fixture()
+def line2d(root):
+    w = Line2D(root, width=320, height=240)
+    w.pack()
+    root.update_idletasks()
+    yield w
+    w.destroy()
+
+
 def test_scatter2d_creates(widget2d):
     """Scatter2D must instantiate without crash."""
     assert isinstance(widget2d, Scatter2D)
@@ -1501,6 +1510,262 @@ def test_scatter2d_set_camera_snaps_back(root):
 def test_scatter2d_axis_labels(widget2d):
     """Scatter2D must default to ('X', 'Y', '') axis labels."""
     assert widget2d._axis_labels == ("X", "Y", "")
+
+
+def test_line2d_drag_does_not_pan(line2d):
+    """Line2D must not forward plain drag motion to renderer.mouse_drag()."""
+    import unittest.mock as mock
+
+    line2d._renderer = mock.Mock()
+    line2d._drag_btn = 1
+    line2d._drag_x = 20
+    line2d._drag_y = 20
+    line2d._rect_active = False
+    line2d._lasso_active = False
+
+    ev = mock.Mock(x=60, y=80)
+    line2d._drag_move(ev, 1)
+
+    line2d._renderer.mouse_drag.assert_not_called()
+
+
+def test_line2d_scroll_does_not_zoom(line2d):
+    """Line2D must ignore wheel zoom so the chart frame stays fixed."""
+    import unittest.mock as mock
+
+    line2d._renderer = mock.Mock()
+    ev = mock.Mock(delta=120)
+    line2d._on_scroll(ev)
+    line2d._on_scroll_up_x11(ev)
+    line2d._on_scroll_down_x11(ev)
+
+    line2d._renderer.scroll.assert_not_called()
+
+
+def test_line2d_set_line_passes_width_to_renderer(line2d):
+    """set_line() must forward the configured line width to the renderer."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+
+    line2d.set_line([0.0, 1.0, 2.0], [1.0, 0.5, 1.5], line_width=3.5)
+
+    renderer.chart2d_add_line.assert_called_once()
+    assert renderer.chart2d_add_line.call_args.args[3] == 3.5
+    assert line2d._primary_width == 3.5
+
+
+def test_line2d_update_line_preserves_and_updates_width(line2d):
+    """update_line() must keep the existing width by default and accept overrides."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    handle = 42
+    line2d._named_lines[handle] = {
+        "color": (0.1, 0.2, 0.3),
+        "line_width": 4.0,
+    }
+
+    line2d.update_line(handle, [0.0, 1.0], [0.0, 1.0])
+    assert renderer.chart2d_update_line.call_args.args[4] == 4.0
+
+    line2d.update_line(handle, [0.0, 1.0], [1.0, 0.0], line_width=6.0)
+    assert renderer.chart2d_update_line.call_args.args[4] == 6.0
+    assert line2d._named_lines[handle]["line_width"] == 6.0
+
+
+def test_line2d_stream_line_passes_width_to_renderer(line2d):
+    """Streaming line uploads must retain the configured width."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+
+    handle = line2d.add_line_stream(max_points=8, line_width=5.0)
+    line2d.stream_line(handle, [0.0, 1.0, 2.0], [1.0, 0.0, 1.0])
+
+    renderer.chart2d_add_line.assert_called_once()
+    assert renderer.chart2d_add_line.call_args.args[3] == 5.0
+
+
+def test_line2d_stream_line_keeps_width_after_wrap(line2d):
+    """Streaming lines must keep the original width after later updates."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+
+    handle = line2d.add_line_stream(max_points=3, line_width=2.5)
+    line2d.stream_line(handle, [10.0, 11.0, 12.0], [0.0, 1.0, 0.0])
+    assert renderer.chart2d_add_line.call_args.args[3] == 2.5
+
+    line2d.stream_line(handle, [13.0, 14.0], [1.0, 0.0])
+    assert renderer.chart2d_update_line.call_args.args[4] == 2.5
+
+
+def test_line2d_invalid_width_raises(line2d):
+    with pytest.raises(ValueError, match="positive finite"):
+        line2d.set_line([0.0, 1.0], [0.0, 1.0], line_width=0.0)
+
+
+def test_line2d_add_line_before_map_returns_virtual_handle(line2d):
+    """Secondary Line2D lines must queue cleanly before the renderer is mapped."""
+    assert line2d._renderer is None
+
+    handle = line2d.add_line([0.0, 1.0], [1.0, 0.0], line_width=3.0)
+
+    assert handle >= 0
+    assert handle in line2d._pending_named_lines
+    _x, _y, _color, width = line2d._pending_named_lines[handle]
+    assert width == 3.0
+
+
+def test_line2d_auto_fit_derives_limits_from_data(line2d):
+    """_auto_fit must derive xlim/ylim from nice-rounded bounds, then call
+    set_chart2d on the renderer with those limits."""
+    import unittest.mock as mock
+    import numpy as np
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+
+    x = np.array([10.0, 20.0, 30.0], dtype=np.float32)
+    y = np.array([0.0, 5.0, -1.0], dtype=np.float32)
+
+    line2d._auto_fit(x, y)
+
+    # xlim/ylim must have been set
+    assert line2d._xlim is not None
+    assert line2d._ylim is not None
+    assert line2d._xlim[0] <= 10.0  # at or left of data minimum
+    assert line2d._xlim[1] >= 30.0  # at or right of data maximum
+    assert line2d._ylim[0] <= -1.0  # at or below data minimum
+    assert line2d._ylim[1] >= 5.0   # at or above data maximum
+
+    # set_chart2d must have been called with the correct limits
+    renderer.set_chart2d.assert_called()
+    call_args = renderer.set_chart2d.call_args
+    x0, x1 = call_args.args[4], call_args.args[5]
+    y0, y1 = call_args.args[6], call_args.args[7]
+    assert x0 == line2d._xlim[0]
+    assert x1 == line2d._xlim[1]
+    assert y0 == line2d._ylim[0]
+    assert y1 == line2d._ylim[1]
+
+
+def test_line2d_animated_set_xlim_uses_fast_path(line2d):
+    """After the first set_chart2d, sliding set_xlim must use chart2d_update_xlim,
+    not call set_chart2d again — verifying the _chart2d_sent fast-path gate."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._ylim = (-1.0, 1.0)
+
+    # First set_xlim triggers a full set_chart2d (chart not yet configured).
+    line2d.set_xlim(0.0, 10.0)
+    assert renderer.set_chart2d.call_count == 1
+    assert renderer.chart2d_update_xlim.call_count == 0
+
+    # Subsequent set_xlim calls must use the fast path.
+    line2d.set_xlim(1.0, 11.0)
+    line2d.set_xlim(2.0, 12.0)
+    assert renderer.set_chart2d.call_count == 1, "set_chart2d must not be called again"
+    assert renderer.chart2d_update_xlim.call_count == 2
+
+    # The fast-path calls must pass the correct limits.
+    last = renderer.chart2d_update_xlim.call_args
+    assert last.args == (2.0, 12.0)
+
+
+def test_line2d_set_ylim_does_full_rebuild(line2d):
+    """set_ylim always does a full set_chart2d because y-tick glyphs must be rebuilt."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+
+    line2d.set_ylim(-1.0, 1.0)
+    assert renderer.set_chart2d.call_count == 1
+
+    # A second set_ylim must also do a full rebuild (not the xlim fast path).
+    line2d.set_ylim(-2.0, 2.0)
+    assert renderer.set_chart2d.call_count == 2
+    assert renderer.chart2d_update_xlim.call_count == 0
+
+
+def test_line2d_set_y_tick_interval_passes_override(line2d):
+    """Custom Y tick spacing must be forwarded through set_chart2d."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-2.0, 2.0)
+
+    line2d.set_y_tick_interval(0.5)
+
+    renderer.set_chart2d.assert_called_once()
+    assert renderer.set_chart2d.call_args.args[10] == 0.5
+
+
+def test_line2d_auto_fit_with_frozen_x_uses_y_fast_path(line2d):
+    """When x is frozen but y is auto, _auto_fit must update only y via the
+    chart2d_update_ylim fast path."""
+    import unittest.mock as mock
+    import numpy as np
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._x_limits_frozen = True
+    line2d._y_limits_frozen = False
+    line2d._sync_limit_freeze()
+
+    x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    y = np.array([-3.2, 1.1, 4.4], dtype=np.float32)
+
+    line2d._auto_fit(x, y)
+
+    renderer.chart2d_update_xlim.assert_not_called()
+    renderer.set_chart2d.assert_not_called()
+    renderer.chart2d_update_ylim.assert_called_once()
+    lo, hi = renderer.chart2d_update_ylim.call_args.args
+    assert lo <= float(y.min())
+    assert hi >= float(y.max())
+    assert line2d._xlim == (0.0, 10.0)
+
+
+def test_line2d_resize_resets_fast_path_gate(line2d):
+    """_do_resize must trigger a full set_chart2d rebuild (axis geometry is in pixels).
+    After the resize rebuild, the fast path is re-armed and the next set_xlim can use it."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._ylim = (-1.0, 1.0)
+
+    line2d.set_xlim(0.0, 10.0)          # first call: full rebuild
+    assert renderer.set_chart2d.call_count == 1
+
+    line2d.set_xlim(1.0, 11.0)          # fast path
+    assert renderer.chart2d_update_xlim.call_count == 1
+    assert renderer.set_chart2d.call_count == 1  # still just 1
+
+    # Simulate a resize — must fire a full set_chart2d (not the fast path).
+    line2d._do_resize(900, 600)
+    assert renderer.set_chart2d.call_count == 2  # full rebuild happened
+    assert line2d._chart2d_sent  # flag re-armed after rebuild
+
+    # Fast path is live again; next set_xlim should not call set_chart2d again.
+    line2d.set_xlim(2.0, 12.0)
+    assert renderer.chart2d_update_xlim.call_count == 2
+    assert renderer.set_chart2d.call_count == 2  # no extra full rebuild
 
 
 # ── Size-by-column tests ──────────────────────────────────────────────────────

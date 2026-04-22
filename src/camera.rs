@@ -13,6 +13,12 @@ pub struct Camera {
     pub far: f32,
     /// When true, use an orthographic projection instead of perspective.
     pub parallel: bool,
+    /// Independent half-extents for orthographic projection.
+    /// When both are > 0 AND `parallel` is true, these override the
+    /// distance/fov_y/aspect calculation, enabling different X and Y scales.
+    /// Reset to 0.0 by `Camera::fit` and `apply_state`.
+    pub ortho_half_w: f32,
+    pub ortho_half_h: f32,
 }
 
 /// Snapshot of camera state returned to / accepted from Python.
@@ -37,6 +43,8 @@ impl Camera {
             near: radius * 0.001,
             far: radius * 100.0,
             parallel: false,
+            ortho_half_w: 0.0,
+            ortho_half_h: 0.0,
         }
     }
 
@@ -55,9 +63,14 @@ impl Camera {
 
     pub fn proj_matrix(&self) -> Mat4 {
         if self.parallel {
-            // Half-height in world units: matches the perspective frustum at distance.
-            let half_h = self.distance * (self.fov_y * 0.5).tan();
-            let half_w = half_h * self.aspect;
+            let (half_w, half_h) = if self.ortho_half_w > 0.0 && self.ortho_half_h > 0.0 {
+                // Explicit independent axis scales (set via set_parallel_scale).
+                (self.ortho_half_w, self.ortho_half_h)
+            } else {
+                // Default: derive from distance and fov so the 3-D scatter view works.
+                let h = self.distance * (self.fov_y * 0.5).tan();
+                (h * self.aspect, h)
+            };
             Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, self.near, self.far)
         } else {
             Mat4::perspective_rh(self.fov_y, self.aspect, self.near, self.far)
@@ -98,10 +111,13 @@ impl Camera {
     }
 
     pub fn apply_state(&mut self, s: CameraState) {
-        self.target   = Vec3::from(s.target);
-        self.distance = s.distance.max(self.near * 10.0);
-        self.yaw      = s.yaw;
-        self.pitch     = s.pitch.clamp(-1.55, 1.55);
-        self.parallel  = s.parallel;
+        self.target       = Vec3::from(s.target);
+        self.distance     = s.distance.max(self.near * 10.0);
+        self.yaw          = s.yaw;
+        self.pitch        = s.pitch.clamp(-1.55, 1.55);
+        self.parallel     = s.parallel;
+        // Clear explicit scale so set_camera() restores default distance-based math.
+        self.ortho_half_w = 0.0;
+        self.ortho_half_h = 0.0;
     }
 }

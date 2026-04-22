@@ -694,6 +694,102 @@ impl PyScatterRenderer {
         ]
     }
 
+    /// Set independent half-extents for orthographic projection.
+    /// After this call the viewport always shows exactly
+    /// [target.x - half_w .. target.x + half_w] × [target.y - half_h .. target.y + half_h].
+    /// Parallel projection is enabled automatically.
+    fn set_parallel_scale(&mut self, half_w: f32, half_h: f32) {
+        self.inner.set_parallel_scale(half_w, half_h);
+    }
+
+    // ── Chart2D dedicated rendering path ──────────────────────────────────────
+
+    /// Enable 2D chart mode with the given frame.
+    ///
+    /// ``plot_left/right/top/bottom`` are viewport fractions in [0, 1].
+    /// ``top`` and ``bottom`` are measured from the *top* of the window
+    /// (so ``top < bottom``).
+    #[pyo3(signature = (plot_left, plot_right, plot_top, plot_bottom,
+                        x0, x1, y0, y1, x_label="", y_label="", y_tick_step=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn set_chart2d(
+        &mut self,
+        plot_left: f32, plot_right: f32, plot_top: f32, plot_bottom: f32,
+        x0: f32, x1: f32, y0: f32, y1: f32,
+        x_label: &str, y_label: &str,
+        y_tick_step: Option<f32>,
+    ) {
+        self.inner.set_chart2d(
+            plot_left, plot_right, plot_top, plot_bottom,
+            x0, x1, y0, y1,
+            x_label.to_string(), y_label.to_string(),
+            y_tick_step,
+        );
+    }
+
+    /// Add a polyline in data (x, y) space; returns a handle.
+    /// The chart2d affine transform converts to NDC at render time.
+    #[pyo3(signature = (x, y, color, line_width=2.0))]
+    fn chart2d_add_line(
+        &mut self,
+        _py: Python<'_>,
+        x: PyReadonlyArray1<f32>,
+        y: PyReadonlyArray1<f32>,
+        color: (f32, f32, f32),
+        line_width: f32,
+    ) -> PyResult<u32> {
+        let xs = x.as_slice()?;
+        let ys = y.as_slice()?;
+        Ok(self.inner.chart2d_add_line(
+            xs,
+            ys,
+            [color.0, color.1, color.2],
+            line_width,
+        ))
+    }
+
+    /// Replace a chart2d polyline's geometry.
+    #[pyo3(signature = (handle, x, y, color, line_width=2.0))]
+    fn chart2d_update_line(
+        &mut self,
+        _py: Python<'_>,
+        handle: u32,
+        x: PyReadonlyArray1<f32>,
+        y: PyReadonlyArray1<f32>,
+        color: (f32, f32, f32),
+        line_width: f32,
+    ) -> bool {
+        let xs = x.as_slice().unwrap_or(&[]);
+        let ys = y.as_slice().unwrap_or(&[]);
+        self.inner.chart2d_update_line(
+            handle,
+            xs,
+            ys,
+            [color.0, color.1, color.2],
+            line_width,
+        )
+    }
+
+    /// Remove a chart2d polyline by handle.
+    fn chart2d_remove_line(&mut self, handle: u32) -> bool {
+        self.inner.chart2d_remove_line(handle)
+    }
+
+    /// Remove all chart2d polylines.
+    fn chart2d_clear_lines(&mut self) {
+        self.inner.chart2d_clear_lines();
+    }
+
+    /// Fast path: update only the x data-range; skips y-tick / title glyph rebuild.
+    fn chart2d_update_xlim(&mut self, x0: f32, x1: f32) {
+        self.inner.chart2d_update_xlim(x0, x1);
+    }
+
+    /// Fast path: update only the y data-range; keeps the Y tick interval fixed.
+    fn chart2d_update_ylim(&mut self, y0: f32, y1: f32) {
+        self.inner.chart2d_update_ylim(y0, y1);
+    }
+
     /// Restore a camera state previously returned by ``get_camera()``.
     fn set_camera(&mut self, state: &pyo3::Bound<'_, pyo3::types::PyDict>) -> PyResult<()> {
         use pyo3::types::PyAnyMethods;

@@ -96,6 +96,59 @@ _LEGEND_POSITION_IDX: dict[str, int] = {
 }
 
 
+def _xy_to_segments(x: "np.ndarray", y: "np.ndarray") -> "np.ndarray":
+    """Convert parallel (N,) x and y arrays into an (N-1, 6) segment array (z=0).
+
+    Each output row is ``[x0, y0, 0, x1, y1, 0]`` — the format expected by
+    :meth:`Scatter3D.add_lines`.  Returns a single degenerate zero-segment when
+    ``len(x) < 2`` so the GPU buffer is never empty.
+    """
+    n = len(x)
+    if n < 2:
+        return np.zeros((1, 6), dtype=np.float32)
+    segs = np.zeros((n - 1, 6), dtype=np.float32)
+    segs[:, 0] = x[:-1]
+    segs[:, 1] = y[:-1]
+    segs[:, 3] = x[1:]
+    segs[:, 4] = y[1:]
+    return segs
+
+
+def _nice_bounds_1d(lo: float, hi: float) -> "tuple[float, float]":
+    """Compute 'nice' rounded axis bounds — mirrors the Rust grid::nice_bounds logic.
+
+    Targets ~5 ticks; step rounds to 1/2/5×10^n.  When the range is
+    degenerate (< 1e-10) a ±0.5 fallback is returned.
+    """
+    import math
+    rng = abs(hi - lo)
+    if rng < 1e-10:
+        return lo - 0.5, hi + 0.5
+    rough = rng / 5.0
+    mag = 10.0 ** math.floor(math.log10(rough))
+    norm = rough / mag
+    if norm <= 1.0:
+        step = 1.0
+    elif norm <= 2.0:
+        step = 2.0
+    elif norm <= 5.0:
+        step = 5.0
+    else:
+        step = 10.0
+    step *= mag
+    return math.floor(lo / step) * step, math.ceil(hi / step) * step
+
+
+def _normalize_line2d_width(line_width: float) -> float:
+    try:
+        value = float(line_width)
+    except Exception as exc:
+        raise ValueError("line width must be a number") from exc
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("line width must be a positive finite number")
+    return value
+
+
 def _is_missing_category_value(value) -> bool:
     if value is None:
         return True
@@ -3114,6 +3167,9 @@ class Scatter2D(Scatter3D):
             return
 
         # Snap to front view after data replay so auto-fit is 2D-correct.
+        # Data replay may call fit_camera() which resets parallel→False, so
+        # restore orthographic projection here unconditionally.
+        self._renderer.set_parallel_projection(True)
         self._renderer.view_xz()
         self._mark_dirty()
 
@@ -3176,6 +3232,7 @@ class Scatter2D(Scatter3D):
         """Fit the camera to the data and restore the 2D front view."""
         super().reset_camera()
         if self._renderer is not None:
+            self._renderer.set_parallel_projection(True)  # reset_camera/fit_camera resets parallel→False
             self._renderer.view_xz()
             self._mark_dirty()
             self._propagate_camera()
@@ -3491,6 +3548,7 @@ class Scatter2D(Scatter3D):
         self._last_prep_pos = None
         super().set_points(positions, **kwargs)
         if self._renderer is not None:
+            self._renderer.set_parallel_projection(True)  # fit_camera() in set_points resets parallel→False
             self._renderer.view_xz()
             self._mark_dirty()
             h = self._scene_actor_handle
@@ -3602,6 +3660,554 @@ class Scatter2D(Scatter3D):
         self._renderer.mouse_drag(float(dx), float(dy), 2)
         self._mark_dirty()
         self._propagate_camera()
+
+
+# ── Line2D ───────────────────────────────────────────────────────────────────
+
+class Line2D(Scatter3D):
+    """A Tkinter widget that renders 2-D line charts using wgpu (Rust).
+
+    Uses a dedicated screen-space chart rendering path instead of the 3D
+    camera — axes are anchored to the window, data lines are clipped to the
+    plot rect, and ticks/labels are positioned in pixel space.  No camera
+    pan/orbit/zoom; the chart frame is stable during streaming.
+
+    Usage — static plot
+    --------------------
+    ::
+
+        import tkinter as tk
+        import numpy as np
+        from dragonsci import Line2D
+
+        root = tk.Tk()
+        w = Line2D(root, width=800, height=600)
+        w.pack(fill="both", expand=True)
+
+        x = np.linspace(0, 4 * np.pi, 1_000)
+        w.set_line(x, np.sin(x))
+
+        root.mainloop()
+
+    Usage — streaming / live plot
+    ------------------------------
+    ::
+
+        w = Line2D(root, width=800, height=600)
+        w.pack(fill="both", expand=True)
+        w.set_xlim(0, 100)
+        w.set_ylim(-1, 1)
+
+        handle = w.add_line_stream(max_points=5_000, mode="ring")
+
+        def tick():
+            w.stream_line(handle, new_x, new_y)
+            w.after(33, tick)
+
+        w.after(33, tick)
+        root.mainloop()
+    """
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        width: int = 800,
+        height: int = 600,
+        fps: int = 60,
+        vsync: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(master, width=width, height=height,
+                         fps=fps, vsync=vsync, **kwargs)
+
+        # Axis limits — drive the chart2d transform.
+        self._xlim: "tuple[float, float] | None" = None
+        self._ylim: "tuple[float, float] | None" = None
+
+        # Axis label text
+        self._xlabel: str = "X"
+        self._ylabel: str = "Y"
+        self._y_tick_interval: "float | None" = None
+
+        # Axis freeze flags: x is often explicit for time-series windows while y stays auto.
+        self._x_limits_frozen: bool = False
+        self._y_limits_frozen: bool = False
+        self._limits_frozen: bool = False
+
+        # Plot rect (viewport fractions). Left/right/top/bottom from the edges.
+        # top < bottom because both are measured from the top of the window.
+        self._pad_left:   float = 0.13
+        self._pad_right:  float = 0.97
+        self._pad_top:    float = 0.04
+        self._pad_bottom: float = 0.88
+
+        # Primary (set_line) handle — replaced on each set_line call.
+        self._primary_handle: "int | None" = None
+        self._primary_color: tuple = (0.3, 0.7, 1.0)
+        self._primary_width: float = 2.0
+        # Pending primary line (set before renderer existed)
+        self._pending_primary: "tuple | None" = None
+
+        # Named extra lines: handle -> {"color": tuple, "line_width": float}
+        self._named_lines: "dict[int, dict]" = {}
+        self._pending_named_lines: "dict[int, tuple[np.ndarray, np.ndarray, tuple, float]]" = {}
+        self._next_nhandle: int = 0
+        self._nhandle_map: "dict[int, int]" = {}
+
+        # Streaming line state: stream-handle (int) → state dict
+        self._line_streams: "dict[int, dict]" = {}
+        self._next_stream: int = 0
+
+        # True once set_chart2d has been sent to the renderer at least once.
+        # Used to gate the fast-path chart2d_update_xlim optimization.
+        self._chart2d_sent: bool = False
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def _init_renderer(self) -> None:
+        super()._init_renderer()
+        if self._renderer is None:
+            return
+        self._push_chart2d()
+        # Replay primary line set before renderer existed.
+        if self._pending_primary is not None:
+            x, y, color, line_width = self._pending_primary
+            self._pending_primary = None
+            self._primary_handle = self._renderer.chart2d_add_line(
+                x, y, color, line_width
+            )
+            self._mark_dirty()
+        # Replay any streams that have data buffered already.
+        for vhandle, (x, y, color, line_width) in list(self._pending_named_lines.items()):
+            real = self._renderer.chart2d_add_line(x, y, color, line_width)
+            self._nhandle_map[vhandle] = real
+            self._named_lines[real] = {"color": color, "line_width": line_width}
+            self._mark_dirty()
+        self._pending_named_lines.clear()
+        for st in self._line_streams.values():
+            cnt = st["count"]
+            if cnt >= 2 and st["render_handle"] is None:
+                xs, ys = self._stream_ordered(st)
+                if xs is not None:
+                    st["render_handle"] = self._renderer.chart2d_add_line(
+                        xs, ys, st["color"], st["line_width"]
+                    )
+                    self._mark_dirty()
+
+    def _do_resize(self, w: int, h: int) -> None:
+        super()._do_resize(w, h)
+        # Force a full set_chart2d rebuild after resize (axis geometry is in px).
+        self._chart2d_sent = False
+        self._push_chart2d()
+
+    # ── Axis setup ────────────────────────────────────────────────────────────
+
+    def set_xlim(self, xmin: float, xmax: float) -> None:
+        """Set the visible X range."""
+        self._apply_xlim(float(xmin), float(xmax), freeze=True)
+
+    def set_ylim(self, ymin: float, ymax: float) -> None:
+        """Set the visible Y range."""
+        self._apply_ylim(float(ymin), float(ymax), freeze=True)
+
+    def set_xlabel(self, label: str) -> None:
+        """Set the X axis title."""
+        self._xlabel = label
+        self._push_chart2d()
+
+    def set_ylabel(self, label: str) -> None:
+        """Set the Y axis title."""
+        self._ylabel = label
+        self._push_chart2d()
+
+    def set_y_tick_interval(self, step: "float | None") -> None:
+        """Set a fixed Y-axis grid/tick interval, or ``None`` to auto-pick it."""
+        if step is None:
+            self._y_tick_interval = None
+        else:
+            step = float(step)
+            if not np.isfinite(step) or step <= 0.0:
+                raise ValueError("y tick interval must be a positive finite number")
+            self._y_tick_interval = step
+        self._push_chart2d()
+
+    def reset_camera(self) -> None:
+        """Re-send chart2d state (no camera to reset in chart mode)."""
+        self._push_chart2d()
+
+    # ── Static / multi-line API ───────────────────────────────────────────────
+
+    def set_line(
+        self,
+        x,
+        y,
+        *,
+        color: "tuple[float, float, float]" = (0.3, 0.7, 1.0),
+        line_width: float = 2.0,
+    ) -> None:
+        """Replace the primary polyline.
+
+        Parameters
+        ----------
+        x, y : array-like, shape (N,)
+            Coordinate arrays of equal length.
+        color : (r, g, b) in [0, 1]
+        line_width : float, optional
+            Line width in screen pixels.
+        """
+        x = np.asarray(x, dtype=np.float32).ravel()
+        y = np.asarray(y, dtype=np.float32).ravel()
+        line_width = _normalize_line2d_width(line_width)
+        if len(x) != len(y):
+            raise ValueError(
+                f"x and y must have equal length, got {len(x)} vs {len(y)}")
+        self._auto_fit(x, y)
+        if self._renderer is None:
+            self._pending_primary = (x.copy(), y.copy(), color, line_width)
+            self._primary_color = color
+            self._primary_width = line_width
+            return
+        if self._primary_handle is None:
+            self._primary_handle = self._renderer.chart2d_add_line(
+                x, y, color, line_width
+            )
+        else:
+            self._renderer.chart2d_update_line(
+                self._primary_handle, x, y, color, line_width
+            )
+        self._primary_color = color
+        self._primary_width = line_width
+        self._mark_dirty()
+
+    def add_line(
+        self,
+        x,
+        y,
+        *,
+        color: "tuple[float, float, float]" = (0.9, 0.5, 0.2),
+        line_width: float = 2.0,
+    ) -> int:
+        """Add a new polyline; returns a handle.
+
+        Parameters
+        ----------
+        x, y : array-like, shape (N,)
+        color : (r, g, b) in [0, 1]
+        line_width : float, optional
+            Line width in screen pixels.
+
+        Returns
+        -------
+        int
+            Handle for :meth:`update_line` and :meth:`remove_line`.
+        """
+        x = np.asarray(x, dtype=np.float32).ravel()
+        y = np.asarray(y, dtype=np.float32).ravel()
+        line_width = _normalize_line2d_width(line_width)
+        if len(x) != len(y):
+            raise ValueError(
+                f"x and y must have equal length, got {len(x)} vs {len(y)}")
+        self._auto_fit(x, y)
+        if self._renderer is None:
+            vhandle = self._next_nhandle
+            self._next_nhandle += 1
+            self._pending_named_lines[vhandle] = (
+                x.copy(), y.copy(), color, line_width
+            )
+            return vhandle
+        handle = self._renderer.chart2d_add_line(x, y, color, line_width)
+        self._named_lines[handle] = {"color": color, "line_width": line_width}
+        self._mark_dirty()
+        return handle
+
+    def _resolve_line_handle(self, handle: int) -> int:
+        return self._nhandle_map.get(handle, handle)
+
+    def update_line(
+        self,
+        handle: int,
+        x,
+        y,
+        *,
+        color: "tuple[float, float, float] | None" = None,
+        line_width: "float | None" = None,
+    ) -> None:
+        """Replace the geometry of an existing line.
+
+        Parameters
+        ----------
+        handle : int
+            Handle returned by :meth:`add_line`.
+        x, y : array-like, shape (N,)
+        color : (r, g, b), optional — keeps existing colour when omitted.
+        line_width : float, optional — keeps existing width when omitted.
+        """
+        x = np.asarray(x, dtype=np.float32).ravel()
+        y = np.asarray(y, dtype=np.float32).ravel()
+        if len(x) != len(y):
+            raise ValueError(
+                f"x and y must have equal length, got {len(x)} vs {len(y)}")
+        if self._renderer is None and handle in self._pending_named_lines:
+            _old_x, _old_y, old_color, old_width = self._pending_named_lines[handle]
+            c = color if color is not None else old_color
+            lw = (
+                _normalize_line2d_width(line_width)
+                if line_width is not None
+                else old_width
+            )
+            self._pending_named_lines[handle] = (x.copy(), y.copy(), c, lw)
+            return
+
+        real = self._resolve_line_handle(handle)
+        meta = self._named_lines.get(real, {})
+        c = color if color is not None else meta.get("color", (0.3, 0.7, 1.0))
+        lw = (
+            _normalize_line2d_width(line_width)
+            if line_width is not None
+            else meta.get("line_width", 2.0)
+        )
+        if self._renderer is not None:
+            self._renderer.chart2d_update_line(real, x, y, c, lw)
+        if real in self._named_lines:
+            self._named_lines[real]["color"] = c
+            self._named_lines[real]["line_width"] = lw
+        self._mark_dirty()
+
+    def remove_line(self, handle: int) -> None:
+        """Remove a line by handle."""
+        if self._renderer is None:
+            self._pending_named_lines.pop(handle, None)
+            return
+        real = self._resolve_line_handle(handle)
+        if self._renderer is not None:
+            self._renderer.chart2d_remove_line(real)
+        self._named_lines.pop(real, None)
+        self._mark_dirty()
+
+    # ── Streaming API ─────────────────────────────────────────────────────────
+
+    def add_line_stream(
+        self,
+        *,
+        max_points: int,
+        mode: str = "ring",
+        color: "tuple[float, float, float]" = (0.3, 0.7, 1.0),
+        line_width: float = 2.0,
+    ) -> int:
+        """Pre-allocate a streaming polyline buffer.
+
+        Parameters
+        ----------
+        max_points : int
+            Maximum number of *(x, y)* points the buffer can hold.
+        mode : ``"ring"`` | ``"append"``
+        color : (r, g, b) in [0, 1]
+        line_width : float, optional
+            Line width in screen pixels.
+
+        Returns
+        -------
+        int
+            Handle for :meth:`stream_line`, :meth:`clear_line_stream`, and
+            :meth:`remove_line_stream`.
+        """
+        if max_points < 2:
+            raise ValueError("max_points must be >= 2")
+        line_width = _normalize_line2d_width(line_width)
+        sid = self._next_stream
+        self._next_stream += 1
+        self._line_streams[sid] = {
+            "buf_x":        np.zeros(max_points, dtype=np.float32),
+            "buf_y":        np.zeros(max_points, dtype=np.float32),
+            "head":         0,
+            "count":        0,
+            "max_pts":      max_points,
+            "mode":         mode,
+            "color":        color,
+            "line_width":   line_width,
+            "render_handle": None,  # chart2d line handle, created on first upload
+        }
+        return sid
+
+    def stream_line(self, handle: int, x, y) -> None:
+        """Append new *(x, y)* samples to a streaming line.
+
+        Parameters
+        ----------
+        handle : int
+            Handle returned by :meth:`add_line_stream`.
+        x, y : scalar or array-like
+        """
+        st = self._line_streams.get(handle)
+        if st is None:
+            raise KeyError(f"No line stream with handle {handle!r}")
+
+        x = np.asarray(x, dtype=np.float32).ravel()
+        y = np.asarray(y, dtype=np.float32).ravel()
+        if len(x) != len(y):
+            raise ValueError(
+                f"x and y must have equal length, got {len(x)} vs {len(y)}")
+        n = len(x)
+        if n == 0:
+            return
+
+        buf_x, buf_y, max_pts = st["buf_x"], st["buf_y"], st["max_pts"]
+        if st["mode"] == "append":
+            remaining = max_pts - st["count"]
+            if remaining <= 0:
+                return
+            n = min(n, remaining)
+            s = st["count"]
+            buf_x[s:s + n] = x[:n]; buf_y[s:s + n] = y[:n]
+            st["count"] += n
+        else:  # ring
+            head  = st["head"]
+            space = max_pts - head
+            if n <= space:
+                buf_x[head:head + n] = x; buf_y[head:head + n] = y
+                st["head"] = (head + n) % max_pts
+            else:
+                buf_x[head:] = x[:space]; buf_y[head:] = y[:space]
+                overflow = min(n - space, max_pts)
+                buf_x[:overflow] = x[space:space + overflow]
+                buf_y[:overflow] = y[space:space + overflow]
+                st["head"] = overflow
+            st["count"] = min(st["count"] + n, max_pts)
+
+        cnt = st["count"]
+        if cnt < 2:
+            return
+
+        self._auto_fit(buf_x[:cnt], buf_y[:cnt])
+
+        if self._renderer is None:
+            return
+
+        xs, ys = self._stream_ordered(st)
+        if xs is None:
+            return
+
+        if st["render_handle"] is None:
+            st["render_handle"] = self._renderer.chart2d_add_line(
+                xs, ys, st["color"], st["line_width"]
+            )
+        else:
+            self._renderer.chart2d_update_line(
+                st["render_handle"], xs, ys, st["color"], st["line_width"]
+            )
+        self._mark_dirty()
+
+    def _stream_ordered(self, st: dict):
+        """Return (x_ordered, y_ordered) arrays oldest-to-newest, or (None, None)."""
+        cnt = st["count"]
+        if cnt < 2:
+            return None, None
+        buf_x, buf_y, max_pts = st["buf_x"], st["buf_y"], st["max_pts"]
+        if cnt < max_pts:
+            return buf_x[:cnt], buf_y[:cnt]
+        head = st["head"]
+        return (np.concatenate([buf_x[head:], buf_x[:head]]),
+                np.concatenate([buf_y[head:], buf_y[:head]]))
+
+    def clear_line_stream(self, handle: int) -> None:
+        """Reset a streaming line to empty; pre-allocated buffer is kept."""
+        st = self._line_streams.get(handle)
+        if st is None:
+            raise KeyError(f"No line stream with handle {handle!r}")
+        st["count"] = 0; st["head"] = 0
+        if st["render_handle"] is not None and self._renderer is not None:
+            empty = np.array([], dtype=np.float32)
+            self._renderer.chart2d_update_line(
+                st["render_handle"], empty, empty, st["color"], st["line_width"]
+            )
+        self._mark_dirty()
+
+    def remove_line_stream(self, handle: int) -> None:
+        """Remove a streaming line actor and release its buffer."""
+        st = self._line_streams.pop(handle, None)
+        if st is None:
+            raise KeyError(f"No line stream with handle {handle!r}")
+        if st["render_handle"] is not None and self._renderer is not None:
+            self._renderer.chart2d_remove_line(st["render_handle"])
+        self._mark_dirty()
+
+    # ── Mouse / camera overrides ──────────────────────────────────────────────
+
+    def _drag_move(self, event: tk.Event, button: int) -> None:
+        """No camera pan in chart mode — only selection drags pass through."""
+        if self._renderer is None or self._drag_btn != button:
+            return
+        if self._try_lasso_move(event):
+            return
+        if button == 1 and self._rect_active:
+            self._renderer.set_selection_rect(
+                float(self._sel_x0), float(self._sel_y0),
+                float(event.x), float(event.y))
+            self._mark_dirty()
+        self._drag_x = event.x
+        self._drag_y = event.y
+
+    def _on_scroll(self, event: tk.Event) -> None:
+        """Ignore scroll; chart mode has fixed axis limits."""
+
+    def _on_scroll_up_x11(self, _event: tk.Event) -> None:
+        """Ignore scroll."""
+
+    def _on_scroll_down_x11(self, _event: tk.Event) -> None:
+        """Ignore scroll."""
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _push_chart2d(self) -> None:
+        """Send current chart2d state to the Rust renderer."""
+        if self._renderer is None or self._xlim is None or self._ylim is None:
+            return
+        self._renderer.set_chart2d(
+            self._pad_left, self._pad_right,
+            self._pad_top,  self._pad_bottom,
+            self._xlim[0],  self._xlim[1],
+            self._ylim[0],  self._ylim[1],
+            self._xlabel,   self._ylabel,
+            self._y_tick_interval,
+        )
+        self._chart2d_sent = True
+        self._mark_dirty()
+
+    def _sync_limit_freeze(self) -> None:
+        self._limits_frozen = self._x_limits_frozen and self._y_limits_frozen
+
+    def _apply_xlim(self, xmin: float, xmax: float, *, freeze: bool) -> None:
+        self._xlim = (float(xmin), float(xmax))
+        self._x_limits_frozen = freeze
+        self._sync_limit_freeze()
+        # Fast path: skip full set_chart2d (glyph reshape) when only xlim slides.
+        if self._chart2d_sent and self._renderer is not None:
+            self._renderer.chart2d_update_xlim(float(xmin), float(xmax))
+            self._mark_dirty()
+            return
+        self._push_chart2d()
+
+    def _apply_ylim(self, ymin: float, ymax: float, *, freeze: bool) -> None:
+        self._ylim = (float(ymin), float(ymax))
+        self._y_limits_frozen = freeze
+        self._sync_limit_freeze()
+        # Fast path for auto-y updates: keep the existing Y interval fixed.
+        if self._chart2d_sent and self._renderer is not None and not freeze:
+            self._renderer.chart2d_update_ylim(float(ymin), float(ymax))
+            self._mark_dirty()
+            return
+        self._push_chart2d()
+
+    def _auto_fit(self, x: "np.ndarray", y: "np.ndarray") -> None:
+        """Derive xlim/ylim from data bounds for any axis that is not frozen."""
+        if len(x) < 1:
+            return
+        if not self._x_limits_frozen:
+            xmin, xmax = float(x.min()), float(x.max())
+            self._apply_xlim(*_nice_bounds_1d(xmin, xmax), freeze=False)
+        if not self._y_limits_frozen:
+            ymin, ymax = float(y.min()), float(y.max())
+            self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
 
 
 # ── Linked-camera module API ──────────────────────────────────────────────────
