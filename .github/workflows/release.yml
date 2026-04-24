@@ -110,6 +110,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [sdist, linux, windows, macos]
     if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    environment: pypi
     permissions:
       contents: read
       id-token: write
