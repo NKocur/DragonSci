@@ -1,5 +1,5 @@
-# Use the MinGW/GNU toolchain to match MSYS2 Python.
-# MSYS2 Python ships libpython3.12.dll.a (MinGW format), not python3.12.lib
-# (MSVC format), so the MSVC linker cannot link against it.
-[build]
-target = "x86_64-pc-windows-gnu"
+# Do not force a repository-wide Windows Rust target here.
+#
+# CPython from python.org normally needs the MSVC target, while MSYS2 Python
+# normally needs the GNU target. Pick the target in the invoking script or in a
+# per-user Cargo config instead of committing one default for every machine.

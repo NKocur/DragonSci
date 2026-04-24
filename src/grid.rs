@@ -12,12 +12,17 @@ pub fn nice_bounds(min: Vec3, max: Vec3) -> (Vec3, Vec3) {
         let rough_step = range / 5.0;
         let mag = 10_f32.powf(rough_step.log10().floor());
         let norm = rough_step / mag;
-        let nice_step = if norm <= 1.0 { 1.0 }
-            else if norm <= 2.0 { 2.0 }
-            else if norm <= 5.0 { 5.0 }
-            else { 10.0 } * mag;
+        let nice_step = if norm <= 1.0 {
+            1.0
+        } else if norm <= 2.0 {
+            2.0
+        } else if norm <= 5.0 {
+            5.0
+        } else {
+            10.0
+        } * mag;
         let nice_min = (lo / nice_step).floor() * nice_step;
-        let nice_max = (hi / nice_step).ceil()  * nice_step;
+        let nice_max = (hi / nice_step).ceil() * nice_step;
         (nice_min, nice_max)
     };
     let (x0, x1) = nice_axis(min.x, max.x);
@@ -30,21 +35,40 @@ pub fn nice_bounds(min: Vec3, max: Vec3) -> (Vec3, Vec3) {
 /// including the step-up loop, so the step always matches what axis_ticks() produces.
 pub fn tick_step(lo: f32, hi: f32, max_ticks: usize) -> f32 {
     let range = hi - lo;
-    if range < 1e-10 || max_ticks == 0 { return 1.0; }
+    if range < 1e-10 || max_ticks == 0 {
+        return 1.0;
+    }
     let rough = range / max_ticks as f32;
     let mag = 10_f32.powf(rough.log10().floor());
     let norm = rough / mag;
-    let mut step = (if norm <= 1.0 { 1.0 } else if norm <= 2.0 { 2.0 } else if norm <= 5.0 { 5.0 } else { 10.0 }) * mag;
+    let mut step = (if norm <= 1.0 {
+        1.0
+    } else if norm <= 2.0 {
+        2.0
+    } else if norm <= 5.0 {
+        5.0
+    } else {
+        10.0
+    }) * mag;
     // Step up until the tick count fits within max_ticks (mirrors axis_ticks loop).
     loop {
         let first = (lo / step).ceil() * step;
         let mut count = 0usize;
         let mut t = first;
-        while t <= hi + step * 1e-4 { count += 1; t += step; }
-        if count <= max_ticks { return step; }
+        while t <= hi + step * 1e-4 {
+            count += 1;
+            t += step;
+        }
+        if count <= max_ticks {
+            return step;
+        }
         let m = 10_f32.powf(step.log10().floor());
         let n = (step / m).round() as i32;
-        step = match n { 1 => 2.0, 2 => 5.0, _ => 10.0 } * m;
+        step = match n {
+            1 => 2.0,
+            2 => 5.0,
+            _ => 10.0,
+        } * m;
     }
 }
 
@@ -74,7 +98,11 @@ pub fn axis_ticks(lo: f32, hi: f32, max_ticks: usize) -> Vec<f32> {
         // Too many — move to next nice step up (1→2→5→10 pattern).
         let mag = 10_f32.powf(step.log10().floor());
         let norm = (step / mag).round() as i32;
-        step = match norm { 1 => 2.0, 2 => 5.0, _ => 10.0 } * mag;
+        step = match norm {
+            1 => 2.0,
+            2 => 5.0,
+            _ => 10.0,
+        } * mag;
     }
 }
 
@@ -184,9 +212,18 @@ pub fn build_grid(
         Vec3::new(nice_max.x, nice_max.y, nice_max.z), // 7: xmax ymax zmax
     ];
     let edges: [(usize, usize); 12] = [
-        (0, 1), (2, 3), (4, 5), (6, 7), // X-parallel
-        (0, 2), (1, 3), (4, 6), (5, 7), // Y-parallel
-        (0, 4), (1, 5), (2, 6), (3, 7), // Z-parallel
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 7), // X-parallel
+        (0, 2),
+        (1, 3),
+        (4, 6),
+        (5, 7), // Y-parallel
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7), // Z-parallel
     ];
     // In 3D the back corner is the vertex diagonally opposite to where the three
     // near faces meet.  Its index bit is 1 for each axis where the camera is on
@@ -194,8 +231,7 @@ pub fn build_grid(
     // far face the max face).  The 3 edges that touch this corner don't lie on
     // any active plane, so they are omitted — leaving the 9 edges that form the
     // three visible planes (open-corner look instead of full wireframe).
-    let far_idx: usize =
-          (camera_eye.x >= center.x) as usize
+    let far_idx: usize = (camera_eye.x >= center.x) as usize
         | ((camera_eye.y >= center.y) as usize) << 1
         | ((camera_eye.z >= center.z) as usize) << 2;
 
@@ -206,13 +242,22 @@ pub fn build_grid(
             // the tick marks are anchored. Skipping the duplicate z=zmax face
             // (indices 2,3,6,7) and all Z-parallel edges (8-11) removes the
             // second box that appears when looking straight at the XY plane.
-            match i { 0 | 1 | 4 | 5 => {} _ => continue, }
+            match i {
+                0 | 1 | 4 | 5 => {}
+                _ => continue,
+            }
         } else if *a == far_idx || *b == far_idx {
             // 3D mode: skip the 3 edges that touch the back corner.
             continue;
         }
-        verts.push(LineVertex { position: c[*a].to_array(), color: box_color });
-        verts.push(LineVertex { position: c[*b].to_array(), color: box_color });
+        verts.push(LineVertex {
+            position: c[*a].to_array(),
+            color: box_color,
+        });
+        verts.push(LineVertex {
+            position: c[*b].to_array(),
+            color: box_color,
+        });
     }
 
     // ── Detect flat axes ──────────────────────────────────────────────────────
@@ -238,16 +283,22 @@ pub fn build_grid(
         (tl, tl)
     };
     // Keep a scalar tick_len for the Z axis and backward-compat branches.
-    let tick_len    = tick_len_y_dir;
+    let tick_len = tick_len_y_dir;
     let label_offset = tick_len * 2.0;
-    let pad          = extent.length() * 0.12;
+    let pad = extent.length() * 0.12;
 
     // Scale max ticks per axis by its fraction of the longest axis.
     // In 2-D scale mode both visible axes fill the viewport → always 5 ticks.
     let max_ne = extent.x.max(extent.y).max(extent.z).max(1e-10);
     let ticks_for = |e: f32| -> usize {
         let r = e / max_ne;
-        if r < 0.15 { 2 } else if r < 0.40 { 3 } else { 5 }
+        if r < 0.15 {
+            2
+        } else if r < 0.40 {
+            3
+        } else {
+            5
+        }
     };
     let (x_ticks_default, y_ticks_default) = if ortho_scale.is_some() {
         (5_usize, 5_usize)
@@ -277,9 +328,9 @@ pub fn build_grid(
         z_y_edge,
     ): (f32, f32, f32, f32, f32, f32, f32, f32, f32, f32) = if !axis_visible[2] {
         (
-            nice_min.y, -1.0, nice_min.z, nice_min.z,  // X axis: bottom
-            nice_min.x, -1.0, nice_min.z,              // Y axis: left
-            nice_max.x,  1.0, nice_min.y,              // Z hidden in 2D, values unused
+            nice_min.y, -1.0, nice_min.z, nice_min.z, // X axis: bottom
+            nice_min.x, -1.0, nice_min.z, // Y axis: left
+            nice_max.x, 1.0, nice_min.y, // Z hidden in 2D, values unused
         )
     } else {
         // For each axis we pick the bounding-box edge (face) on which tick marks
@@ -291,34 +342,57 @@ pub fn build_grid(
         // above, ceiling when camera below) and push further outward so labels
         // project outside the box silhouette in screen space.
         let (x_y_edge, x_y_sign): (f32, f32) = if camera_eye.y >= center.y {
-            (nice_min.y, -1.0)   // camera above → anchor at floor (y=min), push −Y
+            (nice_min.y, -1.0) // camera above → anchor at floor (y=min), push −Y
         } else {
-            (nice_max.y,  1.0)   // camera below → anchor at ceiling (y=max), push +Y
+            (nice_max.y, 1.0) // camera below → anchor at ceiling (y=max), push +Y
         };
         // Near Z-face: tick marks and labels sit on the visible front edge.
-        let x_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
+        let x_z_edge: f32 = if camera_eye.z >= center.z {
+            nice_max.z
+        } else {
+            nice_min.z
+        };
         // Far Z-face: the back-wall grid plane is drawn on the opposite side.
-        let z_wall_edge: f32 = if camera_eye.z >= center.z { nice_min.z } else { nice_max.z };
+        let z_wall_edge: f32 = if camera_eye.z >= center.z {
+            nice_min.z
+        } else {
+            nice_max.z
+        };
 
         // Y-axis ticks (along Y): anchor on the far X-face, push further outward in ±X.
         let (y_x_edge, y_x_sign): (f32, f32) = if camera_eye.x >= center.x {
-            (nice_min.x, -1.0)   // camera at +X → anchor at left wall (x=min), push −X
+            (nice_min.x, -1.0) // camera at +X → anchor at left wall (x=min), push −X
         } else {
-            (nice_max.x,  1.0)   // camera at −X → anchor at right wall (x=max), push +X
+            (nice_max.x, 1.0) // camera at −X → anchor at right wall (x=max), push +X
         };
-        let y_z_edge: f32 = if camera_eye.z >= center.z { nice_max.z } else { nice_min.z };
+        let y_z_edge: f32 = if camera_eye.z >= center.z {
+            nice_max.z
+        } else {
+            nice_min.z
+        };
 
         // Z-axis ticks (along Z): anchor on the near X-face, but *opposite* from Y-axis.
         // Swapping faces guarantees Y and Z labels land on different X-faces and
         // can never pile up at the same corner.
         let (z_x_edge, z_x_sign): (f32, f32) = if camera_eye.x >= center.x {
-            (nice_max.x,  1.0)   // camera at +X → anchor at right wall (x=max), push +X
+            (nice_max.x, 1.0) // camera at +X → anchor at right wall (x=max), push +X
         } else {
-            (nice_min.x, -1.0)   // camera at −X → anchor at left wall (x=min), push −X
+            (nice_min.x, -1.0) // camera at −X → anchor at left wall (x=min), push −X
         };
         // Z ticks share the same Y-face choice as X-axis for consistent appearance.
         let z_y_edge = x_y_edge;
-        (x_y_edge, x_y_sign, x_z_edge, z_wall_edge, y_x_edge, y_x_sign, y_z_edge, z_x_edge, z_x_sign, z_y_edge)
+        (
+            x_y_edge,
+            x_y_sign,
+            x_z_edge,
+            z_wall_edge,
+            y_x_edge,
+            y_x_sign,
+            y_z_edge,
+            z_x_edge,
+            z_x_sign,
+            z_y_edge,
+        )
     };
 
     // ── Depth-axis detection ──────────────────────────────────────────────────
@@ -343,17 +417,27 @@ pub fn build_grid(
     // still render ticks/labels. So only apply flat suppression while the Z axis
     // is visible (true 3D mode).
     let suppress_flat = axis_visible[2];
-    let x_show = axis_visible[0]
-        && !depth_x
-        && (!suppress_flat || !flat_x || tick_override[0].is_some());
-    let y_show = axis_visible[1]
-        && !depth_y
-        && (!suppress_flat || !flat_y || tick_override[1].is_some());
+    let x_show =
+        axis_visible[0] && !depth_x && (!suppress_flat || !flat_x || tick_override[0].is_some());
+    let y_show =
+        axis_visible[1] && !depth_y && (!suppress_flat || !flat_y || tick_override[1].is_some());
     let z_show = axis_visible[2] && !depth_z && (!flat_z || tick_override[2].is_some());
 
-    let x_vals = if x_show { axis_ticks(nice_min.x, nice_max.x, x_ticks) } else { vec![] };
-    let y_vals = if y_show { axis_ticks(nice_min.y, nice_max.y, y_ticks) } else { vec![] };
-    let z_vals = if z_show { axis_ticks(nice_min.z, nice_max.z, z_ticks) } else { vec![] };
+    let x_vals = if x_show {
+        axis_ticks(nice_min.x, nice_max.x, x_ticks)
+    } else {
+        vec![]
+    };
+    let y_vals = if y_show {
+        axis_ticks(nice_min.y, nice_max.y, y_ticks)
+    } else {
+        vec![]
+    };
+    let z_vals = if z_show {
+        axis_ticks(nice_min.z, nice_max.z, z_ticks)
+    } else {
+        vec![]
+    };
 
     // ── Grid planes ───────────────────────────────────────────────────────────
     // Major lines align with the tick positions; minor lines subdivide each
@@ -363,18 +447,48 @@ pub fn build_grid(
         let major_col = [0.20_f32, 0.20, 0.25];
         let minor_col = [0.13_f32, 0.13, 0.17];
 
-        let x_step = if x_vals.len() >= 2 { x_vals[1] - x_vals[0] } else { 0.0 };
-        let y_step = if y_vals.len() >= 2 { y_vals[1] - y_vals[0] } else { 0.0 };
-        let z_step = if z_vals.len() >= 2 { z_vals[1] - z_vals[0] } else { 0.0 };
+        let x_step = if x_vals.len() >= 2 {
+            x_vals[1] - x_vals[0]
+        } else {
+            0.0
+        };
+        let y_step = if y_vals.len() >= 2 {
+            y_vals[1] - y_vals[0]
+        } else {
+            0.0
+        };
+        let z_step = if z_vals.len() >= 2 {
+            z_vals[1] - z_vals[0]
+        } else {
+            0.0
+        };
 
-        let x_minor = if show_minor_planes { minor_ticks(nice_min.x, nice_max.x, x_step, 5) } else { vec![] };
-        let y_minor = if show_minor_planes { minor_ticks(nice_min.y, nice_max.y, y_step, 5) } else { vec![] };
-        let z_minor = if show_minor_planes { minor_ticks(nice_min.z, nice_max.z, z_step, 5) } else { vec![] };
+        let x_minor = if show_minor_planes {
+            minor_ticks(nice_min.x, nice_max.x, x_step, 5)
+        } else {
+            vec![]
+        };
+        let y_minor = if show_minor_planes {
+            minor_ticks(nice_min.y, nice_max.y, y_step, 5)
+        } else {
+            vec![]
+        };
+        let z_minor = if show_minor_planes {
+            minor_ticks(nice_min.z, nice_max.z, z_step, 5)
+        } else {
+            vec![]
+        };
 
         // Helper: push a line segment.
         let mut seg = |a: Vec3, b: Vec3, col: [f32; 3]| {
-            verts.push(LineVertex { position: a.to_array(), color: col });
-            verts.push(LineVertex { position: b.to_array(), color: col });
+            verts.push(LineVertex {
+                position: a.to_array(),
+                color: col,
+            });
+            verts.push(LineVertex {
+                position: b.to_array(),
+                color: col,
+            });
         };
 
         if !axis_visible[2] {
@@ -383,18 +497,34 @@ pub fn build_grid(
             let z = nice_min.z;
             if show_major_planes {
                 for &x in &x_vals {
-                    seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), major_col);
+                    seg(
+                        Vec3::new(x, nice_min.y, z),
+                        Vec3::new(x, nice_max.y, z),
+                        major_col,
+                    );
                 }
                 for &y in &y_vals {
-                    seg(Vec3::new(nice_min.x, y, z), Vec3::new(nice_max.x, y, z), major_col);
+                    seg(
+                        Vec3::new(nice_min.x, y, z),
+                        Vec3::new(nice_max.x, y, z),
+                        major_col,
+                    );
                 }
             }
             if show_minor_planes {
                 for &x in &x_minor {
-                    seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), minor_col);
+                    seg(
+                        Vec3::new(x, nice_min.y, z),
+                        Vec3::new(x, nice_max.y, z),
+                        minor_col,
+                    );
                 }
                 for &y in &y_minor {
-                    seg(Vec3::new(nice_min.x, y, z), Vec3::new(nice_max.x, y, z), minor_col);
+                    seg(
+                        Vec3::new(nice_min.x, y, z),
+                        Vec3::new(nice_max.x, y, z),
+                        minor_col,
+                    );
                 }
             }
         } else {
@@ -403,18 +533,34 @@ pub fn build_grid(
                 let y = x_y_edge;
                 if show_major_planes {
                     for &x in &x_vals {
-                        seg(Vec3::new(x, y, nice_min.z), Vec3::new(x, y, nice_max.z), major_col);
+                        seg(
+                            Vec3::new(x, y, nice_min.z),
+                            Vec3::new(x, y, nice_max.z),
+                            major_col,
+                        );
                     }
                     for &z in &z_vals {
-                        seg(Vec3::new(nice_min.x, y, z), Vec3::new(nice_max.x, y, z), major_col);
+                        seg(
+                            Vec3::new(nice_min.x, y, z),
+                            Vec3::new(nice_max.x, y, z),
+                            major_col,
+                        );
                     }
                 }
                 if show_minor_planes {
                     for &x in &x_minor {
-                        seg(Vec3::new(x, y, nice_min.z), Vec3::new(x, y, nice_max.z), minor_col);
+                        seg(
+                            Vec3::new(x, y, nice_min.z),
+                            Vec3::new(x, y, nice_max.z),
+                            minor_col,
+                        );
                     }
                     for &z in &z_minor {
-                        seg(Vec3::new(nice_min.x, y, z), Vec3::new(nice_max.x, y, z), minor_col);
+                        seg(
+                            Vec3::new(nice_min.x, y, z),
+                            Vec3::new(nice_max.x, y, z),
+                            minor_col,
+                        );
                     }
                 }
             }
@@ -426,18 +572,34 @@ pub fn build_grid(
             let x = y_x_edge;
             if show_major_planes {
                 for &y in &y_vals {
-                    seg(Vec3::new(x, y, nice_min.z), Vec3::new(x, y, nice_max.z), major_col);
+                    seg(
+                        Vec3::new(x, y, nice_min.z),
+                        Vec3::new(x, y, nice_max.z),
+                        major_col,
+                    );
                 }
                 for &z in &z_vals {
-                    seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), major_col);
+                    seg(
+                        Vec3::new(x, nice_min.y, z),
+                        Vec3::new(x, nice_max.y, z),
+                        major_col,
+                    );
                 }
             }
             if show_minor_planes {
                 for &y in &y_minor {
-                    seg(Vec3::new(x, y, nice_min.z), Vec3::new(x, y, nice_max.z), minor_col);
+                    seg(
+                        Vec3::new(x, y, nice_min.z),
+                        Vec3::new(x, y, nice_max.z),
+                        minor_col,
+                    );
                 }
                 for &z in &z_minor {
-                    seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), minor_col);
+                    seg(
+                        Vec3::new(x, nice_min.y, z),
+                        Vec3::new(x, nice_max.y, z),
+                        minor_col,
+                    );
                 }
             }
         }
@@ -448,18 +610,34 @@ pub fn build_grid(
             let z = z_wall_edge;
             if show_major_planes {
                 for &x in &x_vals {
-                    seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), major_col);
+                    seg(
+                        Vec3::new(x, nice_min.y, z),
+                        Vec3::new(x, nice_max.y, z),
+                        major_col,
+                    );
                 }
                 for &y in &y_vals {
-                    seg(Vec3::new(nice_min.x, y, z), Vec3::new(nice_max.x, y, z), major_col);
+                    seg(
+                        Vec3::new(nice_min.x, y, z),
+                        Vec3::new(nice_max.x, y, z),
+                        major_col,
+                    );
                 }
             }
             if show_minor_planes {
                 for &x in &x_minor {
-                    seg(Vec3::new(x, nice_min.y, z), Vec3::new(x, nice_max.y, z), minor_col);
+                    seg(
+                        Vec3::new(x, nice_min.y, z),
+                        Vec3::new(x, nice_max.y, z),
+                        minor_col,
+                    );
                 }
                 for &y in &y_minor {
-                    seg(Vec3::new(nice_min.x, y, z), Vec3::new(nice_max.x, y, z), minor_col);
+                    seg(
+                        Vec3::new(nice_min.x, y, z),
+                        Vec3::new(nice_max.x, y, z),
+                        minor_col,
+                    );
                 }
             }
         }
@@ -469,36 +647,46 @@ pub fn build_grid(
     if x_show {
         // X-axis ticks are pushed in the ±Y direction; use tick_len_y_dir.
         let x_label_off_y = tick_len_y_dir * 2.0;
-        let x_pad_y       = tick_len_y_dir * 4.8;
+        let x_pad_y = tick_len_y_dir * 4.8;
         // When depth_y (camera along Y, viewing XZ plane) the normal ±Y push
         // goes into the depth — switch to ±Z so labels remain visible.
         let (x_tick_off, x_label_off, x_pad_off) = if !depth_y {
-            (Vec3::new(0.0, x_y_sign * tick_len_y_dir, 0.0),
-             Vec3::new(0.0, x_y_sign * x_label_off_y,  0.0),
-             Vec3::new(0.0, x_y_sign * x_pad_y,         0.0))
+            (
+                Vec3::new(0.0, x_y_sign * tick_len_y_dir, 0.0),
+                Vec3::new(0.0, x_y_sign * x_label_off_y, 0.0),
+                Vec3::new(0.0, x_y_sign * x_pad_y, 0.0),
+            )
         } else {
-            (Vec3::new(0.0, 0.0, z_out * tick_len),
-             Vec3::new(0.0, 0.0, z_out * label_offset),
-             Vec3::new(0.0, 0.0, z_out * pad))
+            (
+                Vec3::new(0.0, 0.0, z_out * tick_len),
+                Vec3::new(0.0, 0.0, z_out * label_offset),
+                Vec3::new(0.0, 0.0, z_out * pad),
+            )
         };
         for &val in &x_vals {
-            let v   = Vec3::new(val, x_y_edge, x_z_edge);
+            let v = Vec3::new(val, x_y_edge, x_z_edge);
             let end = v + x_tick_off;
-            verts.push(LineVertex { position: v.to_array(),   color: x_col });
-            verts.push(LineVertex { position: end.to_array(), color: x_col });
+            verts.push(LineVertex {
+                position: v.to_array(),
+                color: x_col,
+            });
+            verts.push(LineVertex {
+                position: end.to_array(),
+                color: x_col,
+            });
             labels.push(LabelAnchor {
-                world_pos:    end + x_label_off,
-                tick_pos:     end,
-                text:         format_tick(val),
+                world_pos: end + x_label_off,
+                tick_pos: end,
+                text: format_tick(val),
                 is_axis_title: false,
             });
         }
         if !axis_texts[0].is_empty() {
             let mid = Vec3::new(center.x, x_y_edge, x_z_edge);
             labels.push(LabelAnchor {
-                world_pos:    mid + x_pad_off,
-                tick_pos:     mid,
-                text:         axis_texts[0].clone(),
+                world_pos: mid + x_pad_off,
+                tick_pos: mid,
+                text: axis_texts[0].clone(),
                 is_axis_title: true,
             });
         }
@@ -508,36 +696,46 @@ pub fn build_grid(
     if y_show {
         // Y-axis ticks are pushed in the ±X direction; use tick_len_x_dir.
         let y_label_off_x = tick_len_x_dir * 2.0;
-        let y_pad_x       = tick_len_x_dir * 4.8;
+        let y_pad_x = tick_len_x_dir * 4.8;
         // When depth_x (camera along X, viewing YZ plane) the normal ±X push
         // goes into the depth — switch to ±Z so labels remain visible.
         let (y_tick_off, y_label_off, y_pad_off) = if !depth_x {
-            (Vec3::new(y_x_sign * tick_len_x_dir, 0.0, 0.0),
-             Vec3::new(y_x_sign * y_label_off_x,  0.0, 0.0),
-             Vec3::new(y_x_sign * y_pad_x,         0.0, 0.0))
+            (
+                Vec3::new(y_x_sign * tick_len_x_dir, 0.0, 0.0),
+                Vec3::new(y_x_sign * y_label_off_x, 0.0, 0.0),
+                Vec3::new(y_x_sign * y_pad_x, 0.0, 0.0),
+            )
         } else {
-            (Vec3::new(0.0, 0.0, z_out * tick_len),
-             Vec3::new(0.0, 0.0, z_out * label_offset),
-             Vec3::new(0.0, 0.0, z_out * pad))
+            (
+                Vec3::new(0.0, 0.0, z_out * tick_len),
+                Vec3::new(0.0, 0.0, z_out * label_offset),
+                Vec3::new(0.0, 0.0, z_out * pad),
+            )
         };
         for &val in &y_vals {
-            let v   = Vec3::new(y_x_edge, val, y_z_edge);
+            let v = Vec3::new(y_x_edge, val, y_z_edge);
             let end = v + y_tick_off;
-            verts.push(LineVertex { position: v.to_array(),   color: y_col });
-            verts.push(LineVertex { position: end.to_array(), color: y_col });
+            verts.push(LineVertex {
+                position: v.to_array(),
+                color: y_col,
+            });
+            verts.push(LineVertex {
+                position: end.to_array(),
+                color: y_col,
+            });
             labels.push(LabelAnchor {
-                world_pos:    end + y_label_off,
-                tick_pos:     end,
-                text:         format_tick(val),
+                world_pos: end + y_label_off,
+                tick_pos: end,
+                text: format_tick(val),
                 is_axis_title: false,
             });
         }
         if !axis_texts[1].is_empty() {
             let mid = Vec3::new(y_x_edge, center.y, y_z_edge);
             labels.push(LabelAnchor {
-                world_pos:    mid + y_pad_off,
-                tick_pos:     mid,
-                text:         axis_texts[1].clone(),
+                world_pos: mid + y_pad_off,
+                tick_pos: mid,
+                text: axis_texts[1].clone(),
                 is_axis_title: true,
             });
         }
@@ -548,41 +746,56 @@ pub fn build_grid(
         // When depth_x (camera along X, viewing YZ plane) the normal ±X push
         // goes into the depth — switch to ±Y so labels remain visible.
         let (z_tick_off, z_label_off, z_pad_off) = if !depth_x {
-            (Vec3::new(z_x_sign * tick_len,     0.0, 0.0),
-             Vec3::new(z_x_sign * label_offset, 0.0, 0.0),
-             Vec3::new(z_x_sign * pad,          0.0, 0.0))
+            (
+                Vec3::new(z_x_sign * tick_len, 0.0, 0.0),
+                Vec3::new(z_x_sign * label_offset, 0.0, 0.0),
+                Vec3::new(z_x_sign * pad, 0.0, 0.0),
+            )
         } else {
-            (Vec3::new(0.0, x_y_sign * tick_len,     0.0),
-             Vec3::new(0.0, x_y_sign * label_offset, 0.0),
-             Vec3::new(0.0, x_y_sign * pad,          0.0))
+            (
+                Vec3::new(0.0, x_y_sign * tick_len, 0.0),
+                Vec3::new(0.0, x_y_sign * label_offset, 0.0),
+                Vec3::new(0.0, x_y_sign * pad, 0.0),
+            )
         };
         for &val in &z_vals {
-            let v   = Vec3::new(z_x_edge, z_y_edge, val);
+            let v = Vec3::new(z_x_edge, z_y_edge, val);
             let end = v + z_tick_off;
-            verts.push(LineVertex { position: v.to_array(),   color: z_col });
-            verts.push(LineVertex { position: end.to_array(), color: z_col });
+            verts.push(LineVertex {
+                position: v.to_array(),
+                color: z_col,
+            });
+            verts.push(LineVertex {
+                position: end.to_array(),
+                color: z_col,
+            });
             labels.push(LabelAnchor {
-                world_pos:    end + z_label_off,
-                tick_pos:     end,
-                text:         format_tick(val),
+                world_pos: end + z_label_off,
+                tick_pos: end,
+                text: format_tick(val),
                 is_axis_title: false,
             });
         }
         if !axis_texts[2].is_empty() {
             let mid = Vec3::new(z_x_edge, z_y_edge, center.z);
             labels.push(LabelAnchor {
-                world_pos:    mid + z_pad_off,
-                tick_pos:     mid,
-                text:         axis_texts[2].clone(),
+                world_pos: mid + z_pad_off,
+                tick_pos: mid,
+                text: axis_texts[2].clone(),
                 is_axis_title: true,
             });
         }
     }
 
-    GridGeometry { vertices: verts, labels }
+    GridGeometry {
+        vertices: verts,
+        labels,
+    }
 }
 
-pub fn format_tick_pub(v: f32) -> String { format_tick(v) }
+pub fn format_tick_pub(v: f32) -> String {
+    format_tick(v)
+}
 
 /// Format a tick value using a named preset.
 ///
@@ -608,7 +821,7 @@ pub fn format_tick_with_fmt(v: f32, fmt: &str) -> String {
                 format!("{sign}{m:02}:{s:02}")
             }
         }
-        _ => format_tick(v),   // "default" and anything else
+        _ => format_tick(v), // "default" and anything else
     }
 }
 
@@ -617,7 +830,9 @@ pub fn format_tick_with_fmt(v: f32, fmt: &str) -> String {
 /// chart (log) space for NDC computation.
 /// Returns an empty vec for degenerate or non-positive ranges.
 pub fn axis_ticks_log(lo: f32, hi: f32) -> Vec<f32> {
-    if lo <= 0.0 || hi <= 0.0 || lo >= hi { return vec![]; }
+    if lo <= 0.0 || hi <= 0.0 || lo >= hi {
+        return vec![];
+    }
     let log_lo = lo.log10().floor() as i32;
     let log_hi = hi.log10().ceil() as i32;
     (log_lo..=log_hi)
@@ -650,13 +865,11 @@ fn format_tick(v: f32) -> String {
 ///   bit 4 — depth axis is Y  (|cam_dir.y| > 0.97 → Y ticks/grid suppressed)
 ///   bit 5 — depth axis is Z  (|cam_dir.z| > 0.97 → Z ticks/grid suppressed)
 pub fn face_bits(camera_eye: Vec3, center: Vec3) -> u8 {
-    let side =
-          ((camera_eye.y < center.y) as u8)
+    let side = ((camera_eye.y < center.y) as u8)
         | (((camera_eye.z < center.z) as u8) << 1)
         | (((camera_eye.x < center.x) as u8) << 2);
     let cam_dir = (center - camera_eye).normalize_or_zero();
-    let depth =
-          ((cam_dir.x.abs() > 0.97) as u8) << 3
+    let depth = ((cam_dir.x.abs() > 0.97) as u8) << 3
         | ((cam_dir.y.abs() > 0.97) as u8) << 4
         | ((cam_dir.z.abs() > 0.97) as u8) << 5;
     side | depth
@@ -683,7 +896,10 @@ mod tests {
             &["X".to_string(), "Y".to_string(), "".to_string()],
             true,
             false,
-            Some(((nice_max.x - nice_min.x) * 0.5, (nice_max.y - nice_min.y) * 0.5)),
+            Some((
+                (nice_max.x - nice_min.x) * 0.5,
+                (nice_max.y - nice_min.y) * 0.5,
+            )),
         );
 
         assert!(
@@ -691,7 +907,9 @@ mod tests {
             "Y axis title should remain visible in 2D high-aspect plots",
         );
         assert!(
-            geo.labels.iter().any(|l| !l.is_axis_title && l.tick_pos.y != center.y),
+            geo.labels
+                .iter()
+                .any(|l| !l.is_axis_title && l.tick_pos.y != center.y),
             "Y axis tick labels should remain visible in 2D high-aspect plots",
         );
     }
@@ -713,13 +931,30 @@ mod tests {
             &["X".to_string(), "Y".to_string(), "".to_string()],
             true,
             false,
-            Some(((nice_max.x - nice_min.x) * 0.5, (nice_max.y - nice_min.y) * 0.5)),
+            Some((
+                (nice_max.x - nice_min.x) * 0.5,
+                (nice_max.y - nice_min.y) * 0.5,
+            )),
         );
 
-        let x_title = geo.labels.iter().find(|l| l.is_axis_title && l.text == "X").unwrap();
-        let y_title = geo.labels.iter().find(|l| l.is_axis_title && l.text == "Y").unwrap();
+        let x_title = geo
+            .labels
+            .iter()
+            .find(|l| l.is_axis_title && l.text == "X")
+            .unwrap();
+        let y_title = geo
+            .labels
+            .iter()
+            .find(|l| l.is_axis_title && l.text == "Y")
+            .unwrap();
 
-        assert_eq!(x_title.tick_pos.y, nice_min.y, "2D X axis should stay on the bottom edge");
-        assert_eq!(y_title.tick_pos.x, nice_min.x, "2D Y axis should stay on the left edge");
+        assert_eq!(
+            x_title.tick_pos.y, nice_min.y,
+            "2D X axis should stay on the bottom edge"
+        );
+        assert_eq!(
+            y_title.tick_pos.x, nice_min.x,
+            "2D Y axis should stay on the left edge"
+        );
     }
 }

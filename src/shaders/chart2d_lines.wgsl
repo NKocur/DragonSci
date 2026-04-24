@@ -19,13 +19,13 @@
 //   view_proj    mat4x4<f32>   offset  0   (chart space → clip space, w == 1)
 //   screen_size  vec2<f32>     offset 64
 //   style        u32           offset 72   (unused by this shader)
-//   _pad         f32           offset 76
+//   lod_factor   u32           offset 76   (unused by this shader)
 
 struct Uniforms {
     view_proj:   mat4x4<f32>,
     screen_size: vec2<f32>,
     style:       u32,
-    _pad:        f32,
+    lod_factor:  u32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -54,15 +54,24 @@ fn to_screen(p: vec2<f32>) -> vec2<f32> {
     return clip.xy * uniforms.screen_size * 0.5;
 }
 
+// Transform a local chart-space delta to pixel units without applying the
+// translation part of the chart matrix. This avoids subtracting two large
+// translated clip positions when the x-window slides over large x values.
+fn delta_to_screen(d: vec2<f32>) -> vec2<f32> {
+    let sx = uniforms.view_proj[0][0] * uniforms.screen_size.x * 0.5;
+    let sy = uniforms.view_proj[1][1] * uniforms.screen_size.y * 0.5;
+    return vec2<f32>(d.x * sx, d.y * sy);
+}
+
 @vertex
 fn vs_main(v: VertIn) -> VertOut {
-    let s_prev = to_screen(v.pos_prev);
     let s_curr = to_screen(v.pos_curr);
-    let s_next = to_screen(v.pos_next);
 
-    // Segment direction vectors in screen space (y-up, pixel units).
-    let d0 = s_curr - s_prev;   // prev → curr
-    let d1 = s_next - s_curr;   // curr → next
+    // Segment direction vectors in screen space (y-up, pixel units). Compute
+    // them from local chart-space deltas, not from transformed absolute
+    // positions, so the stroke shape stays stable while the x-axis slides.
+    let d0 = delta_to_screen(v.pos_curr - v.pos_prev);   // prev to curr
+    let d1 = delta_to_screen(v.pos_next - v.pos_curr);   // curr to next
     let len0 = length(d0);
     let len1 = length(d1);
 

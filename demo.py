@@ -1856,6 +1856,9 @@ class DemoApp(tk.Tk):
                     w._renderer.chart2d_remove_line(w._primary_handle)
                 w._primary_handle = None
             w._pending_primary = None
+            w._primary_label = None
+            w._primary_x = None
+            w._primary_y = None
             # Remove named lines from renderer.
             if w._renderer is not None:
                 for h in list(w._named_lines):
@@ -1863,6 +1866,8 @@ class DemoApp(tk.Tk):
             w._named_lines.clear()
             w._pending_named_lines.clear()
             w._nhandle_map.clear()
+            w._data_xmin = w._data_xmax = None
+            w._data_ymin = w._data_ymax = None
             w._xlim = None
             w._ylim = None
             w._x_limits_frozen = False

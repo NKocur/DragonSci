@@ -9,7 +9,9 @@ use glyphon::{
 use wgpu::util::DeviceExt;
 
 use crate::camera::{Camera, CameraState};
-use crate::grid::{axis_ticks_log, build_grid, face_bits, format_tick_with_fmt, tick_step, LineVertex};
+use crate::grid::{
+    axis_ticks_log, build_grid, face_bits, format_tick_with_fmt, tick_step, LineVertex,
+};
 
 // ── GPU data structures ───────────────────────────────────────────────────────
 
@@ -20,7 +22,7 @@ struct Uniforms {
     screen_size: [f32; 2],
     /// 0 = circle (soft), 1 = square, 2 = gaussian
     style: u32,
-    _pad: f32,
+    lod_factor: u32,
 }
 
 #[repr(C)]
@@ -42,7 +44,11 @@ struct GrowableBuffer {
 
 impl GrowableBuffer {
     fn new(usage: wgpu::BufferUsages) -> Self {
-        Self { buf: None, capacity: 0, usage }
+        Self {
+            buf: None,
+            capacity: 0,
+            usage,
+        }
     }
 
     /// Upload `data` bytes. Reallocates (with 1.5x headroom) only when capacity is exceeded.
@@ -68,10 +74,16 @@ impl GrowableBuffer {
         self.buf.as_ref().map(|b| b.slice(..))
     }
 
+    fn buffer(&self) -> Option<&wgpu::Buffer> {
+        self.buf.as_ref()
+    }
+
     /// Grow the buffer to hold at least `needed` bytes, potentially reallocating.
     /// Returns `true` when a new GPU buffer was created (all previous data lost).
     fn ensure_capacity(&mut self, device: &wgpu::Device, needed: u64) -> bool {
-        if needed <= self.capacity { return false; }
+        if needed <= self.capacity {
+            return false;
+        }
         let new_cap = needed + needed / 2;
         self.buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -126,9 +138,11 @@ struct Chart2DLineActor {
 /// Use `f32::NEG_INFINITY`/`f32::INFINITY` for the "full extent" axis (x for hspan, y for vspan).
 struct Chart2DSpanActor {
     id: u32,
-    x0: f32, x1: f32,
-    y0: f32, y1: f32,
-    color: [f32; 4],  // RGBA — alpha is honoured by the alpha-blending pipeline
+    x0: f32,
+    x1: f32,
+    y0: f32,
+    y1: f32,
+    color: [f32; 4], // RGBA — alpha is honoured by the alpha-blending pipeline
     buf: GrowableBuffer,
     vertex_count: u32,
 }
@@ -160,12 +174,12 @@ pub struct MeshVertex {
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 struct ThickLineVert {
-    pos_prev:   [f32; 2],
-    pos_curr:   [f32; 2],
-    pos_next:   [f32; 2],
-    side:       f32,       // +1.0 = left edge, -1.0 = right edge
-    line_width: f32,       // pixels
-    color:      [f32; 4],
+    pos_prev: [f32; 2],
+    pos_curr: [f32; 2],
+    pos_next: [f32; 2],
+    side: f32,       // +1.0 = left edge, -1.0 = right edge
+    line_width: f32, // pixels
+    color: [f32; 4],
 }
 
 struct MeshActor {
@@ -212,13 +226,20 @@ impl ScreenPickCache {
         let rows = ((h / GRID_CELL_PX).ceil() as u32).max(1);
         let n_cells = (cols * rows) as usize;
 
-        let screen_xy: Vec<Option<[f32; 2]>> = positions.iter().map(|&p| {
-            let clip = vp * Vec3::from(p).extend(1.0);
-            if clip.w <= 0.0 { return None; }
-            let ndc = clip.truncate() / clip.w;
-            if ndc.x.abs() > 1.05 || ndc.y.abs() > 1.05 { return None; }
-            Some([(ndc.x + 1.0) * 0.5 * w, (1.0 - ndc.y) * 0.5 * h])
-        }).collect();
+        let screen_xy: Vec<Option<[f32; 2]>> = positions
+            .iter()
+            .map(|&p| {
+                let clip = vp * Vec3::from(p).extend(1.0);
+                if clip.w <= 0.0 {
+                    return None;
+                }
+                let ndc = clip.truncate() / clip.w;
+                if ndc.x.abs() > 1.05 || ndc.y.abs() > 1.05 {
+                    return None;
+                }
+                Some([(ndc.x + 1.0) * 0.5 * w, (1.0 - ndc.y) * 0.5 * h])
+            })
+            .collect();
 
         // First pass: count points per cell.
         let mut cell_count = vec![0u32; n_cells];
@@ -254,26 +275,42 @@ impl ScreenPickCache {
             }
         }
 
-        Self { vp, w, h, cols, rows, screen_xy, cell_start, sorted_pts }
+        Self {
+            vp,
+            w,
+            h,
+            cols,
+            rows,
+            screen_xy,
+            cell_start,
+            sorted_pts,
+        }
     }
 
     /// Invoke `f(point_index, [sx, sy])` for every point whose grid cell overlaps
     /// `[sx0, sy0]–[sx1, sy1]`.  Points in border cells that fall outside the
     /// rectangle are also visited; the caller does the exact test.
     fn for_each_in_rect<F: FnMut(u32, [f32; 2])>(
-        &self, sx0: f32, sy0: f32, sx1: f32, sy1: f32, mut f: F,
+        &self,
+        sx0: f32,
+        sy0: f32,
+        sx1: f32,
+        sy1: f32,
+        mut f: F,
     ) {
         let cx0 = ((sx0 / GRID_CELL_PX).floor() as i32).max(0) as u32;
         let cy0 = ((sy0 / GRID_CELL_PX).floor() as i32).max(0) as u32;
         let cx1 = ((sx1 / GRID_CELL_PX).ceil() as i32)
-            .min(self.cols as i32 - 1).max(0) as u32;
+            .min(self.cols as i32 - 1)
+            .max(0) as u32;
         let cy1 = ((sy1 / GRID_CELL_PX).ceil() as i32)
-            .min(self.rows as i32 - 1).max(0) as u32;
+            .min(self.rows as i32 - 1)
+            .max(0) as u32;
         for cy in cy0..=cy1 {
             for cx in cx0..=cx1 {
                 let cell = (cy * self.cols + cx) as usize;
                 let start = self.cell_start[cell] as usize;
-                let end   = self.cell_start[cell + 1] as usize;
+                let end = self.cell_start[cell + 1] as usize;
                 for &pt in &self.sorted_pts[start..end] {
                     if let Some(xy) = self.screen_xy[pt as usize] {
                         f(pt, xy);
@@ -288,23 +325,33 @@ impl ScreenPickCache {
     /// Used by the expanding-ring fallback in `pick_point`.
     fn for_each_in_ring<F: FnMut(u32, [f32; 2])>(
         &self,
-        ox0: f32, oy0: f32, ox1: f32, oy1: f32,  // outer box
-        ix0: f32, iy0: f32, ix1: f32, iy1: f32,  // inner box (skip)
+        ox0: f32,
+        oy0: f32,
+        ox1: f32,
+        oy1: f32, // outer box
+        ix0: f32,
+        iy0: f32,
+        ix1: f32,
+        iy1: f32, // inner box (skip)
         mut f: F,
     ) {
         let cx0 = ((ox0 / GRID_CELL_PX).floor() as i32).max(0) as u32;
         let cy0 = ((oy0 / GRID_CELL_PX).floor() as i32).max(0) as u32;
         let cx1 = ((ox1 / GRID_CELL_PX).ceil() as i32)
-            .min(self.cols as i32 - 1).max(0) as u32;
+            .min(self.cols as i32 - 1)
+            .max(0) as u32;
         let cy1 = ((oy1 / GRID_CELL_PX).ceil() as i32)
-            .min(self.rows as i32 - 1).max(0) as u32;
+            .min(self.rows as i32 - 1)
+            .max(0) as u32;
         // Inner cell range (inclusive) — cells fully inside inner box.
         let icx0 = ((ix0 / GRID_CELL_PX).ceil() as i32).max(0) as u32;
         let icy0 = ((iy0 / GRID_CELL_PX).ceil() as i32).max(0) as u32;
         let icx1 = ((ix1 / GRID_CELL_PX).floor() as i32)
-            .min(self.cols as i32 - 1).max(0) as u32;
+            .min(self.cols as i32 - 1)
+            .max(0) as u32;
         let icy1 = ((iy1 / GRID_CELL_PX).floor() as i32)
-            .min(self.rows as i32 - 1).max(0) as u32;
+            .min(self.rows as i32 - 1)
+            .max(0) as u32;
         for cy in cy0..=cy1 {
             for cx in cx0..=cx1 {
                 // Skip cells entirely within the previously searched inner box.
@@ -313,7 +360,7 @@ impl ScreenPickCache {
                 }
                 let cell = (cy * self.cols + cx) as usize;
                 let start = self.cell_start[cell] as usize;
-                let end   = self.cell_start[cell + 1] as usize;
+                let end = self.cell_start[cell + 1] as usize;
                 for &pt in &self.sorted_pts[start..end] {
                     if let Some(xy) = self.screen_xy[pt as usize] {
                         f(pt, xy);
@@ -348,7 +395,7 @@ struct StreamInfo {
 struct Actor {
     id: u32,
     buf: GrowableBuffer,
-    positions: Vec<[f32; 3]>,   // CPU copy for picking / pick-cache rebuild
+    positions: Vec<[f32; 3]>, // CPU copy for picking / pick-cache rebuild
     count: u32,
     visible: bool,
     data_min: Vec3,
@@ -369,7 +416,9 @@ impl Actor {
             return;
         }
         if let Some(ref c) = self.pick_cache {
-            if c.vp == vp && c.w == w && c.h == h { return; }
+            if c.vp == vp && c.w == w && c.h == h {
+                return;
+            }
         }
         self.pick_cache = Some(ScreenPickCache::build(&self.positions, vp, w, h));
     }
@@ -451,7 +500,12 @@ fn build_label_buffer(font_system: &mut FontSystem, text: &str, size: f32) -> Bu
     let line_h = size * 1.4;
     let mut buf = Buffer::new(font_system, Metrics::new(size, line_h));
     buf.set_size(font_system, Some(512.0), Some(line_h * 2.0));
-    buf.set_text(font_system, text, Attrs::new().family(Family::SansSerif), Shaping::Basic);
+    buf.set_text(
+        font_system,
+        text,
+        Attrs::new().family(Family::SansSerif),
+        Shaping::Basic,
+    );
     buf.shape_until_scroll(font_system, false);
     buf
 }
@@ -460,7 +514,13 @@ fn build_label_buffer(font_system: &mut FontSystem, text: &str, size: f32) -> Bu
 
 /// Which role a chart2d text label plays (determines pixel-position formula).
 #[derive(Clone, Copy, PartialEq)]
-enum Chart2DLabelKind { XTick, YTick, XTitle, YTitle, ChartTitle }
+enum Chart2DLabelKind {
+    XTick,
+    YTick,
+    XTitle,
+    YTitle,
+    ChartTitle,
+}
 
 /// Pre-shaped legend text label (pixel-space; position known at build time).
 struct Chart2DLegendLabel {
@@ -481,12 +541,14 @@ struct Chart2DLabel {
 
 /// Describes the 2D chart frame: data domain, viewport fractions, axis titles.
 struct Chart2DState {
-    plot_left:   f32,   // viewport fraction [0,1], left edge of the plot area
-    plot_right:  f32,   // viewport fraction [0,1], right edge
-    plot_top:    f32,   // viewport fraction [0,1], top edge (smaller = closer to top of window)
-    plot_bottom: f32,   // viewport fraction [0,1], bottom edge
-    x0: f32, x1: f32,  // xlim (data domain)
-    y0: f32, y1: f32,  // ylim (data domain)
+    plot_left: f32,   // viewport fraction [0,1], left edge of the plot area
+    plot_right: f32,  // viewport fraction [0,1], right edge
+    plot_top: f32,    // viewport fraction [0,1], top edge (smaller = closer to top of window)
+    plot_bottom: f32, // viewport fraction [0,1], bottom edge
+    x0: f32,
+    x1: f32, // xlim (data domain)
+    y0: f32,
+    y1: f32, // ylim (data domain)
     x_label: String,
     y_label: String,
     /// Optional chart-level title displayed above the plot area.
@@ -510,28 +572,52 @@ struct Chart2DState {
 impl Chart2DState {
     /// Map a data-space x value to chart (transform-input) space.
     /// When log scale is on this is log₁₀(v); otherwise v itself.
-    #[inline] fn chart_x(&self, v: f32) -> f32 {
-        if self.x_log_scale { v.max(1e-30).log10() } else { v }
+    #[inline]
+    fn chart_x(&self, v: f32) -> f32 {
+        if self.x_log_scale {
+            v.max(1e-30).log10()
+        } else {
+            v
+        }
     }
-    #[inline] fn chart_y(&self, v: f32) -> f32 {
-        if self.y_log_scale { v.max(1e-30).log10() } else { v }
+    #[inline]
+    fn chart_y(&self, v: f32) -> f32 {
+        if self.y_log_scale {
+            v.max(1e-30).log10()
+        } else {
+            v
+        }
     }
     /// Effective x0/x1 in chart space (log-transformed when log scale is on).
-    #[inline] fn effective_x0(&self) -> f32 { self.chart_x(self.x0) }
-    #[inline] fn effective_x1(&self) -> f32 { self.chart_x(self.x1) }
-    #[inline] fn effective_y0(&self) -> f32 { self.chart_y(self.y0) }
-    #[inline] fn effective_y1(&self) -> f32 { self.chart_y(self.y1) }
+    #[inline]
+    fn effective_x0(&self) -> f32 {
+        self.chart_x(self.x0)
+    }
+    #[inline]
+    fn effective_x1(&self) -> f32 {
+        self.chart_x(self.x1)
+    }
+    #[inline]
+    fn effective_y0(&self) -> f32 {
+        self.chart_y(self.y0)
+    }
+    #[inline]
+    fn effective_y1(&self) -> f32 {
+        self.chart_y(self.y1)
+    }
 
     /// NDC x = scale_x * chart_x(data_x) + offset_x
     fn scale_x(&self) -> f32 {
-        2.0 * (self.plot_right - self.plot_left) / (self.effective_x1() - self.effective_x0()).abs().max(1e-10)
+        2.0 * (self.plot_right - self.plot_left)
+            / (self.effective_x1() - self.effective_x0()).abs().max(1e-10)
     }
     fn offset_x(&self) -> f32 {
         (2.0 * self.plot_left - 1.0) - self.effective_x0() * self.scale_x()
     }
     /// NDC y = scale_y * chart_y(data_y) + offset_y
     fn scale_y(&self) -> f32 {
-        2.0 * (self.plot_bottom - self.plot_top) / (self.effective_y1() - self.effective_y0()).abs().max(1e-10)
+        2.0 * (self.plot_bottom - self.plot_top)
+            / (self.effective_y1() - self.effective_y0()).abs().max(1e-10)
     }
     fn offset_y(&self) -> f32 {
         (1.0 - 2.0 * self.plot_bottom) - self.effective_y0() * self.scale_y()
@@ -547,14 +633,14 @@ impl Chart2DState {
         // Column-major 4×4: col[i][j] = row j of column i
         Uniforms {
             view_proj: [
-                [sx,  0.0, 0.0, 0.0],  // col 0
-                [0.0, sy,  0.0, 0.0],  // col 1
-                [0.0, 0.0, 1.0, 0.0],  // col 2
-                [ox,  oy,  0.0, 1.0],  // col 3 (translation)
+                [sx, 0.0, 0.0, 0.0],  // col 0
+                [0.0, sy, 0.0, 0.0],  // col 1
+                [0.0, 0.0, 1.0, 0.0], // col 2
+                [ox, oy, 0.0, 1.0],   // col 3 (translation)
             ],
             screen_size: [screen_w, screen_h],
             style: 0,
-            _pad: 0.0,
+            lod_factor: 1,
         }
     }
 }
@@ -570,6 +656,8 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
 
     point_pipeline: wgpu::RenderPipeline,
+    point_lod_pipeline: wgpu::RenderPipeline,
+    point_lod_bind_group_layout: wgpu::BindGroupLayout,
     line_pipeline: wgpu::RenderPipeline,
 
     actors: Vec<Actor>,
@@ -605,7 +693,7 @@ pub struct Renderer {
     // Scalar bar overlay (screen-space, drawn with identity view_proj)
     scalar_bar_buf: GrowableBuffer,
     scalar_bar_line_count: u32,
-    overlay_bind_group: wgpu::BindGroup,  // identity-matrix uniform
+    overlay_bind_group: wgpu::BindGroup, // identity-matrix uniform
     scalar_bar_labels: Vec<ScalarBarLabel>,
     scalar_bar_visible: bool,
 
@@ -649,7 +737,7 @@ pub struct Renderer {
 
     /// Active point style: 0 = circle, 1 = square, 2 = gaussian
     point_style: u32,
-    /// LOD divisor: draw only first `count / lod_factor` instances (1 = full quality)
+    /// LOD divisor: draw one representative point every N instances (1 = full quality).
     lod_factor: u32,
 
     // ── Visual appearance ─────────────────────────────────────────────────────
@@ -781,7 +869,7 @@ impl Renderer {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             screen_size: [width as f32, height as f32],
             style: 0,
-            _pad: 0.0,
+            lod_factor: 1,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -848,13 +936,24 @@ impl Renderer {
             surface_format,
             include_str!("shaders/points.wgsl"),
         );
+        let (point_lod_pipeline, point_lod_bind_group_layout) = build_point_lod_pipeline(
+            &device,
+            surface_format,
+            include_str!("shaders/points_lod.wgsl"),
+        );
         let line_pipeline = build_line_pipeline(
-            &device, &uniform_layout, surface_format,
-            include_str!("shaders/lines.wgsl"), true,
+            &device,
+            &uniform_layout,
+            surface_format,
+            include_str!("shaders/lines.wgsl"),
+            true,
         );
         let line_pipeline_nodepth = build_line_pipeline(
-            &device, &uniform_layout, surface_format,
-            include_str!("shaders/lines.wgsl"), false,
+            &device,
+            &uniform_layout,
+            surface_format,
+            include_str!("shaders/lines.wgsl"),
+            false,
         );
 
         let font_system = FontSystem::new();
@@ -878,24 +977,34 @@ impl Renderer {
         let camera = Camera::fit(Vec3::ZERO, 1.0, width as f32 / height.max(1) as f32);
 
         let mesh_wgsl = include_str!("shaders/mesh.wgsl");
-        let mesh_pipeline_opaque      = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
-        let mesh_pipeline_transparent = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
-        let mesh_pipeline_wireframe   = build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
-        let chart2d_line_pipeline = build_chart2d_line_pipeline(
-            &device, &uniform_layout, surface_format, mesh_wgsl,
-        );
+        let mesh_pipeline_opaque =
+            build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
+        let mesh_pipeline_transparent =
+            build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
+        let mesh_pipeline_wireframe =
+            build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
+        let chart2d_line_pipeline =
+            build_chart2d_line_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
         let chart2d_thick_wgsl = include_str!("shaders/chart2d_lines.wgsl");
         let chart2d_thick_pipeline = build_chart2d_thick_pipeline(
-            &device, &uniform_layout, surface_format, chart2d_thick_wgsl,
+            &device,
+            &uniform_layout,
+            surface_format,
+            chart2d_thick_wgsl,
         );
 
         Ok(Self {
             device,
             queue,
-            render_surface: RenderSurface::Windowed { surface, surface_config },
+            render_surface: RenderSurface::Windowed {
+                surface,
+                surface_config,
+            },
             depth_texture,
             depth_view,
             point_pipeline,
+            point_lod_pipeline,
+            point_lod_bind_group_layout,
             line_pipeline,
             actors: Vec::new(),
             next_actor_id: 0,
@@ -1024,7 +1133,7 @@ impl Renderer {
             view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             screen_size: [width as f32, height as f32],
             style: 0,
-            _pad: 0.0,
+            lod_factor: 1,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("uniforms"),
@@ -1084,16 +1193,29 @@ impl Renderer {
         });
 
         let point_pipeline = build_point_pipeline(
-            &device, &uniform_layout, surface_format,
+            &device,
+            &uniform_layout,
+            surface_format,
             include_str!("shaders/points.wgsl"),
         );
+        let (point_lod_pipeline, point_lod_bind_group_layout) = build_point_lod_pipeline(
+            &device,
+            surface_format,
+            include_str!("shaders/points_lod.wgsl"),
+        );
         let line_pipeline = build_line_pipeline(
-            &device, &uniform_layout, surface_format,
-            include_str!("shaders/lines.wgsl"), true,
+            &device,
+            &uniform_layout,
+            surface_format,
+            include_str!("shaders/lines.wgsl"),
+            true,
         );
         let line_pipeline_nodepth = build_line_pipeline(
-            &device, &uniform_layout, surface_format,
-            include_str!("shaders/lines.wgsl"), false,
+            &device,
+            &uniform_layout,
+            surface_format,
+            include_str!("shaders/lines.wgsl"),
+            false,
         );
 
         let font_system = FontSystem::new();
@@ -1117,15 +1239,20 @@ impl Renderer {
         let camera = Camera::fit(Vec3::ZERO, 1.0, width as f32 / height.max(1) as f32);
 
         let mesh_wgsl = include_str!("shaders/mesh.wgsl");
-        let mesh_pipeline_opaque      = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
-        let mesh_pipeline_transparent = build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
-        let mesh_pipeline_wireframe   = build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
-        let chart2d_line_pipeline = build_chart2d_line_pipeline(
-            &device, &uniform_layout, surface_format, mesh_wgsl,
-        );
+        let mesh_pipeline_opaque =
+            build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, false);
+        let mesh_pipeline_transparent =
+            build_mesh_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl, true);
+        let mesh_pipeline_wireframe =
+            build_wireframe_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
+        let chart2d_line_pipeline =
+            build_chart2d_line_pipeline(&device, &uniform_layout, surface_format, mesh_wgsl);
         let chart2d_thick_wgsl = include_str!("shaders/chart2d_lines.wgsl");
         let chart2d_thick_pipeline = build_chart2d_thick_pipeline(
-            &device, &uniform_layout, surface_format, chart2d_thick_wgsl,
+            &device,
+            &uniform_layout,
+            surface_format,
+            chart2d_thick_wgsl,
         );
 
         Ok(Self {
@@ -1135,6 +1262,8 @@ impl Renderer {
             depth_texture,
             depth_view,
             point_pipeline,
+            point_lod_pipeline,
+            point_lod_bind_group_layout,
             line_pipeline,
             actors: Vec::new(),
             next_actor_id: 0,
@@ -1264,17 +1393,16 @@ impl Renderer {
         // Bar dimensions & position in pixels
         let bar_w = 16.0_f32;
         let bar_h = (h * 0.45).min(220.0).max(60.0);
-        let margin_r = 52.0_f32;  // from right edge
-        let margin_t = 32.0_f32;  // from top edge
-        let bar_x1 = w - margin_r - bar_w;  // left edge in pixels
-        let bar_x2 = w - margin_r;           // right edge
-        let bar_y1 = margin_t;               // top edge
-        let bar_y2 = margin_t + bar_h;       // bottom edge
+        let margin_r = 52.0_f32; // from right edge
+        let margin_t = 32.0_f32; // from top edge
+        let bar_x1 = w - margin_r - bar_w; // left edge in pixels
+        let bar_x2 = w - margin_r; // right edge
+        let bar_y1 = margin_t; // top edge
+        let bar_y2 = margin_t + bar_h; // bottom edge
 
         // Convert pixel coords to NDC [-1, 1]
-        let to_ndc = |px: f32, py: f32| -> [f32; 3] {
-            [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0]
-        };
+        let to_ndc =
+            |px: f32, py: f32| -> [f32; 3] { [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0] };
 
         // Gradient: N horizontal line pairs, each colored by the colormap.
         const GRAD_STEPS: usize = 64;
@@ -1288,30 +1416,53 @@ impl Renderer {
             let y_top = bar_y1 + t_top * bar_h;
             let y_bot = bar_y1 + t_bot * bar_h;
             // Draw top and bottom edges of this band (both same color → solid band)
-            verts.push(LineVertex { position: to_ndc(bar_x1, y_top), color });
-            verts.push(LineVertex { position: to_ndc(bar_x2, y_top), color });
-            verts.push(LineVertex { position: to_ndc(bar_x1, y_bot), color });
-            verts.push(LineVertex { position: to_ndc(bar_x2, y_bot), color });
+            verts.push(LineVertex {
+                position: to_ndc(bar_x1, y_top),
+                color,
+            });
+            verts.push(LineVertex {
+                position: to_ndc(bar_x2, y_top),
+                color,
+            });
+            verts.push(LineVertex {
+                position: to_ndc(bar_x1, y_bot),
+                color,
+            });
+            verts.push(LineVertex {
+                position: to_ndc(bar_x2, y_bot),
+                color,
+            });
         }
         // Thin white border around the bar
         let border = [0.7_f32, 0.7, 0.7];
         let corners = [
-            to_ndc(bar_x1, bar_y1), to_ndc(bar_x2, bar_y1),
-            to_ndc(bar_x2, bar_y1), to_ndc(bar_x2, bar_y2),
-            to_ndc(bar_x2, bar_y2), to_ndc(bar_x1, bar_y2),
-            to_ndc(bar_x1, bar_y2), to_ndc(bar_x1, bar_y1),
+            to_ndc(bar_x1, bar_y1),
+            to_ndc(bar_x2, bar_y1),
+            to_ndc(bar_x2, bar_y1),
+            to_ndc(bar_x2, bar_y2),
+            to_ndc(bar_x2, bar_y2),
+            to_ndc(bar_x1, bar_y2),
+            to_ndc(bar_x1, bar_y2),
+            to_ndc(bar_x1, bar_y1),
         ];
         for i in (0..corners.len()).step_by(2) {
-            verts.push(LineVertex { position: corners[i],   color: border });
-            verts.push(LineVertex { position: corners[i+1], color: border });
+            verts.push(LineVertex {
+                position: corners[i],
+                color: border,
+            });
+            verts.push(LineVertex {
+                position: corners[i + 1],
+                color: border,
+            });
         }
 
-        self.scalar_bar_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        self.scalar_bar_buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         self.scalar_bar_line_count = verts.len() as u32;
 
         // Labels: title + tick values
         self.scalar_bar_labels.clear();
-        let label_x = bar_x2 + 4.0;  // just right of bar
+        let label_x = bar_x2 + 4.0; // just right of bar
 
         let mut add_label = |text: String, px: f32, py: f32| {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(11.0, 14.0));
@@ -1323,13 +1474,17 @@ impl Renderer {
                 Shaping::Basic,
             );
             buf.shape_until_scroll(&mut self.font_system, false);
-            self.scalar_bar_labels.push(ScalarBarLabel { glyph_buf: buf, px, py });
+            self.scalar_bar_labels.push(ScalarBarLabel {
+                glyph_buf: buf,
+                px,
+                py,
+            });
         };
 
         // Tick labels: vmax at top, vmin at bottom, one or two intermediate
         let tick_count = 5_usize;
         for i in 0..=tick_count {
-            let t = i as f32 / tick_count as f32;  // 0 = top (vmax), 1 = bottom (vmin)
+            let t = i as f32 / tick_count as f32; // 0 = top (vmax), 1 = bottom (vmin)
             let val = if log_scale {
                 let lmin = vmin.max(1e-10).ln();
                 let lmax = vmax.max(1e-10).ln();
@@ -1382,8 +1537,8 @@ impl Renderer {
         }
 
         // Clone stored state to avoid borrow conflicts with font_system.
-        let title   = self.legend_title_stored.clone();
-        let items   = self.legend_items_stored.clone();
+        let title = self.legend_title_stored.clone();
+        let items = self.legend_items_stored.clone();
         let position = self.legend_position_stored;
 
         let (w, h) = (self.width as f32, self.height as f32);
@@ -1417,7 +1572,7 @@ impl Renderer {
                 // the two overlays never overlap without any user intervention.
                 let y_start = if self.scalar_bar_visible {
                     let bar_h = (h * 0.45).min(220.0_f32).max(60.0_f32);
-                    32.0_f32 + bar_h + 10.0  // 10 px gap below the bar
+                    32.0_f32 + bar_h + 10.0 // 10 px gap below the bar
                 } else {
                     MARGIN
                 };
@@ -1427,17 +1582,22 @@ impl Renderer {
         let box_x2 = box_x1 + BOX_W;
         let box_y2 = box_y1 + box_h;
 
-        let to_ndc = |px: f32, py: f32| -> [f32; 3] {
-            [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0]
-        };
+        let to_ndc =
+            |px: f32, py: f32| -> [f32; 3] { [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0] };
 
         let mut verts: Vec<LineVertex> = Vec::new();
 
         // Background fill
         let bg = [0.10_f32, 0.10, 0.13];
         for y in (box_y1 as i32)..=(box_y2 as i32) {
-            verts.push(LineVertex { position: to_ndc(box_x1, y as f32), color: bg });
-            verts.push(LineVertex { position: to_ndc(box_x2, y as f32), color: bg });
+            verts.push(LineVertex {
+                position: to_ndc(box_x1, y as f32),
+                color: bg,
+            });
+            verts.push(LineVertex {
+                position: to_ndc(box_x2, y as f32),
+                color: bg,
+            });
         }
 
         // Swatch fills
@@ -1448,8 +1608,14 @@ impl Renderer {
             let sy1 = cursor_y + (ROW_H - SWATCH) * 0.5;
             let sy2 = sy1 + SWATCH;
             for y in (sy1 as i32)..=(sy2 as i32) {
-                verts.push(LineVertex { position: to_ndc(swatch_x1, y as f32), color });
-                verts.push(LineVertex { position: to_ndc(swatch_x2, y as f32), color });
+                verts.push(LineVertex {
+                    position: to_ndc(swatch_x1, y as f32),
+                    color,
+                });
+                verts.push(LineVertex {
+                    position: to_ndc(swatch_x2, y as f32),
+                    color,
+                });
             }
             cursor_y += ROW_H + ROW_GAP;
         }
@@ -1457,17 +1623,28 @@ impl Renderer {
         // Border
         let border = [0.45_f32, 0.45, 0.52];
         let corners = [
-            to_ndc(box_x1, box_y1), to_ndc(box_x2, box_y1),
-            to_ndc(box_x2, box_y1), to_ndc(box_x2, box_y2),
-            to_ndc(box_x2, box_y2), to_ndc(box_x1, box_y2),
-            to_ndc(box_x1, box_y2), to_ndc(box_x1, box_y1),
+            to_ndc(box_x1, box_y1),
+            to_ndc(box_x2, box_y1),
+            to_ndc(box_x2, box_y1),
+            to_ndc(box_x2, box_y2),
+            to_ndc(box_x2, box_y2),
+            to_ndc(box_x1, box_y2),
+            to_ndc(box_x1, box_y2),
+            to_ndc(box_x1, box_y1),
         ];
         for i in (0..corners.len()).step_by(2) {
-            verts.push(LineVertex { position: corners[i],   color: border });
-            verts.push(LineVertex { position: corners[i+1], color: border });
+            verts.push(LineVertex {
+                position: corners[i],
+                color: border,
+            });
+            verts.push(LineVertex {
+                position: corners[i + 1],
+                color: border,
+            });
         }
 
-        self.legend_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        self.legend_buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         self.legend_line_count = verts.len() as u32;
 
         // Text labels
@@ -1477,21 +1654,41 @@ impl Renderer {
 
         if has_title {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(12.0, 15.0));
-            buf.set_size(&mut self.font_system, Some(BOX_W - PAD_H * 2.0), Some(TITLE_H));
-            buf.set_text(&mut self.font_system, &title,
-                Attrs::new().family(Family::SansSerif), Shaping::Basic);
+            buf.set_size(
+                &mut self.font_system,
+                Some(BOX_W - PAD_H * 2.0),
+                Some(TITLE_H),
+            );
+            buf.set_text(
+                &mut self.font_system,
+                &title,
+                Attrs::new().family(Family::SansSerif),
+                Shaping::Basic,
+            );
             buf.shape_until_scroll(&mut self.font_system, false);
-            self.legend_labels.push(ScalarBarLabel { glyph_buf: buf, px: box_x1 + PAD_H, py: cursor_y });
+            self.legend_labels.push(ScalarBarLabel {
+                glyph_buf: buf,
+                px: box_x1 + PAD_H,
+                py: cursor_y,
+            });
             cursor_y += TITLE_H + TITLE_GAP;
         }
         for (label, _) in &items {
             let mut buf = Buffer::new(&mut self.font_system, Metrics::new(11.0, 14.0));
             buf.set_size(&mut self.font_system, Some(TEXT_W), Some(ROW_H));
-            buf.set_text(&mut self.font_system, label,
-                Attrs::new().family(Family::SansSerif), Shaping::Basic);
+            buf.set_text(
+                &mut self.font_system,
+                label,
+                Attrs::new().family(Family::SansSerif),
+                Shaping::Basic,
+            );
             buf.shape_until_scroll(&mut self.font_system, false);
             let ty = cursor_y + (ROW_H - 11.0) * 0.5;
-            self.legend_labels.push(ScalarBarLabel { glyph_buf: buf, px: text_x, py: ty });
+            self.legend_labels.push(ScalarBarLabel {
+                glyph_buf: buf,
+                px: text_x,
+                py: ty,
+            });
             cursor_y += ROW_H + ROW_GAP;
         }
     }
@@ -1504,7 +1701,14 @@ impl Renderer {
     /// repeated full-scene refreshes avoid GPU reallocation when the point count
     /// stays similar or shrinks (GrowableBuffer only reallocates on growth).
     /// Returns the actor ID, or `None` when `count == 0`.
-    pub fn set_points(&mut self, instances: &[PointInstance], positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> Option<u32> {
+    pub fn set_points(
+        &mut self,
+        instances: &[PointInstance],
+        positions: Vec<[f32; 3]>,
+        count: u32,
+        data_min: Vec3,
+        data_max: Vec3,
+    ) -> Option<u32> {
         // Drop add_points actors but keep the scene slot so its GPU buffer survives.
         match self.scene_actor_id {
             Some(sid) => self.actors.retain(|a| a.id == sid),
@@ -1520,8 +1724,14 @@ impl Renderer {
         // Reuse the existing scene actor's GPU buffer.
         if let Some(sid) = self.scene_actor_id {
             if let Some(actor) = self.actors.iter_mut().find(|a| a.id == sid) {
-                actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
-                actor.positions = if self.store_pick_data { positions } else { vec![] };
+                actor
+                    .buf
+                    .upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
+                actor.positions = if self.store_pick_data {
+                    positions
+                } else {
+                    vec![]
+                };
                 actor.count = count;
                 actor.data_min = data_min;
                 actor.data_max = data_max;
@@ -1537,7 +1747,14 @@ impl Renderer {
         Some(id)
     }
 
-    fn _add_actor_buf(&mut self, instances: &[PointInstance], mut positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> u32 {
+    fn _add_actor_buf(
+        &mut self,
+        instances: &[PointInstance],
+        mut positions: Vec<[f32; 3]>,
+        count: u32,
+        data_min: Vec3,
+        data_max: Vec3,
+    ) -> u32 {
         if !self.store_pick_data {
             positions.clear();
             positions.shrink_to_fit();
@@ -1546,7 +1763,7 @@ impl Renderer {
         self.next_actor_id += 1;
         let mut actor = Actor {
             id,
-            buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
+            buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE),
             positions,
             count,
             visible: true,
@@ -1555,27 +1772,45 @@ impl Renderer {
             pick_cache: None,
             stream: None,
         };
-        actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
+        actor
+            .buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
         self.actors.push(actor);
         id
     }
 
     /// Add a new point cloud actor and return its ID.
-    pub fn add_actor(&mut self, instances: &[PointInstance], positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> u32 {
+    pub fn add_actor(
+        &mut self,
+        instances: &[PointInstance],
+        positions: Vec<[f32; 3]>,
+        count: u32,
+        data_min: Vec3,
+        data_max: Vec3,
+    ) -> u32 {
         self._add_actor_buf(instances, positions, count, data_min, data_max)
     }
 
     /// Replace data for an existing actor in-place. Returns false if not found.
-    pub fn update_actor_data(&mut self, id: u32, instances: &[PointInstance], positions: Vec<[f32; 3]>, count: u32, data_min: Vec3, data_max: Vec3) -> bool {
+    pub fn update_actor_data(
+        &mut self,
+        id: u32,
+        instances: &[PointInstance],
+        positions: Vec<[f32; 3]>,
+        count: u32,
+        data_min: Vec3,
+        data_max: Vec3,
+    ) -> bool {
         let store = self.store_pick_data;
         if let Some(a) = self.actors.iter_mut().find(|a| a.id == id) {
             a.count = count;
             a.data_min = data_min;
             a.data_max = data_max;
             a.positions = if store { positions } else { vec![] };
-            a.pick_cache = None;  // positions changed — invalidate pick cache
+            a.pick_cache = None; // positions changed — invalidate pick cache
             if count > 0 {
-                a.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
+                a.buf
+                    .upload(&self.device, &self.queue, bytemuck::cast_slice(instances));
             }
             true
         } else {
@@ -1605,16 +1840,25 @@ impl Renderer {
         let inst_size = std::mem::size_of::<PointInstance>() as u64;
         let cap_bytes = max_points as u64 * inst_size;
 
-        let mut buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
+        let mut buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE);
         buf.ensure_capacity(&self.device, cap_bytes);
 
-        let fill = count.min(max_points);
+        let fill = count.min(max_points) as usize;
+        let src_start = if mode == StreamMode::Ring && instances.len() > fill {
+            instances.len() - fill
+        } else {
+            0
+        };
         if fill > 0 {
-            buf.write_at(&self.queue, 0, bytemuck::cast_slice(&instances[..fill as usize]));
+            buf.write_at(
+                &self.queue,
+                0,
+                bytemuck::cast_slice(&instances[src_start..src_start + fill]),
+            );
         }
 
         let stream_positions = if self.store_pick_data {
-            positions[..fill as usize].to_vec()
+            positions[src_start..src_start + fill].to_vec()
         } else {
             vec![]
         };
@@ -1622,14 +1866,14 @@ impl Renderer {
             id,
             buf,
             positions: stream_positions,
-            count: fill,
+            count: fill as u32,
             visible: true,
             data_min,
             data_max,
             pick_cache: None,
             stream: Some(StreamInfo {
                 capacity: max_points,
-                write_head: fill % max_points.max(1),
+                write_head: (fill as u32) % max_points.max(1),
                 mode,
             }),
         });
@@ -1662,25 +1906,40 @@ impl Renderer {
         };
 
         let n = instances.len();
-        if n == 0 { return (true, false); }
+        if n == 0 {
+            return (true, false);
+        }
         let inst_size = std::mem::size_of::<PointInstance>();
         let cap = si.capacity as usize;
+        if cap == 0 {
+            return (true, false);
+        }
 
         match si.mode {
             StreamMode::Append => {
                 let space = cap.saturating_sub(actor.count as usize);
                 let to_write = n.min(space);
-                if to_write == 0 { return (true, false); }
+                if to_write == 0 {
+                    return (true, false);
+                }
                 let offset = actor.count as u64 * inst_size as u64;
-                actor.buf.write_at(&self.queue, offset,
-                    bytemuck::cast_slice(&instances[..to_write]));
+                actor.buf.write_at(
+                    &self.queue,
+                    offset,
+                    bytemuck::cast_slice(&instances[..to_write]),
+                );
                 if !actor.positions.is_empty() {
-                    actor.positions.extend_from_slice(&new_positions[..to_write]);
+                    actor
+                        .positions
+                        .extend_from_slice(&new_positions[..to_write]);
                 }
                 actor.count += to_write as u32;
             }
             StreamMode::Ring => {
                 let to_write = n.min(cap);
+                let src_start = n - to_write;
+                let write_instances = &instances[src_start..src_start + to_write];
+                let write_positions = &new_positions[src_start..src_start + to_write];
                 let head = si.write_head as usize;
 
                 // Two-segment write to handle the wrap-around boundary.
@@ -1688,11 +1947,17 @@ impl Renderer {
                 let seg1_len = seg1_end - head;
                 let seg2_len = to_write - seg1_len;
 
-                actor.buf.write_at(&self.queue, (head * inst_size) as u64,
-                    bytemuck::cast_slice(&instances[..seg1_len]));
+                actor.buf.write_at(
+                    &self.queue,
+                    (head * inst_size) as u64,
+                    bytemuck::cast_slice(&write_instances[..seg1_len]),
+                );
                 if seg2_len > 0 {
-                    actor.buf.write_at(&self.queue, 0,
-                        bytemuck::cast_slice(&instances[seg1_len..to_write]));
+                    actor.buf.write_at(
+                        &self.queue,
+                        0,
+                        bytemuck::cast_slice(&write_instances[seg1_len..to_write]),
+                    );
                 }
 
                 let new_count = (actor.count as usize + to_write).min(cap);
@@ -1701,11 +1966,13 @@ impl Renderer {
                     if actor.positions.len() < new_count {
                         actor.positions.resize(new_count, [0.0; 3]);
                     }
-                    for i in 0..seg1_len {
-                        actor.positions[head + i] = new_positions[i];
+                    if seg1_len > 0 {
+                        actor.positions[head..head + seg1_len]
+                            .copy_from_slice(&write_positions[..seg1_len]);
                     }
-                    for i in 0..seg2_len {
-                        actor.positions[i] = new_positions[seg1_len + i];
+                    if seg2_len > 0 {
+                        actor.positions[..seg2_len]
+                            .copy_from_slice(&write_positions[seg1_len..to_write]);
                     }
                 }
 
@@ -1731,7 +1998,9 @@ impl Renderer {
             Some(a) => a,
             None => return false,
         };
-        if actor.stream.is_none() { return false; }
+        if actor.stream.is_none() {
+            return false;
+        }
         actor.count = 0;
         actor.positions.clear();
         actor.pick_cache = None;
@@ -1779,24 +2048,34 @@ impl Renderer {
         let mut bmax = Vec3::splat(f32::NEG_INFINITY);
         let mut any = false;
         for a in &self.actors {
-            if !a.visible || a.count == 0 { continue; }
+            if !a.visible || a.count == 0 {
+                continue;
+            }
             bmin = bmin.min(a.data_min);
             bmax = bmax.max(a.data_max);
             any = true;
         }
         for la in &self.line_actors {
-            if !la.visible || la.vertex_count == 0 { continue; }
+            if !la.visible || la.vertex_count == 0 {
+                continue;
+            }
             bmin = bmin.min(la.data_min);
             bmax = bmax.max(la.data_max);
             any = true;
         }
         for ma in &self.mesh_actors {
-            if !ma.visible || ma.index_count == 0 { continue; }
+            if !ma.visible || ma.index_count == 0 {
+                continue;
+            }
             bmin = bmin.min(ma.data_min);
             bmax = bmax.max(ma.data_max);
             any = true;
         }
-        if any { Some((bmin, bmax)) } else { None }
+        if any {
+            Some((bmin, bmax))
+        } else {
+            None
+        }
     }
 
     // ── Picking ───────────────────────────────────────────────────────────────
@@ -1817,14 +2096,19 @@ impl Renderer {
         // guaranteed to be in the searched cells (cell boundary slack included).
         const R: f32 = GRID_CELL_PX * 2.0;
         for actor in &mut self.actors {
-            if !actor.visible { continue; }
+            if !actor.visible {
+                continue;
+            }
             actor.ensure_pick_cache(vp, w, h);
             let (cache, positions, actor_id) = match actor.pick_cache.as_ref() {
                 Some(c) => (c, &actor.positions, actor.id),
                 None => continue,
             };
             cache.for_each_in_rect(
-                screen_x - R, screen_y - R, screen_x + R, screen_y + R,
+                screen_x - R,
+                screen_y - R,
+                screen_x + R,
+                screen_y + R,
                 |i, [sx, sy]| {
                     let d_sq = (sx - screen_x).powi(2) + (sy - screen_y).powi(2);
                     if d_sq < best_dist_sq {
@@ -1846,17 +2130,23 @@ impl Renderer {
             while inner_r < max_r {
                 let outer_r = inner_r + GRID_CELL_PX;
                 for actor in &mut self.actors {
-                    if !actor.visible { continue; }
+                    if !actor.visible {
+                        continue;
+                    }
                     // Cache is already built from the fast-path loop above.
                     let (cache, positions, actor_id) = match actor.pick_cache.as_ref() {
                         Some(c) => (c, &actor.positions, actor.id),
                         None => continue,
                     };
                     cache.for_each_in_ring(
-                        screen_x - outer_r, screen_y - outer_r,
-                        screen_x + outer_r, screen_y + outer_r,
-                        screen_x - inner_r, screen_y - inner_r,
-                        screen_x + inner_r, screen_y + inner_r,
+                        screen_x - outer_r,
+                        screen_y - outer_r,
+                        screen_x + outer_r,
+                        screen_y + outer_r,
+                        screen_x - inner_r,
+                        screen_y - inner_r,
+                        screen_x + inner_r,
+                        screen_y + inner_r,
                         |i, [sx, sy]| {
                             let d_sq = (sx - screen_x).powi(2) + (sy - screen_y).powi(2);
                             if d_sq < best_dist_sq {
@@ -1888,7 +2178,9 @@ impl Renderer {
 
         let mut result = Vec::new();
         for actor in &mut self.actors {
-            if !actor.visible { continue; }
+            if !actor.visible {
+                continue;
+            }
             actor.ensure_pick_cache(vp, w, h);
             let (cache, actor_id) = match actor.pick_cache.as_ref() {
                 Some(c) => (c, actor.id),
@@ -1908,25 +2200,49 @@ impl Renderer {
     /// Draw an in-progress selection rectangle (screen coords, pixels).
     pub fn set_selection_rect(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
         let (w, h) = (self.width as f32, self.height as f32);
-        let to_ndc = |px: f32, py: f32| -> [f32; 3] {
-            [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0]
-        };
+        let to_ndc =
+            |px: f32, py: f32| -> [f32; 3] { [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0] };
         let tl = to_ndc(x0, y0);
         let tr = to_ndc(x1, y0);
         let br = to_ndc(x1, y1);
         let bl = to_ndc(x0, y1);
         let col = [0.4_f32, 0.8, 1.0];
         let verts: [LineVertex; 8] = [
-            LineVertex { position: tl, color: col },
-            LineVertex { position: tr, color: col },
-            LineVertex { position: tr, color: col },
-            LineVertex { position: br, color: col },
-            LineVertex { position: br, color: col },
-            LineVertex { position: bl, color: col },
-            LineVertex { position: bl, color: col },
-            LineVertex { position: tl, color: col },
+            LineVertex {
+                position: tl,
+                color: col,
+            },
+            LineVertex {
+                position: tr,
+                color: col,
+            },
+            LineVertex {
+                position: tr,
+                color: col,
+            },
+            LineVertex {
+                position: br,
+                color: col,
+            },
+            LineVertex {
+                position: br,
+                color: col,
+            },
+            LineVertex {
+                position: bl,
+                color: col,
+            },
+            LineVertex {
+                position: bl,
+                color: col,
+            },
+            LineVertex {
+                position: tl,
+                color: col,
+            },
         ];
-        self.sel_rect_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        self.sel_rect_buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         self.sel_rect_visible = true;
     }
 
@@ -1945,19 +2261,25 @@ impl Renderer {
             return;
         }
         let (w, h) = (self.width as f32, self.height as f32);
-        let to_ndc = |px: f32, py: f32| -> [f32; 3] {
-            [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0]
-        };
+        let to_ndc =
+            |px: f32, py: f32| -> [f32; 3] { [(px / w) * 2.0 - 1.0, 1.0 - (py / h) * 2.0, 0.0] };
         let col = [0.4_f32, 0.8, 1.0];
         let mut verts = Vec::with_capacity((n - 1) * 2);
         for i in 0..(n - 1) {
             let [ax, ay] = screen_verts[i];
             let [bx, by] = screen_verts[i + 1];
-            verts.push(LineVertex { position: to_ndc(ax, ay), color: col });
-            verts.push(LineVertex { position: to_ndc(bx, by), color: col });
+            verts.push(LineVertex {
+                position: to_ndc(ax, ay),
+                color: col,
+            });
+            verts.push(LineVertex {
+                position: to_ndc(bx, by),
+                color: col,
+            });
         }
         self.lasso_vert_count = verts.len() as u32;
-        self.lasso_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        self.lasso_buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         self.lasso_visible = true;
     }
 
@@ -1982,9 +2304,11 @@ impl Renderer {
         const SV: u64 = std::mem::size_of::<LineVertex>() as u64;
         let col = [0.4_f32, 0.8, 1.0];
         let n = self.lasso_pts.len();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         self.lasso_pts.push([sx, sy]);
-        let new_n = n + 1;   // point count after push
+        let new_n = n + 1; // point count after push
 
         let (w, h) = (self.width as f32, self.height as f32);
         let to_v = |px: f32, py: f32| LineVertex {
@@ -2015,14 +2339,16 @@ impl Renderer {
                 verts.push(to_v(cx, cy));
                 verts.push(to_v(dx, dy));
             }
-            self.lasso_buf.write_at(&self.queue, 0, bytemuck::cast_slice(&verts));
+            self.lasso_buf
+                .write_at(&self.queue, 0, bytemuck::cast_slice(&verts));
             self.lasso_vert_count = verts.len() as u32;
         } else if new_n == 2 {
             // First segment [pt0 → pt1].
             let [ax, ay] = self.lasso_pts[0];
             let [bx, by] = self.lasso_pts[1];
             let verts = [to_v(ax, ay), to_v(bx, by)];
-            self.lasso_buf.write_at(&self.queue, 0, bytemuck::cast_slice(&verts));
+            self.lasso_buf
+                .write_at(&self.queue, 0, bytemuck::cast_slice(&verts));
             self.lasso_vert_count = 2;
         } else {
             // n >= 2: overwrite old close segment with new open segment,
@@ -2030,11 +2356,12 @@ impl Renderer {
             // Buffer layout: [seg(0→1), ..., seg(n-2→n-1), close(n-1→0)]
             // close_offset = 2*(n-1) verts * SV  (works for n==2: appends, no overwrite)
             let close_offset = 2 * (n as u64 - 1) * SV;
-            let [ax, ay] = self.lasso_pts[n - 1];  // prev last pt
-            let [bx, by] = self.lasso_pts[n];       // new last pt
-            let [cx, cy] = self.lasso_pts[0];        // first pt
+            let [ax, ay] = self.lasso_pts[n - 1]; // prev last pt
+            let [bx, by] = self.lasso_pts[n]; // new last pt
+            let [cx, cy] = self.lasso_pts[0]; // first pt
             let new_segs = [to_v(ax, ay), to_v(bx, by), to_v(bx, by), to_v(cx, cy)];
-            self.lasso_buf.write_at(&self.queue, close_offset, bytemuck::cast_slice(&new_segs));
+            self.lasso_buf
+                .write_at(&self.queue, close_offset, bytemuck::cast_slice(&new_segs));
             self.lasso_vert_count = (2 * new_n) as u32;
         }
 
@@ -2077,7 +2404,9 @@ impl Renderer {
         let bb_y1 = screen_verts.iter().map(|v| v[1]).fold(f32::MIN, f32::max);
 
         for actor in &mut self.actors {
-            if !actor.visible { continue; }
+            if !actor.visible {
+                continue;
+            }
             actor.ensure_pick_cache(vp, w, h);
             let (cache, actor_id) = match actor.pick_cache.as_ref() {
                 Some(c) => (c, actor.id),
@@ -2099,55 +2428,81 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     pub fn set_chart2d(
         &mut self,
-        plot_left:   f32, plot_right: f32,
-        plot_top:    f32, plot_bottom: f32,
-        x0: f32, x1: f32,
-        y0: f32, y1: f32,
-        x_label: String, y_label: String,
+        plot_left: f32,
+        plot_right: f32,
+        plot_top: f32,
+        plot_bottom: f32,
+        x0: f32,
+        x1: f32,
+        y0: f32,
+        y1: f32,
+        x_label: String,
+        y_label: String,
         y_tick_step_override: Option<f32>,
         title: String,
         x_tick_step_override: Option<f32>,
     ) {
         // Preserve format/log-scale settings from previous state across reconfigurations.
         let (x_fmt, y_fmt, x_log, y_log) = match self.chart2d_state.as_ref() {
-            Some(old) => (old.x_tick_format.clone(), old.y_tick_format.clone(),
-                          old.x_log_scale, old.y_log_scale),
+            Some(old) => (
+                old.x_tick_format.clone(),
+                old.y_tick_format.clone(),
+                old.x_log_scale,
+                old.y_log_scale,
+            ),
             None => ("default".to_string(), "default".to_string(), false, false),
         };
-        let x_step = if x_log { 1.0 } else {
+        let x_step = if x_log {
+            1.0
+        } else {
             x_tick_step_override
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .unwrap_or_else(|| tick_step(x0, x1, 5))
         };
-        let y_step = if y_log { 1.0 } else {
+        let y_step = if y_log {
+            1.0
+        } else {
             y_tick_step_override
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .unwrap_or_else(|| tick_step(y0, y1, 5))
         };
         let mut state = Chart2DState {
-            plot_left, plot_right, plot_top, plot_bottom,
-            x0, x1, y0, y1, x_label, y_label, title,
+            plot_left,
+            plot_right,
+            plot_top,
+            plot_bottom,
+            x0,
+            x1,
+            y0,
+            y1,
+            x_label,
+            y_label,
+            title,
             x_tick_cache: Vec::new(),
-            x_tick_step: x_step, y_tick_step: y_step,
-            x_tick_format: x_fmt, y_tick_format: y_fmt,
-            x_log_scale: x_log, y_log_scale: y_log,
+            x_tick_step: x_step,
+            y_tick_step: y_step,
+            x_tick_format: x_fmt,
+            y_tick_format: y_fmt,
+            x_log_scale: x_log,
+            y_log_scale: y_log,
         };
 
         // Update the chart2d uniform buffer with the new affine transform.
         let u = state.as_uniforms(self.width as f32, self.height as f32);
-        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+        self.queue
+            .write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
 
         // Rebuild NDC-space axis geometry (frame, Y grid, tick marks).
         let verts = build_chart2d_axis_verts(&state, self.width, self.height);
         self.chart2d_axis_count = verts.len() as u32;
         if !verts.is_empty() {
-            self.chart2d_axis_buf.upload(
-                &self.device, &self.queue, bytemuck::cast_slice(&verts));
+            self.chart2d_axis_buf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         }
 
         // Rebuild pre-shaped text labels for ticks + axis titles.
         self.chart2d_text_labels.clear();
-        let sz_tick  = 11.0_f32;
+        let sz_tick = 11.0_f32;
         let sz_title = 13.0_f32;
         let sx = state.scale_x();
         let ox = state.offset_x();
@@ -2159,30 +2514,58 @@ impl Renderer {
         state.x_tick_cache = x_ticks.clone();
         for &xt in &x_ticks {
             let ndc_x = sx * state.chart_x(xt) + ox;
-            if ndc_x < -1.05 || ndc_x > 1.05 { continue; }
-            let buf = build_label_buffer(&mut self.font_system, &format_tick_with_fmt(xt, &state.x_tick_format), sz_tick);
-            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: ndc_x, glyph_buf: buf, kind: Chart2DLabelKind::XTick });
+            if ndc_x < -1.05 || ndc_x > 1.05 {
+                continue;
+            }
+            let buf = build_label_buffer(
+                &mut self.font_system,
+                &format_tick_with_fmt(xt, &state.x_tick_format),
+                sz_tick,
+            );
+            self.chart2d_text_labels.push(Chart2DLabel {
+                ndc_val: ndc_x,
+                glyph_buf: buf,
+                kind: Chart2DLabelKind::XTick,
+            });
         }
         // Y tick labels
         for &yt in &chart2d_y_ticks(&state) {
             let ndc_y = sy * state.chart_y(yt) + oy;
-            if ndc_y < -1.05 || ndc_y > 1.05 { continue; }
-            let buf = build_label_buffer(&mut self.font_system, &format_tick_with_fmt(yt, &state.y_tick_format), sz_tick);
-            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: ndc_y, glyph_buf: buf, kind: Chart2DLabelKind::YTick });
+            if ndc_y < -1.05 || ndc_y > 1.05 {
+                continue;
+            }
+            let buf = build_label_buffer(
+                &mut self.font_system,
+                &format_tick_with_fmt(yt, &state.y_tick_format),
+                sz_tick,
+            );
+            self.chart2d_text_labels.push(Chart2DLabel {
+                ndc_val: ndc_y,
+                glyph_buf: buf,
+                kind: Chart2DLabelKind::YTick,
+            });
         }
         // X axis title
         if !state.x_label.is_empty() {
             let buf = build_label_buffer(&mut self.font_system, &state.x_label, sz_title);
             let mid_chart = (state.chart_x(x0) + state.chart_x(x1)) * 0.5;
             let mid_ndc = (sx * mid_chart + ox).clamp(-1.0, 1.0);
-            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: mid_ndc, glyph_buf: buf, kind: Chart2DLabelKind::XTitle });
+            self.chart2d_text_labels.push(Chart2DLabel {
+                ndc_val: mid_ndc,
+                glyph_buf: buf,
+                kind: Chart2DLabelKind::XTitle,
+            });
         }
         // Y axis title
         if !state.y_label.is_empty() {
             let buf = build_label_buffer(&mut self.font_system, &state.y_label, sz_title);
             let mid_chart = (state.chart_y(y0) + state.chart_y(y1)) * 0.5;
             let mid_ndc = (sy * mid_chart + oy).clamp(-1.0, 1.0);
-            self.chart2d_text_labels.push(Chart2DLabel { ndc_val: mid_ndc, glyph_buf: buf, kind: Chart2DLabelKind::YTitle });
+            self.chart2d_text_labels.push(Chart2DLabel {
+                ndc_val: mid_ndc,
+                glyph_buf: buf,
+                kind: Chart2DLabelKind::YTitle,
+            });
         }
         // Chart title — centered horizontally on the plot area.
         if !state.title.is_empty() {
@@ -2190,7 +2573,9 @@ impl Renderer {
             let buf = build_label_buffer(&mut self.font_system, &state.title, sz_chart_title);
             let plot_center_ndc = (state.plot_left + state.plot_right) - 1.0;
             self.chart2d_text_labels.push(Chart2DLabel {
-                ndc_val: plot_center_ndc, glyph_buf: buf, kind: Chart2DLabelKind::ChartTitle,
+                ndc_val: plot_center_ndc,
+                glyph_buf: buf,
+                kind: Chart2DLabelKind::ChartTitle,
             });
         }
 
@@ -2205,7 +2590,9 @@ impl Renderer {
     ///   Always:   uniform buffer write + chart chrome rebuild (cheap).
     ///   When tick values change: x-tick glyph reshape.
     pub fn chart2d_update_xlim(&mut self, x0: f32, x1: f32) {
-        if self.chart2d_state.is_none() { return; }
+        if self.chart2d_state.is_none() {
+            return;
+        }
 
         // Update state x range.
         {
@@ -2218,41 +2605,64 @@ impl Renderer {
         self.chart2d_state.as_mut().unwrap().x_tick_cache = new_ticks.clone();
 
         // Always: update the affine transform.
-        let u = self.chart2d_state.as_ref().unwrap()
+        let u = self
+            .chart2d_state
+            .as_ref()
+            .unwrap()
             .as_uniforms(self.width as f32, self.height as f32);
-        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+        self.queue
+            .write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
 
         // Always: rebuild axis geometry so X tick marks track the new xlim.
         let frame_verts = build_chart2d_axis_verts(
-            self.chart2d_state.as_ref().unwrap(), self.width, self.height);
+            self.chart2d_state.as_ref().unwrap(),
+            self.width,
+            self.height,
+        );
         self.chart2d_axis_count = frame_verts.len() as u32;
         if !frame_verts.is_empty() {
             self.chart2d_axis_buf.upload(
-                &self.device, &self.queue, bytemuck::cast_slice(&frame_verts));
+                &self.device,
+                &self.queue,
+                bytemuck::cast_slice(&frame_verts),
+            );
         }
 
         // Only when tick values change: reshape glyphs.
         if ticks_changed {
-            self.chart2d_text_labels.retain(|l| !matches!(l.kind, Chart2DLabelKind::XTick));
+            self.chart2d_text_labels
+                .retain(|l| !matches!(l.kind, Chart2DLabelKind::XTick));
             let s = self.chart2d_state.as_ref().unwrap();
-            let sx = s.scale_x(); let ox = s.offset_x();
+            let sx = s.scale_x();
+            let ox = s.offset_x();
             let fmt = s.x_tick_format.clone();
             let sz_tick = 11.0_f32;
             for &xt in &new_ticks {
                 let ndc_x = sx * s.chart_x(xt) + ox;
-                if ndc_x < -1.05 || ndc_x > 1.05 { continue; }
-                let buf = build_label_buffer(&mut self.font_system, &format_tick_with_fmt(xt, &fmt), sz_tick);
+                if ndc_x < -1.05 || ndc_x > 1.05 {
+                    continue;
+                }
+                let buf = build_label_buffer(
+                    &mut self.font_system,
+                    &format_tick_with_fmt(xt, &fmt),
+                    sz_tick,
+                );
                 self.chart2d_text_labels.push(Chart2DLabel {
-                    ndc_val: ndc_x, glyph_buf: buf, kind: Chart2DLabelKind::XTick,
+                    ndc_val: ndc_x,
+                    glyph_buf: buf,
+                    kind: Chart2DLabelKind::XTick,
                 });
             }
         } else {
             // Tick values unchanged — just recompute NDC positions in-place.
             let s = self.chart2d_state.as_ref().unwrap();
-            let sx = s.scale_x(); let ox = s.offset_x();
+            let sx = s.scale_x();
+            let ox = s.offset_x();
             let mut i = 0;
             for label in self.chart2d_text_labels.iter_mut() {
-                if !matches!(label.kind, Chart2DLabelKind::XTick) { continue; }
+                if !matches!(label.kind, Chart2DLabelKind::XTick) {
+                    continue;
+                }
                 if i < new_ticks.len() {
                     label.ndc_val = sx * s.chart_x(new_ticks[i]) + ox;
                     i += 1;
@@ -2266,7 +2676,9 @@ impl Renderer {
 
     /// Fast path: update only the y data-range while keeping the Y tick interval fixed.
     pub fn chart2d_update_ylim(&mut self, y0: f32, y1: f32) {
-        if self.chart2d_state.is_none() { return; }
+        if self.chart2d_state.is_none() {
+            return;
+        }
         {
             let s = self.chart2d_state.as_mut().unwrap();
             s.y0 = y0;
@@ -2274,29 +2686,49 @@ impl Renderer {
         }
         let new_ticks = chart2d_y_ticks(self.chart2d_state.as_ref().unwrap());
 
-        let u = self.chart2d_state.as_ref().unwrap()
+        let u = self
+            .chart2d_state
+            .as_ref()
+            .unwrap()
             .as_uniforms(self.width as f32, self.height as f32);
-        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+        self.queue
+            .write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
 
         let frame_verts = build_chart2d_axis_verts(
-            self.chart2d_state.as_ref().unwrap(), self.width, self.height);
+            self.chart2d_state.as_ref().unwrap(),
+            self.width,
+            self.height,
+        );
         self.chart2d_axis_count = frame_verts.len() as u32;
         if !frame_verts.is_empty() {
             self.chart2d_axis_buf.upload(
-                &self.device, &self.queue, bytemuck::cast_slice(&frame_verts));
+                &self.device,
+                &self.queue,
+                bytemuck::cast_slice(&frame_verts),
+            );
         }
 
-        self.chart2d_text_labels.retain(|l| !matches!(l.kind, Chart2DLabelKind::YTick));
+        self.chart2d_text_labels
+            .retain(|l| !matches!(l.kind, Chart2DLabelKind::YTick));
         let s = self.chart2d_state.as_ref().unwrap();
-        let sy = s.scale_y(); let oy = s.offset_y();
+        let sy = s.scale_y();
+        let oy = s.offset_y();
         let fmt = s.y_tick_format.clone();
         let sz_tick = 11.0_f32;
         for &yt in &new_ticks {
             let ndc_y = sy * s.chart_y(yt) + oy;
-            if ndc_y < -1.05 || ndc_y > 1.05 { continue; }
-            let buf = build_label_buffer(&mut self.font_system, &format_tick_with_fmt(yt, &fmt), sz_tick);
+            if ndc_y < -1.05 || ndc_y > 1.05 {
+                continue;
+            }
+            let buf = build_label_buffer(
+                &mut self.font_system,
+                &format_tick_with_fmt(yt, &fmt),
+                sz_tick,
+            );
             self.chart2d_text_labels.push(Chart2DLabel {
-                ndc_val: ndc_y, glyph_buf: buf, kind: Chart2DLabelKind::YTick,
+                ndc_val: ndc_y,
+                glyph_buf: buf,
+                kind: Chart2DLabelKind::YTick,
             });
         }
 
@@ -2304,7 +2736,9 @@ impl Renderer {
         let mid_chart = (s.chart_y(y0) + s.chart_y(y1)) * 0.5;
         let mid_ndc = (s.scale_y() * mid_chart + s.offset_y()).clamp(-1.0, 1.0);
         for label in self.chart2d_text_labels.iter_mut() {
-            if matches!(label.kind, Chart2DLabelKind::YTitle) { label.ndc_val = mid_ndc; }
+            if matches!(label.kind, Chart2DLabelKind::YTitle) {
+                label.ndc_val = mid_ndc;
+            }
         }
         // GPU-side transform handles line vertex data; only spans, ref lines, and
         // markers need geometry rebuilds on an axis-limit change.
@@ -2316,7 +2750,9 @@ impl Renderer {
     /// `axis` is `"x"` or `"y"`.
     /// `fmt` is one of `"default"`, `"sci"`, `"time"`, `"int"`.
     pub fn chart2d_set_tick_format(&mut self, axis: &str, fmt: &str) {
-        let Some(state) = self.chart2d_state.as_mut() else { return; };
+        let Some(state) = self.chart2d_state.as_mut() else {
+            return;
+        };
         match axis {
             "x" => state.x_tick_format = fmt.to_string(),
             "y" => state.y_tick_format = fmt.to_string(),
@@ -2330,7 +2766,9 @@ impl Renderer {
     ///
     /// `axis` is `"x"` or `"y"`.  Triggers a full geometry rebuild.
     pub fn chart2d_set_log_scale(&mut self, axis: &str, enabled: bool) {
-        let Some(state) = self.chart2d_state.as_mut() else { return; };
+        let Some(state) = self.chart2d_state.as_mut() else {
+            return;
+        };
         match axis {
             "x" => {
                 state.x_log_scale = enabled;
@@ -2338,7 +2776,7 @@ impl Renderer {
                 // current range; log mode doesn't use tick_step so its stored value
                 // may be stale (or was forced to 1.0 on the prior enable).
                 state.x_tick_step = if enabled {
-                    1.0  // log mode ignores tick_step
+                    1.0 // log mode ignores tick_step
                 } else {
                     tick_step(state.x0, state.x1, 5)
                 };
@@ -2354,14 +2792,22 @@ impl Renderer {
             _ => return,
         }
         // Full rebuild: uniform, axis geometry, labels, and all line/span geometry.
-        let u = self.chart2d_state.as_ref().unwrap()
+        let u = self
+            .chart2d_state
+            .as_ref()
+            .unwrap()
             .as_uniforms(self.width as f32, self.height as f32);
-        self.queue.write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
+        self.queue
+            .write_buffer(&self.chart2d_uniform_buf, 0, bytemuck::bytes_of(&u));
         let verts = build_chart2d_axis_verts(
-            self.chart2d_state.as_ref().unwrap(), self.width, self.height);
+            self.chart2d_state.as_ref().unwrap(),
+            self.width,
+            self.height,
+        );
         self.chart2d_axis_count = verts.len() as u32;
         if !verts.is_empty() {
-            self.chart2d_axis_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+            self.chart2d_axis_buf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         }
         self.rebuild_chart2d_tick_labels("x");
         self.rebuild_chart2d_tick_labels("y");
@@ -2370,36 +2816,58 @@ impl Renderer {
 
     /// Rebuild tick-label glyphs for `"x"` or `"y"` from the current chart state.
     fn rebuild_chart2d_tick_labels(&mut self, axis: &str) {
-        let Some(state) = self.chart2d_state.as_ref() else { return; };
+        let Some(state) = self.chart2d_state.as_ref() else {
+            return;
+        };
         let sz_tick = 11.0_f32;
         match axis {
             "x" => {
-                self.chart2d_text_labels.retain(|l| !matches!(l.kind, Chart2DLabelKind::XTick));
+                self.chart2d_text_labels
+                    .retain(|l| !matches!(l.kind, Chart2DLabelKind::XTick));
                 let ticks = chart2d_x_ticks(state);
-                let sx = state.scale_x(); let ox = state.offset_x();
+                let sx = state.scale_x();
+                let ox = state.offset_x();
                 let fmt = state.x_tick_format.clone();
                 let cx_fn: Vec<f32> = ticks.iter().map(|&v| state.chart_x(v)).collect();
                 for (i, &xt) in ticks.iter().enumerate() {
                     let ndc_x = sx * cx_fn[i] + ox;
-                    if ndc_x < -1.05 || ndc_x > 1.05 { continue; }
-                    let buf = build_label_buffer(&mut self.font_system, &format_tick_with_fmt(xt, &fmt), sz_tick);
+                    if ndc_x < -1.05 || ndc_x > 1.05 {
+                        continue;
+                    }
+                    let buf = build_label_buffer(
+                        &mut self.font_system,
+                        &format_tick_with_fmt(xt, &fmt),
+                        sz_tick,
+                    );
                     self.chart2d_text_labels.push(Chart2DLabel {
-                        ndc_val: ndc_x, glyph_buf: buf, kind: Chart2DLabelKind::XTick,
+                        ndc_val: ndc_x,
+                        glyph_buf: buf,
+                        kind: Chart2DLabelKind::XTick,
                     });
                 }
             }
             "y" => {
-                self.chart2d_text_labels.retain(|l| !matches!(l.kind, Chart2DLabelKind::YTick));
+                self.chart2d_text_labels
+                    .retain(|l| !matches!(l.kind, Chart2DLabelKind::YTick));
                 let ticks = chart2d_y_ticks(state);
-                let sy = state.scale_y(); let oy = state.offset_y();
+                let sy = state.scale_y();
+                let oy = state.offset_y();
                 let fmt = state.y_tick_format.clone();
                 let cy_fn: Vec<f32> = ticks.iter().map(|&v| state.chart_y(v)).collect();
                 for (i, &yt) in ticks.iter().enumerate() {
                     let ndc_y = sy * cy_fn[i] + oy;
-                    if ndc_y < -1.05 || ndc_y > 1.05 { continue; }
-                    let buf = build_label_buffer(&mut self.font_system, &format_tick_with_fmt(yt, &fmt), sz_tick);
+                    if ndc_y < -1.05 || ndc_y > 1.05 {
+                        continue;
+                    }
+                    let buf = build_label_buffer(
+                        &mut self.font_system,
+                        &format_tick_with_fmt(yt, &fmt),
+                        sz_tick,
+                    );
                     self.chart2d_text_labels.push(Chart2DLabel {
-                        ndc_val: ndc_y, glyph_buf: buf, kind: Chart2DLabelKind::YTick,
+                        ndc_val: ndc_y,
+                        glyph_buf: buf,
+                        kind: Chart2DLabelKind::YTick,
                     });
                 }
             }
@@ -2419,19 +2887,31 @@ impl Renderer {
         if verts.is_empty() {
             actor.buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
         } else {
-            actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+            actor
+                .buf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         }
         // Marker geometry (square dots at every Nth data point).
         if actor.marker_style > 0 && actor.marker_every > 0 {
             if let Some(state) = self.chart2d_state.as_ref() {
                 let mverts = build_marker_vertices(
-                    &actor.x, &actor.y,
-                    actor.marker_style, actor.marker_size_px, actor.marker_every,
-                    actor.color, state, self.width, self.height,
+                    &actor.x,
+                    &actor.y,
+                    actor.marker_style,
+                    actor.marker_size_px,
+                    actor.marker_every,
+                    actor.color,
+                    state,
+                    self.width,
+                    self.height,
                 );
                 actor.marker_vertex_count = mverts.len() as u32;
                 if !mverts.is_empty() {
-                    actor.marker_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mverts));
+                    actor.marker_buf.upload(
+                        &self.device,
+                        &self.queue,
+                        bytemuck::cast_slice(&mverts),
+                    );
                 } else {
                     actor.marker_buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
                 }
@@ -2482,13 +2962,23 @@ impl Renderer {
             if actor.marker_style > 0 && actor.marker_every > 0 {
                 if let Some(state) = self.chart2d_state.as_ref() {
                     let mverts = build_marker_vertices(
-                        &actor.x, &actor.y,
-                        actor.marker_style, actor.marker_size_px, actor.marker_every,
-                        actor.color, state, self.width, self.height,
+                        &actor.x,
+                        &actor.y,
+                        actor.marker_style,
+                        actor.marker_size_px,
+                        actor.marker_every,
+                        actor.color,
+                        state,
+                        self.width,
+                        self.height,
                     );
                     actor.marker_vertex_count = mverts.len() as u32;
                     if !mverts.is_empty() {
-                        actor.marker_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mverts));
+                        actor.marker_buf.upload(
+                            &self.device,
+                            &self.queue,
+                            bytemuck::cast_slice(&mverts),
+                        );
                     } else {
                         actor.marker_buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
                     }
@@ -2518,21 +3008,57 @@ impl Renderer {
             return;
         };
         // Resolve infinite extents to the current data range, then map to chart space.
-        let x0 = state.chart_x(if actor.x0.is_finite() { actor.x0 } else { state.x0.min(state.x1) });
-        let x1 = state.chart_x(if actor.x1.is_finite() { actor.x1 } else { state.x0.max(state.x1) });
-        let y0 = state.chart_y(if actor.y0.is_finite() { actor.y0 } else { state.y0.min(state.y1) });
-        let y1 = state.chart_y(if actor.y1.is_finite() { actor.y1 } else { state.y0.max(state.y1) });
+        let x0 = state.chart_x(if actor.x0.is_finite() {
+            actor.x0
+        } else {
+            state.x0.min(state.x1)
+        });
+        let x1 = state.chart_x(if actor.x1.is_finite() {
+            actor.x1
+        } else {
+            state.x0.max(state.x1)
+        });
+        let y0 = state.chart_y(if actor.y0.is_finite() {
+            actor.y0
+        } else {
+            state.y0.min(state.y1)
+        });
+        let y1 = state.chart_y(if actor.y1.is_finite() {
+            actor.y1
+        } else {
+            state.y0.max(state.y1)
+        });
         let c = actor.color;
         let verts = [
-            MeshVertex { position: [x0, y0, 0.0], color: c },
-            MeshVertex { position: [x1, y0, 0.0], color: c },
-            MeshVertex { position: [x1, y1, 0.0], color: c },
-            MeshVertex { position: [x0, y0, 0.0], color: c },
-            MeshVertex { position: [x1, y1, 0.0], color: c },
-            MeshVertex { position: [x0, y1, 0.0], color: c },
+            MeshVertex {
+                position: [x0, y0, 0.0],
+                color: c,
+            },
+            MeshVertex {
+                position: [x1, y0, 0.0],
+                color: c,
+            },
+            MeshVertex {
+                position: [x1, y1, 0.0],
+                color: c,
+            },
+            MeshVertex {
+                position: [x0, y0, 0.0],
+                color: c,
+            },
+            MeshVertex {
+                position: [x1, y1, 0.0],
+                color: c,
+            },
+            MeshVertex {
+                position: [x0, y1, 0.0],
+                color: c,
+            },
         ];
         actor.vertex_count = verts.len() as u32;
-        actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        actor
+            .buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
     }
 
     fn rebuild_chart2d_ref_line(&self, actor: &mut Chart2DRefLine) {
@@ -2552,14 +3078,21 @@ impl Renderer {
             )
         };
         let verts = xy_to_thick_line_vertices(
-            &x, &y, actor.color, actor.line_width,
-            Some(state), self.width, self.height,
+            &x,
+            &y,
+            actor.color,
+            actor.line_width,
+            Some(state),
+            self.width,
+            self.height,
         );
         actor.vertex_count = verts.len() as u32;
         if verts.is_empty() {
             actor.buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
         } else {
-            actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+            actor
+                .buf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
         }
     }
 
@@ -2621,7 +3154,8 @@ impl Renderer {
             if verts.is_empty() {
                 a.buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
             } else {
-                a.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+                a.buf
+                    .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
             }
             true
         } else {
@@ -2653,39 +3187,66 @@ impl Renderer {
 
     /// Set marker style/size/spacing on an existing line actor.
     /// `style` 0 = none, 1 = square.  `every` = draw one marker every N data points.
-    pub fn chart2d_set_line_markers(&mut self, id: u32, style: u8, size_px: f32, every: u32) -> bool {
+    pub fn chart2d_set_line_markers(
+        &mut self,
+        id: u32,
+        style: u8,
+        size_px: f32,
+        every: u32,
+    ) -> bool {
         let Some(a) = self.chart2d_line_actors.iter_mut().find(|a| a.id == id) else {
             return false;
         };
-        a.marker_style  = style;
+        a.marker_style = style;
         a.marker_size_px = size_px;
-        a.marker_every  = every;
+        a.marker_every = every;
         let (xs, ys, color, lw) = (a.x.clone(), a.y.clone(), a.color, a.line_width);
         if let Some(state) = self.chart2d_state.as_ref() {
             if style > 0 && every > 0 {
                 let mverts = build_marker_vertices(
-                    &xs, &ys, style, size_px, every, color, state, self.width, self.height,
+                    &xs,
+                    &ys,
+                    style,
+                    size_px,
+                    every,
+                    color,
+                    state,
+                    self.width,
+                    self.height,
                 );
-                let a2 = self.chart2d_line_actors.iter_mut().find(|a| a.id == id).unwrap();
+                let a2 = self
+                    .chart2d_line_actors
+                    .iter_mut()
+                    .find(|a| a.id == id)
+                    .unwrap();
                 a2.marker_vertex_count = mverts.len() as u32;
                 if !mverts.is_empty() {
-                    a2.marker_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mverts));
+                    a2.marker_buf
+                        .upload(&self.device, &self.queue, bytemuck::cast_slice(&mverts));
                 } else {
                     a2.marker_buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
                 }
             } else {
-                let a2 = self.chart2d_line_actors.iter_mut().find(|a| a.id == id).unwrap();
+                let a2 = self
+                    .chart2d_line_actors
+                    .iter_mut()
+                    .find(|a| a.id == id)
+                    .unwrap();
                 a2.marker_vertex_count = 0;
             }
             // Also rebuild the line itself (GPU thick-line format) to keep vertex data fresh.
-            let verts = xy_to_gpu_thick_verts(&xs, &ys, color, lw,
-                self.chart2d_state.as_ref());
-            let a3 = self.chart2d_line_actors.iter_mut().find(|a| a.id == id).unwrap();
+            let verts = xy_to_gpu_thick_verts(&xs, &ys, color, lw, self.chart2d_state.as_ref());
+            let a3 = self
+                .chart2d_line_actors
+                .iter_mut()
+                .find(|a| a.id == id)
+                .unwrap();
             a3.vertex_count = verts.len() as u32;
             if verts.is_empty() {
                 a3.buf = GrowableBuffer::new(wgpu::BufferUsages::VERTEX);
             } else {
-                a3.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+                a3.buf
+                    .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
             }
         }
         true
@@ -2699,8 +3260,10 @@ impl Renderer {
         self.next_chart2d_overlay_id += 1;
         let mut actor = Chart2DSpanActor {
             id,
-            x0: f32::NEG_INFINITY, x1: f32::INFINITY,
-            y0, y1,
+            x0: f32::NEG_INFINITY,
+            x1: f32::INFINITY,
+            y0,
+            y1,
             color,
             buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
             vertex_count: 0,
@@ -2716,8 +3279,10 @@ impl Renderer {
         self.next_chart2d_overlay_id += 1;
         let mut actor = Chart2DSpanActor {
             id,
-            x0, x1,
-            y0: f32::NEG_INFINITY, y1: f32::INFINITY,
+            x0,
+            x1,
+            y0: f32::NEG_INFINITY,
+            y1: f32::INFINITY,
             color,
             buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
             vertex_count: 0,
@@ -2732,8 +3297,11 @@ impl Renderer {
         let id = self.next_chart2d_overlay_id;
         self.next_chart2d_overlay_id += 1;
         let mut actor = Chart2DRefLine {
-            id, value: y, is_vertical: false,
-            color, line_width,
+            id,
+            value: y,
+            is_vertical: false,
+            color,
+            line_width,
             buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
             vertex_count: 0,
         };
@@ -2747,8 +3315,11 @@ impl Renderer {
         let id = self.next_chart2d_overlay_id;
         self.next_chart2d_overlay_id += 1;
         let mut actor = Chart2DRefLine {
-            id, value: x, is_vertical: true,
-            color, line_width,
+            id,
+            value: x,
+            is_vertical: true,
+            color,
+            line_width,
             buf: GrowableBuffer::new(wgpu::BufferUsages::VERTEX),
             vertex_count: 0,
         };
@@ -2789,8 +3360,16 @@ impl Renderer {
         }
         // Snapshot state values to avoid borrow conflicts with self.
         let (x0, x1, y0, y1, pl, pr, pt, pb) = match self.chart2d_state.as_ref() {
-            Some(s) => (s.x0, s.x1, s.y0, s.y1,
-                        s.plot_left, s.plot_right, s.plot_top, s.plot_bottom),
+            Some(s) => (
+                s.x0,
+                s.x1,
+                s.y0,
+                s.y1,
+                s.plot_left,
+                s.plot_right,
+                s.plot_top,
+                s.plot_bottom,
+            ),
             None => return,
         };
         let w = self.width;
@@ -2800,23 +3379,44 @@ impl Renderer {
         let yc = y_data.clamp(y0.min(y1), y0.max(y1));
         // Build a lightweight state snapshot (strings/cache not needed for vertex gen).
         let tmp = Chart2DState {
-            plot_left: pl, plot_right: pr, plot_top: pt, plot_bottom: pb,
-            x0, x1, y0, y1,
-            x_label: String::new(), y_label: String::new(), title: String::new(),
-            x_tick_cache: Vec::new(), x_tick_step: 1.0, y_tick_step: 1.0,
-            x_tick_format: String::new(), y_tick_format: String::new(),
-            x_log_scale: false, y_log_scale: false,
+            plot_left: pl,
+            plot_right: pr,
+            plot_top: pt,
+            plot_bottom: pb,
+            x0,
+            x1,
+            y0,
+            y1,
+            x_label: String::new(),
+            y_label: String::new(),
+            title: String::new(),
+            x_tick_cache: Vec::new(),
+            x_tick_step: 1.0,
+            y_tick_step: 1.0,
+            x_tick_format: String::new(),
+            y_tick_format: String::new(),
+            x_log_scale: false,
+            y_log_scale: false,
         };
         let cc = [0.72_f32, 0.72_f32, 0.80_f32];
         // H line spans the full x domain at the cursor y.
-        let mut verts = xy_to_thick_line_vertices(
-            &[x0, x1], &[yc, yc], cc, 1.0, Some(&tmp), w, h);
+        let mut verts = xy_to_thick_line_vertices(&[x0, x1], &[yc, yc], cc, 1.0, Some(&tmp), w, h);
         // V line spans the full y domain at the cursor x.
         verts.extend(xy_to_thick_line_vertices(
-            &[xc, xc], &[y0, y1], cc, 1.0, Some(&tmp), w, h));
-        if verts.is_empty() { return; }
+            &[xc, xc],
+            &[y0, y1],
+            cc,
+            1.0,
+            Some(&tmp),
+            w,
+            h,
+        ));
+        if verts.is_empty() {
+            return;
+        }
         let bytes: &[u8] = bytemuck::cast_slice(&verts);
-        self.chart2d_cursor_buf.upload(&self.device, &self.queue, bytes);
+        self.chart2d_cursor_buf
+            .upload(&self.device, &self.queue, bytes);
         self.chart2d_cursor_vertex_count = verts.len() as u32;
     }
 
@@ -2840,26 +3440,32 @@ impl Renderer {
             return;
         }
 
-        let w = self.width  as f32;
+        let w = self.width as f32;
         let h = self.height as f32;
-        if w < 1.0 || h < 1.0 { return; }
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
 
         const SWATCH_W: f32 = 20.0;
         const SWATCH_H: f32 = 4.0;
-        const GAP:      f32 = 6.0;
-        const ENTRY_H:  f32 = 20.0;
-        const MARGIN:   f32 = 12.0;
-        const FONT_SZ:  f32 = 11.0;
+        const GAP: f32 = 6.0;
+        const ENTRY_H: f32 = 20.0;
+        const MARGIN: f32 = 12.0;
+        const FONT_SZ: f32 = 11.0;
 
         // Shape all label texts and measure the maximum rendered width.
-        let mut shaped: Vec<Buffer> = entries.iter()
+        let mut shaped: Vec<Buffer> = entries
+            .iter()
             .map(|(lbl, _)| build_label_buffer(&mut self.font_system, lbl, FONT_SZ))
             .collect();
 
-        let max_text_w: f32 = shaped.iter()
-            .map(|buf| buf.layout_runs()
-                .flat_map(|r| r.glyphs.iter())
-                .fold(0.0_f32, |acc, g| acc.max(g.x + g.w)))
+        let max_text_w: f32 = shaped
+            .iter()
+            .map(|buf| {
+                buf.layout_runs()
+                    .flat_map(|r| r.glyphs.iter())
+                    .fold(0.0_f32, |acc, g| acc.max(g.x + g.w))
+            })
             .fold(0.0_f32, f32::max);
 
         let block_w = SWATCH_W + GAP + max_text_w.max(1.0);
@@ -2867,11 +3473,11 @@ impl Renderer {
 
         // Compute top-left anchor of the legend block.
         let (anchor_x, anchor_y) = match position {
-            "top-left"     => (MARGIN, MARGIN),
-            "top-right"    => (w - MARGIN - block_w, MARGIN),
-            "bottom-left"  => (MARGIN, h - MARGIN - block_h),
+            "top-left" => (MARGIN, MARGIN),
+            "top-right" => (w - MARGIN - block_w, MARGIN),
+            "bottom-left" => (MARGIN, h - MARGIN - block_h),
             "bottom-right" => (w - MARGIN - block_w, h - MARGIN - block_h),
-            _              => (w - MARGIN - block_w, MARGIN), // default: top-right
+            _ => (w - MARGIN - block_w, MARGIN), // default: top-right
         };
 
         let ndc_x = |px: f32| -> f32 { px / w * 2.0 - 1.0 };
@@ -2893,12 +3499,30 @@ impl Renderer {
             let (cx, cy) = (ndc_x(sx1), ndc_y(sy1));
             let (dx, dy) = (ndc_x(sx0), ndc_y(sy1));
             swatch_verts.extend_from_slice(&[
-                MeshVertex { position: [ax, ay, 0.0], color: rgba },
-                MeshVertex { position: [bx, by, 0.0], color: rgba },
-                MeshVertex { position: [cx, cy, 0.0], color: rgba },
-                MeshVertex { position: [ax, ay, 0.0], color: rgba },
-                MeshVertex { position: [cx, cy, 0.0], color: rgba },
-                MeshVertex { position: [dx, dy, 0.0], color: rgba },
+                MeshVertex {
+                    position: [ax, ay, 0.0],
+                    color: rgba,
+                },
+                MeshVertex {
+                    position: [bx, by, 0.0],
+                    color: rgba,
+                },
+                MeshVertex {
+                    position: [cx, cy, 0.0],
+                    color: rgba,
+                },
+                MeshVertex {
+                    position: [ax, ay, 0.0],
+                    color: rgba,
+                },
+                MeshVertex {
+                    position: [cx, cy, 0.0],
+                    color: rgba,
+                },
+                MeshVertex {
+                    position: [dx, dy, 0.0],
+                    color: rgba,
+                },
             ]);
 
             let text_h = FONT_SZ * 1.4;
@@ -2912,7 +3536,10 @@ impl Renderer {
         self.chart2d_legend_swatch_count = swatch_verts.len() as u32;
         if !swatch_verts.is_empty() {
             self.chart2d_legend_buf.upload(
-                &self.device, &self.queue, bytemuck::cast_slice(&swatch_verts));
+                &self.device,
+                &self.queue,
+                bytemuck::cast_slice(&swatch_verts),
+            );
         }
     }
 
@@ -2931,7 +3558,9 @@ impl Renderer {
             data_max,
         };
         if !vertices.is_empty() {
-            actor.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(vertices));
+            actor
+                .buf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(vertices));
         }
         self.line_actors.push(actor);
         id
@@ -2944,7 +3573,8 @@ impl Renderer {
             a.data_min = data_min;
             a.data_max = data_max;
             if !vertices.is_empty() {
-                a.buf.upload(&self.device, &self.queue, bytemuck::cast_slice(vertices));
+                a.buf
+                    .upload(&self.device, &self.queue, bytemuck::cast_slice(vertices));
             }
             true
         } else {
@@ -2981,8 +3611,8 @@ impl Renderer {
         self.point_style = style.min(2);
     }
 
-    /// Set the LOD divisor. When > 1 each actor draws only `count / lod_factor`
-    /// instances, giving fast interaction at the cost of apparent density.
+    /// Set the LOD divisor. When > 1 each actor draws a sampled storage-buffer
+    /// view of every Nth point, giving fast interaction without prefix bias.
     pub fn set_lod_factor(&mut self, factor: u32) {
         self.lod_factor = factor.max(1);
     }
@@ -3015,25 +3645,37 @@ impl Renderer {
     }
 
     fn update_axes_buf(&mut self) {
-        if !self.axes_visible { return; }
+        if !self.axes_visible {
+            return;
+        }
         // Corner center in NDC (bottom-left, accounting for wgpu Y-up NDC).
         let (cx, cy) = (-0.82_f32, -0.82_f32);
         let scale = 0.13_f32;
         let vm = self.camera.view_matrix();
         // World-axis directions in camera space (X=right, Y=up in NDC).
         let axes: [([f32; 3], [f32; 3]); 3] = [
-            ([1., 0., 0.], [0.95, 0.30, 0.30]),  // X — red
-            ([0., 1., 0.], [0.30, 0.90, 0.30]),  // Y — green
-            ([0., 0., 1.], [0.40, 0.60, 1.00]),  // Z — blue
+            ([1., 0., 0.], [0.95, 0.30, 0.30]), // X — red
+            ([0., 1., 0.], [0.30, 0.90, 0.30]), // Y — green
+            ([0., 0., 1.], [0.40, 0.60, 1.00]), // Z — blue
         ];
-        let mut verts = [LineVertex { position: [0.; 3], color: [0.; 3] }; 6];
+        let mut verts = [LineVertex {
+            position: [0.; 3],
+            color: [0.; 3],
+        }; 6];
         for (i, (world_axis, color)) in axes.iter().enumerate() {
             // transform_vector3 applies only the rotation part of the view matrix.
             let d = vm.transform_vector3(Vec3::from(*world_axis));
-            verts[i * 2]     = LineVertex { position: [cx, cy, 0.], color: *color };
-            verts[i * 2 + 1] = LineVertex { position: [cx + d.x * scale, cy + d.y * scale, 0.], color: *color };
+            verts[i * 2] = LineVertex {
+                position: [cx, cy, 0.],
+                color: *color,
+            };
+            verts[i * 2 + 1] = LineVertex {
+                position: [cx + d.x * scale, cy + d.y * scale, 0.],
+                color: *color,
+            };
         }
-        self.axes_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
+        self.axes_buf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&verts));
     }
 
     pub fn clear_grid(&mut self) {
@@ -3081,8 +3723,10 @@ impl Renderer {
     /// camera crosses an axis midplane.
     fn rebuild_grid_geometry(&mut self) {
         let (dmin, dmax, nmin, nmax) = match (
-            self.last_data_min, self.last_data_max,
-            self.last_grid_min, self.last_grid_max,
+            self.last_data_min,
+            self.last_data_max,
+            self.last_grid_min,
+            self.last_grid_max,
         ) {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => return,
@@ -3097,13 +3741,25 @@ impl Renderer {
         } else {
             None
         };
-        let geo = build_grid(dmin, dmax, nmin, nmax,
-                             self.tick_override, self.axis_visible,
-                             eye, &axis_texts,
-                             self.major_grid_planes, self.minor_grid_planes,
-                             ortho_scale);
+        let geo = build_grid(
+            dmin,
+            dmax,
+            nmin,
+            nmax,
+            self.tick_override,
+            self.axis_visible,
+            eye,
+            &axis_texts,
+            self.major_grid_planes,
+            self.minor_grid_planes,
+            ortho_scale,
+        );
 
-        self.line_buf.upload(&self.device, &self.queue, bytemuck::cast_slice(&geo.vertices));
+        self.line_buf.upload(
+            &self.device,
+            &self.queue,
+            bytemuck::cast_slice(&geo.vertices),
+        );
         self.line_count = geo.vertices.len() as u32;
 
         // Pre-shape label glyphs.  Axis title labels use a larger font.
@@ -3124,9 +3780,9 @@ impl Renderer {
             );
             buf.shape_until_scroll(&mut self.font_system, false);
             self.cached_labels.push(CachedLabel {
-                glyph_buf:    buf,
-                world_pos:    anchor.world_pos,
-                tick_pos:     anchor.tick_pos,
+                glyph_buf: buf,
+                world_pos: anchor.world_pos,
+                tick_pos: anchor.tick_pos,
                 is_axis_title: anchor.is_axis_title,
             });
         }
@@ -3138,8 +3794,8 @@ impl Renderer {
     fn update_grid_for_camera(&mut self) {
         if let (Some(nmin), Some(nmax)) = (self.last_grid_min, self.last_grid_max) {
             let center = (nmin + nmax) * 0.5;
-            let eye    = self.camera.position();
-            let bits   = face_bits(eye, center);
+            let eye = self.camera.position();
+            let bits = face_bits(eye, center);
             if bits != self.grid_face_bits {
                 self.grid_face_bits = bits;
                 self.rebuild_grid_geometry();
@@ -3164,7 +3820,11 @@ impl Renderer {
         }
         self.width = w;
         self.height = h;
-        if let RenderSurface::Windowed { ref mut surface_config, ref surface } = self.render_surface {
+        if let RenderSurface::Windowed {
+            ref mut surface_config,
+            ref surface,
+        } = self.render_surface
+        {
             surface_config.width = w;
             surface_config.height = h;
             surface.configure(&self.device, surface_config);
@@ -3173,8 +3833,8 @@ impl Renderer {
         self.depth_texture = dt;
         self.depth_view = dv;
         self.camera.aspect = w as f32 / h as f32;
-        self.screenshot_cache = None;  // dimensions changed — invalidate cached resources
-        // Pixel coordinates have changed — all cached screen projections are stale.
+        self.screenshot_cache = None; // dimensions changed — invalidate cached resources
+                                      // Pixel coordinates have changed — all cached screen projections are stale.
         for actor in &mut self.actors {
             actor.pick_cache = None;
         }
@@ -3247,7 +3907,9 @@ impl Renderer {
     ///
     /// Returns `(width, height, rgba_bytes)`. Bytes are always RGBA regardless of
     /// the internal surface format (BGRA is swapped before returning).
-    pub fn screenshot(&mut self) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn screenshot(
+        &mut self,
+    ) -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
         let (w, h) = (self.width, self.height);
 
         // Readback row stride must satisfy COPY_BYTES_PER_ROW_ALIGNMENT.
@@ -3257,11 +3919,21 @@ impl Renderer {
         let padded_row = (unpadded_row + align - 1) & !(align - 1);
 
         // Reuse the offscreen color texture + readback buffer if dimensions match.
-        if self.screenshot_cache.as_ref().map_or(true, |c| c.w != w || c.h != h) {
+        if self
+            .screenshot_cache
+            .as_ref()
+            .map_or(true, |c| c.w != w || c.h != h)
+        {
             let color_tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("screenshot_color"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
                 format: self.surface_format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
@@ -3273,7 +3945,14 @@ impl Renderer {
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
-            self.screenshot_cache = Some(ScreenshotCache { w, h, color_tex, color_view, readback, padded_row });
+            self.screenshot_cache = Some(ScreenshotCache {
+                w,
+                h,
+                color_tex,
+                color_view,
+                readback,
+                padded_row,
+            });
         }
 
         // Take the cache out of self so we can freely call self.* methods alongside
@@ -3287,16 +3966,25 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             screen_size: [w as f32, h as f32],
             style: self.point_style,
-            _pad: 0.0,
+            lod_factor: 1,
         };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-        self.viewport.update(&self.queue, Resolution { width: w, height: h });
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: w,
+                height: h,
+            },
+        );
         self.prepare_text_labels(view_proj);
         self.update_axes_buf();
 
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("screenshot") }
-        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("screenshot"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("screenshot_pass"),
@@ -3305,15 +3993,20 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: self.bg_color[0], g: self.bg_color[1],
-                            b: self.bg_color[2], a: self.bg_color[3],
+                            r: self.bg_color[0],
+                            g: self.bg_color[1],
+                            b: self.bg_color[2],
+                            a: self.bg_color[3],
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
                     stencil_ops: None,
                 }),
                 occlusion_query_set: None,
@@ -3326,8 +4019,12 @@ impl Renderer {
                 let (sc_x, sc_y, sc_w, sc_h) = if let Some(ref state) = self.chart2d_state {
                     let sx = (state.plot_left * self.width as f32).floor() as u32;
                     let sy = (state.plot_top * self.height as f32).floor() as u32;
-                    let sw = ((state.plot_right - state.plot_left) * self.width as f32).ceil() as u32 + 1;
-                    let sh = ((state.plot_bottom - state.plot_top) * self.height as f32).ceil() as u32 + 1;
+                    let sw = ((state.plot_right - state.plot_left) * self.width as f32).ceil()
+                        as u32
+                        + 1;
+                    let sh = ((state.plot_bottom - state.plot_top) * self.height as f32).ceil()
+                        as u32
+                        + 1;
                     (
                         sx.min(self.width.saturating_sub(1)),
                         sy.min(self.height.saturating_sub(1)),
@@ -3403,15 +4100,15 @@ impl Renderer {
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 if self.grid_visible {
                     if let Some(slice) = self.line_buf.slice() {
-                    pass.set_vertex_buffer(0, slice);
-                    pass.draw(0..self.line_count, 0..1);
+                        pass.set_vertex_buffer(0, slice);
+                        pass.draw(0..self.line_count, 0..1);
                     }
                 }
                 for la in &self.line_actors {
                     if la.visible && la.vertex_count > 0 {
                         if let Some(slice) = la.buf.slice() {
-                        pass.set_vertex_buffer(0, slice);
-                        pass.draw(0..la.vertex_count, 0..1);
+                            pass.set_vertex_buffer(0, slice);
+                            pass.draw(0..la.vertex_count, 0..1);
                         }
                     }
                 }
@@ -3420,17 +4117,22 @@ impl Renderer {
                 for actor in &self.actors {
                     if actor.visible && actor.count > 0 {
                         if let Some(slice) = actor.buf.slice() {
-                        pass.set_vertex_buffer(0, slice);
-                        pass.draw(0..6, 0..actor.count);
+                            pass.set_vertex_buffer(0, slice);
+                            pass.draw(0..6, 0..actor.count);
                         }
                     }
                 }
 
-            // ── Mesh actors (convex hulls, ellipsoids) ─────────────────────────
-            draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
-                             &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
-                             &self.uniform_bind_group, view_proj, &mut pass);
-
+                // ── Mesh actors (convex hulls, ellipsoids) ─────────────────────────
+                draw_mesh_actors(
+                    &self.mesh_actors,
+                    &self.mesh_pipeline_wireframe,
+                    &self.mesh_pipeline_opaque,
+                    &self.mesh_pipeline_transparent,
+                    &self.uniform_bind_group,
+                    view_proj,
+                    &mut pass,
+                );
             }
 
             pass.set_pipeline(&self.line_pipeline);
@@ -3457,13 +4159,17 @@ impl Renderer {
                     pass.draw(0..6, 0..1);
                 }
             }
-            self.text_renderer.render(&self.text_atlas, &self.viewport, &mut pass).ok();
+            self.text_renderer
+                .render(&self.text_atlas, &self.viewport, &mut pass)
+                .ok();
         }
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &cache.color_tex, mip_level: 0,
-                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+                texture: &cache.color_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
                 buffer: &cache.readback,
@@ -3473,13 +4179,22 @@ impl Renderer {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Wait for GPU and read bytes back to CPU.
         let (tx, rx) = std::sync::mpsc::channel();
-        cache.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| { tx.send(r).ok(); });
+        cache
+            .readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).ok();
+            });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().unwrap().unwrap();
 
@@ -3518,7 +4233,9 @@ impl Renderer {
     /// Render one frame offscreen and return raw RGBA bytes (width × height × 4).
     /// Only valid when the renderer was created with `new_offscreen()`.
     /// For windowed renderers use `screenshot()` instead.
-    pub fn render_offscreen(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn render_offscreen(
+        &mut self,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let (_w, _h, pixels) = self.screenshot()?;
         Ok(pixels)
     }
@@ -3529,7 +4246,9 @@ impl Renderer {
         let (output, view) = match &self.render_surface {
             RenderSurface::Windowed { surface, .. } => {
                 let output = surface.get_current_texture()?;
-                let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let view = output
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
                 (Some(output), view)
             }
             RenderSurface::Offscreen => {
@@ -3550,18 +4269,27 @@ impl Renderer {
             view_proj: view_proj.to_cols_array_2d(),
             screen_size: [self.width as f32, self.height as f32],
             style: self.point_style,
-            _pad: 0.0,
+            lod_factor: self.lod_factor.max(1),
         };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
-        self.viewport.update(&self.queue, Resolution { width: self.width, height: self.height });
+        self.viewport.update(
+            &self.queue,
+            Resolution {
+                width: self.width,
+                height: self.height,
+            },
+        );
 
         self.prepare_text_labels(view_proj);
         self.update_axes_buf();
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3571,8 +4299,10 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: self.bg_color[0], g: self.bg_color[1],
-                            b: self.bg_color[2], a: self.bg_color[3],
+                            r: self.bg_color[0],
+                            g: self.bg_color[1],
+                            b: self.bg_color[2],
+                            a: self.bg_color[3],
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -3595,15 +4325,23 @@ impl Renderer {
 
                 // Compute scissor rect for plot area.
                 let (sc_x, sc_y, sc_w, sc_h) = if let Some(ref state) = self.chart2d_state {
-                    let sx = (state.plot_left   * self.width  as f32).floor() as u32;
-                    let sy = (state.plot_top     * self.height as f32).floor() as u32;
-                    let sw = ((state.plot_right  - state.plot_left)   * self.width  as f32).ceil() as u32 + 1;
-                    let sh = ((state.plot_bottom - state.plot_top)    * self.height as f32).ceil() as u32 + 1;
-                    (sx.min(self.width.saturating_sub(1)),
-                     sy.min(self.height.saturating_sub(1)),
-                     sw.min(self.width.saturating_sub(sx)),
-                     sh.min(self.height.saturating_sub(sy)))
-                } else { (0, 0, self.width, self.height) };
+                    let sx = (state.plot_left * self.width as f32).floor() as u32;
+                    let sy = (state.plot_top * self.height as f32).floor() as u32;
+                    let sw = ((state.plot_right - state.plot_left) * self.width as f32).ceil()
+                        as u32
+                        + 1;
+                    let sh = ((state.plot_bottom - state.plot_top) * self.height as f32).ceil()
+                        as u32
+                        + 1;
+                    (
+                        sx.min(self.width.saturating_sub(1)),
+                        sy.min(self.height.saturating_sub(1)),
+                        sw.min(self.width.saturating_sub(sx)),
+                        sh.min(self.height.saturating_sub(sy)),
+                    )
+                } else {
+                    (0, 0, self.width, self.height)
+                };
 
                 // Frame + grid lines + tick marks (NDC space, identity bind group).
                 pass.set_bind_group(0, &self.overlay_bind_group, &[]);
@@ -3687,17 +4425,51 @@ impl Renderer {
                 pass.set_pipeline(&self.point_pipeline);
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 let lod = self.lod_factor.max(1);
-                for actor in &self.actors {
-                    if actor.visible && actor.count > 0 {
-                        if let Some(slice) = actor.buf.slice() {
-                            pass.set_vertex_buffer(0, slice);
-                            pass.draw(0..6, 0..(actor.count / lod).max(1));
+                if lod == 1 {
+                    for actor in &self.actors {
+                        if actor.visible && actor.count > 0 {
+                            if let Some(slice) = actor.buf.slice() {
+                                pass.set_vertex_buffer(0, slice);
+                                pass.draw(0..6, 0..actor.count);
+                            }
+                        }
+                    }
+                } else {
+                    pass.set_pipeline(&self.point_lod_pipeline);
+                    for actor in &self.actors {
+                        if actor.visible && actor.count > 0 {
+                            if let Some(buffer) = actor.buf.buffer() {
+                                let bind_group =
+                                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                        label: Some("point_lod_actor_bind_group"),
+                                        layout: &self.point_lod_bind_group_layout,
+                                        entries: &[
+                                            wgpu::BindGroupEntry {
+                                                binding: 0,
+                                                resource: self.uniform_buffer.as_entire_binding(),
+                                            },
+                                            wgpu::BindGroupEntry {
+                                                binding: 1,
+                                                resource: buffer.as_entire_binding(),
+                                            },
+                                        ],
+                                    });
+                                let sampled = actor.count.div_ceil(lod).max(1);
+                                pass.set_bind_group(0, &bind_group, &[]);
+                                pass.draw(0..sampled.saturating_mul(6), 0..1);
+                            }
                         }
                     }
                 }
-                draw_mesh_actors(&self.mesh_actors, &self.mesh_pipeline_wireframe,
-                                 &self.mesh_pipeline_opaque, &self.mesh_pipeline_transparent,
-                                 &self.uniform_bind_group, view_proj, &mut pass);
+                draw_mesh_actors(
+                    &self.mesh_actors,
+                    &self.mesh_pipeline_wireframe,
+                    &self.mesh_pipeline_opaque,
+                    &self.mesh_pipeline_transparent,
+                    &self.uniform_bind_group,
+                    view_proj,
+                    &mut pass,
+                );
             }
 
             // ── Screen-space overlays (always drawn regardless of mode) ────────
@@ -3774,7 +4546,9 @@ impl Renderer {
 
     pub fn add_user_label(
         &mut self,
-        x: f32, y: f32, z: f32,
+        x: f32,
+        y: f32,
+        z: f32,
         text: &str,
         color: [f32; 4],
         size: f32,
@@ -3805,16 +4579,28 @@ impl Renderer {
         size: Option<f32>,
         anchor: Option<u8>,
     ) {
-        let Some(label) = self.user_labels.iter_mut().find(|l| l.id == id) else { return };
-        if let Some(p) = pos   { label.world_pos = Vec3::new(p[0], p[1], p[2]); }
-        if let Some(c) = color { label.color = c; }
-        if let Some(a) = anchor { label.anchor = LabelAnchor::from_u8(a); }
+        let Some(label) = self.user_labels.iter_mut().find(|l| l.id == id) else {
+            return;
+        };
+        if let Some(p) = pos {
+            label.world_pos = Vec3::new(p[0], p[1], p[2]);
+        }
+        if let Some(c) = color {
+            label.color = c;
+        }
+        if let Some(a) = anchor {
+            label.anchor = LabelAnchor::from_u8(a);
+        }
         // Rebuild the glyph buffer when text or size changes.
         let new_text = text.map(|t| t.to_string());
         let new_size = size.filter(|&s| (s - label.size).abs() > 0.01);
         if new_text.is_some() || new_size.is_some() {
-            if let Some(s) = new_size { label.size = s; }
-            if let Some(t) = new_text { label.text = t; }
+            if let Some(s) = new_size {
+                label.size = s;
+            }
+            if let Some(t) = new_text {
+                label.text = t;
+            }
             // Borrow fields individually to satisfy the borrow checker.
             let buf = build_label_buffer(&mut self.font_system, &label.text.clone(), label.size);
             label.glyph_buf = buf;
@@ -3848,7 +4634,8 @@ impl Renderer {
         self.next_mesh_actor_id += 1;
 
         let (data_min, data_max) = mesh_bounds(vertices);
-        let mesh_verts: Vec<MeshVertex> = vertices.iter()
+        let mesh_verts: Vec<MeshVertex> = vertices
+            .iter()
             .map(|&p| MeshVertex { position: p, color })
             .collect();
 
@@ -3870,7 +4657,15 @@ impl Renderer {
         ibuf.upload(&self.device, &self.queue, &index_bytes);
 
         self.mesh_actors.push(MeshActor {
-            id, vbuf, ibuf, index_count, visible: true, wireframe, color, data_min, data_max,
+            id,
+            vbuf,
+            ibuf,
+            index_count,
+            visible: true,
+            wireframe,
+            color,
+            data_min,
+            data_max,
             positions: vertices.to_vec(),
             triangle_indices: indices.to_vec(),
         });
@@ -3890,7 +4685,8 @@ impl Renderer {
             None => return false,
         };
         let (data_min, data_max) = mesh_bounds(vertices);
-        let mesh_verts: Vec<MeshVertex> = vertices.iter()
+        let mesh_verts: Vec<MeshVertex> = vertices
+            .iter()
             .map(|&p| MeshVertex { position: p, color })
             .collect();
         let index_bytes: Vec<u8>;
@@ -3911,7 +4707,9 @@ impl Renderer {
         actor.index_count = index_count;
         actor.positions = vertices.to_vec();
         actor.triangle_indices = indices.to_vec();
-        actor.vbuf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mesh_verts));
+        actor
+            .vbuf
+            .upload(&self.device, &self.queue, bytemuck::cast_slice(&mesh_verts));
         actor.ibuf.upload(&self.device, &self.queue, &index_bytes);
         true
     }
@@ -3932,10 +4730,14 @@ impl Renderer {
         actor.color = color;
         actor.wireframe = wireframe;
         if color_changed {
-            let mesh_verts: Vec<MeshVertex> = actor.positions.iter()
+            let mesh_verts: Vec<MeshVertex> = actor
+                .positions
+                .iter()
                 .map(|&p| MeshVertex { position: p, color })
                 .collect();
-            actor.vbuf.upload(&self.device, &self.queue, bytemuck::cast_slice(&mesh_verts));
+            actor
+                .vbuf
+                .upload(&self.device, &self.queue, bytemuck::cast_slice(&mesh_verts));
         }
         if wireframe_changed {
             let idxs = actor.triangle_indices.clone();
@@ -3991,120 +4793,151 @@ impl Renderer {
 
         let mut text_areas: Vec<TextArea> = Vec::with_capacity(self.cached_labels.len());
         if self.grid_visible {
-        for label in &self.cached_labels {
-            let clip = vp * label.world_pos.extend(1.0);
-            if clip.w <= 0.0 { continue; }
-            let ndc = clip.truncate() / clip.w;
-            if ndc.x < -1.1 || ndc.x > 1.1 || ndc.y < -1.1 || ndc.y > 1.1 { continue; }
-
-            let mut sx = (ndc.x + 1.0) * 0.5 * w as f32;
-            let mut sy = (1.0 - ndc.y) * 0.5 * h as f32;
-
-            if label.is_axis_title {
-                if self.axis_visible[2] {
-                    // 3D mode: titles sit slightly farther from the cube so they
-                    // clear the silhouette across viewing angles.
-                    let cx = w as f32 * 0.5;
-                    let cy = h as f32 * 0.5;
-                    let dx = sx - cx;
-                    let dy = sy - cy;
-                    let len = (dx * dx + dy * dy).sqrt().max(1.0);
-                    sx += dx / len * 24.0;
-                    sy += dy / len * 24.0;
+            for label in &self.cached_labels {
+                let clip = vp * label.world_pos.extend(1.0);
+                if clip.w <= 0.0 {
+                    continue;
                 }
-            } else {
-                // Tick labels: push away from their tick mark; suppress when depth-aligned.
-                let tick_clip = vp * label.tick_pos.extend(1.0);
-                if tick_clip.w > 0.0 {
-                    let tndc = tick_clip.truncate() / tick_clip.w;
-                    let tx = (tndc.x + 1.0) * 0.5 * w as f32;
-                    let ty = (1.0 - tndc.y) * 0.5 * h as f32;
-                    let push = glam::Vec2::new(sx - tx, sy - ty);
-                    let push_len = push.length();
-                    if push_len < 1.0 {
-                        continue;
-                    }
-                    if push_len < MIN_PUSH_PX {
-                        let n = push / push_len;
-                        sx = tx + n.x * MIN_PUSH_PX;
-                        sy = ty + n.y * MIN_PUSH_PX;
-                    }
+                let ndc = clip.truncate() / clip.w;
+                if ndc.x < -1.1 || ndc.x > 1.1 || ndc.y < -1.1 || ndc.y > 1.1 {
+                    continue;
                 }
-            }
 
-            text_areas.push(TextArea {
-                buffer: &label.glyph_buf,
-                left: sx,
-                top: sy,
-                scale: 1.0,
-                bounds: TextBounds::default(),
-                default_color: if label.is_axis_title {
-                    Color::rgb(220, 220, 240)
+                let mut sx = (ndc.x + 1.0) * 0.5 * w as f32;
+                let mut sy = (1.0 - ndc.y) * 0.5 * h as f32;
+
+                if label.is_axis_title {
+                    if self.axis_visible[2] {
+                        // 3D mode: titles sit slightly farther from the cube so they
+                        // clear the silhouette across viewing angles.
+                        let cx = w as f32 * 0.5;
+                        let cy = h as f32 * 0.5;
+                        let dx = sx - cx;
+                        let dy = sy - cy;
+                        let len = (dx * dx + dy * dy).sqrt().max(1.0);
+                        sx += dx / len * 24.0;
+                        sy += dy / len * 24.0;
+                    }
                 } else {
-                    Color::rgb(200, 200, 200)
-                },
-                custom_glyphs: &[],
-            });
-        }
+                    // Tick labels: push away from their tick mark; suppress when depth-aligned.
+                    let tick_clip = vp * label.tick_pos.extend(1.0);
+                    if tick_clip.w > 0.0 {
+                        let tndc = tick_clip.truncate() / tick_clip.w;
+                        let tx = (tndc.x + 1.0) * 0.5 * w as f32;
+                        let ty = (1.0 - tndc.y) * 0.5 * h as f32;
+                        let push = glam::Vec2::new(sx - tx, sy - ty);
+                        let push_len = push.length();
+                        if push_len < 1.0 {
+                            continue;
+                        }
+                        if push_len < MIN_PUSH_PX {
+                            let n = push / push_len;
+                            sx = tx + n.x * MIN_PUSH_PX;
+                            sy = ty + n.y * MIN_PUSH_PX;
+                        }
+                    }
+                }
+
+                text_areas.push(TextArea {
+                    buffer: &label.glyph_buf,
+                    left: sx,
+                    top: sy,
+                    scale: 1.0,
+                    bounds: TextBounds::default(),
+                    default_color: if label.is_axis_title {
+                        Color::rgb(220, 220, 240)
+                    } else {
+                        Color::rgb(200, 200, 200)
+                    },
+                    custom_glyphs: &[],
+                });
+            }
         } // end grid_visible guard
 
         // Chart2D axis labels — pixel positions computed dynamically from state + w/h.
         if let Some(ref state) = self.chart2d_state {
-            let pl_px  = state.plot_left   * w as f32;
-            let pb_px  = state.plot_bottom * h as f32;
-            let pt_px  = state.plot_top    * h as f32;
-            let line_h = 11.0_f32 * 1.4;  // matches sz_tick * 1.4 from build_label_buffer
+            let pl_px = state.plot_left * w as f32;
+            let pb_px = state.plot_bottom * h as f32;
+            let pt_px = state.plot_top * h as f32;
+            let line_h = 11.0_f32 * 1.4; // matches sz_tick * 1.4 from build_label_buffer
 
             // Pre-compute max Y-tick label width so the Y-axis title can be
             // placed to the left of the widest tick without overlapping.
-            let max_ytick_w: f32 = self.chart2d_text_labels.iter()
+            let max_ytick_w: f32 = self
+                .chart2d_text_labels
+                .iter()
                 .filter(|l| matches!(l.kind, Chart2DLabelKind::YTick))
-                .map(|l| l.glyph_buf.layout_runs()
-                    .flat_map(|r| r.glyphs.iter())
-                    .fold(0.0_f32, |acc, g| acc.max(g.x + g.w)))
+                .map(|l| {
+                    l.glyph_buf
+                        .layout_runs()
+                        .flat_map(|r| r.glyphs.iter())
+                        .fold(0.0_f32, |acc, g| acc.max(g.x + g.w))
+                })
                 .fold(0.0_f32, f32::max);
 
             for label in &self.chart2d_text_labels {
                 let (sx, sy, color) = match label.kind {
                     Chart2DLabelKind::XTick => {
                         let px = (label.ndc_val + 1.0) * 0.5 * w as f32;
-                        let text_w: f32 = label.glyph_buf.layout_runs()
+                        let text_w: f32 = label
+                            .glyph_buf
+                            .layout_runs()
                             .flat_map(|r| r.glyphs.iter())
                             .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
                         (px - text_w * 0.5, pb_px + 6.0, Color::rgb(190, 190, 195))
                     }
                     Chart2DLabelKind::YTick => {
                         let py = (1.0 - label.ndc_val) * 0.5 * h as f32;
-                        let text_w: f32 = label.glyph_buf.layout_runs()
+                        let text_w: f32 = label
+                            .glyph_buf
+                            .layout_runs()
                             .flat_map(|r| r.glyphs.iter())
                             .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
-                        (pl_px - 8.0 - text_w, py - line_h * 0.5, Color::rgb(190, 190, 195))
+                        (
+                            pl_px - 8.0 - text_w,
+                            py - line_h * 0.5,
+                            Color::rgb(190, 190, 195),
+                        )
                     }
                     Chart2DLabelKind::XTitle => {
                         let px = (label.ndc_val + 1.0) * 0.5 * w as f32;
-                        let text_w: f32 = label.glyph_buf.layout_runs()
+                        let text_w: f32 = label
+                            .glyph_buf
+                            .layout_runs()
                             .flat_map(|r| r.glyphs.iter())
                             .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
                         (px - text_w * 0.5, pb_px + 28.0, Color::rgb(210, 210, 230))
                     }
                     Chart2DLabelKind::YTitle => {
                         let py = (1.0 - label.ndc_val) * 0.5 * h as f32;
-                        let text_w: f32 = label.glyph_buf.layout_runs()
+                        let text_w: f32 = label
+                            .glyph_buf
+                            .layout_runs()
                             .flat_map(|r| r.glyphs.iter())
                             .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
                         let title_h = 13.0_f32 * 1.4;
                         // Place to the left of the widest tick label (8px gap + 6px gap).
                         let right_edge = pl_px - 8.0 - max_ytick_w - 6.0;
-                        (right_edge - text_w, py - title_h * 0.5, Color::rgb(210, 210, 230))
+                        (
+                            right_edge - text_w,
+                            py - title_h * 0.5,
+                            Color::rgb(210, 210, 230),
+                        )
                     }
                     Chart2DLabelKind::ChartTitle => {
                         // Centered horizontally on the plot area, above the frame.
                         let px = (label.ndc_val + 1.0) * 0.5 * w as f32;
-                        let text_w: f32 = label.glyph_buf.layout_runs()
+                        let text_w: f32 = label
+                            .glyph_buf
+                            .layout_runs()
                             .flat_map(|r| r.glyphs.iter())
                             .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
                         let title_h = 14.0_f32 * 1.4;
-                        (px - text_w * 0.5, pt_px - title_h - 4.0, Color::rgb(235, 235, 245))
+                        (
+                            px - text_w * 0.5,
+                            pt_px - title_h - 4.0,
+                            Color::rgb(235, 235, 245),
+                        )
                     }
                 };
                 // Suppress labels that would fall outside the window.
@@ -4114,7 +4947,9 @@ impl Renderer {
                 // In 2D chart mode also suppress Y labels that are too close to
                 // the top or bottom of the plot area (would overlap the frame).
                 if matches!(label.kind, Chart2DLabelKind::YTick) {
-                    if sy < pt_px - 4.0 || sy + line_h > pb_px + 4.0 { continue; }
+                    if sy < pt_px - 4.0 || sy + line_h > pb_px + 4.0 {
+                        continue;
+                    }
                 }
                 text_areas.push(TextArea {
                     buffer: &label.glyph_buf,
@@ -4173,25 +5008,33 @@ impl Renderer {
 
         // User-defined world-space labels
         for label in &self.user_labels {
-            if !label.visible { continue; }
+            if !label.visible {
+                continue;
+            }
             let clip = vp * label.world_pos.extend(1.0);
-            if clip.w <= 0.0 { continue; }
+            if clip.w <= 0.0 {
+                continue;
+            }
             let ndc = clip.truncate() / clip.w;
-            if ndc.x < -1.1 || ndc.x > 1.1 || ndc.y < -1.1 || ndc.y > 1.1 { continue; }
+            if ndc.x < -1.1 || ndc.x > 1.1 || ndc.y < -1.1 || ndc.y > 1.1 {
+                continue;
+            }
             let sx = (ndc.x + 1.0) * 0.5 * w as f32;
             let sy = (1.0 - ndc.y) * 0.5 * h as f32;
 
             // Measure rendered text width from layout runs for anchor offset.
-            let text_w: f32 = label.glyph_buf.layout_runs()
+            let text_w: f32 = label
+                .glyph_buf
+                .layout_runs()
                 .flat_map(|r| r.glyphs.iter())
                 .fold(0.0_f32, |acc, g| acc.max(g.x + g.w));
             let text_h = label.glyph_buf.metrics().line_height;
 
             let (ox, oy) = match label.anchor {
                 LabelAnchor::Center => (-text_w * 0.5, -text_h * 0.5),
-                LabelAnchor::Left   => (4.0, -text_h * 0.5),
-                LabelAnchor::Right  => (-text_w - 4.0, -text_h * 0.5),
-                LabelAnchor::Top    => (-text_w * 0.5, -text_h - 4.0),
+                LabelAnchor::Left => (4.0, -text_h * 0.5),
+                LabelAnchor::Right => (-text_w - 4.0, -text_h * 0.5),
+                LabelAnchor::Top => (-text_w * 0.5, -text_h - 4.0),
                 LabelAnchor::Bottom => (-text_w * 0.5, 4.0),
             };
 
@@ -4228,17 +5071,20 @@ impl Renderer {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn push_chart2d_tri(
-    out: &mut Vec<MeshVertex>,
-    a: Vec2,
-    b: Vec2,
-    c: Vec2,
-    color: [f32; 3],
-) {
+fn push_chart2d_tri(out: &mut Vec<MeshVertex>, a: Vec2, b: Vec2, c: Vec2, color: [f32; 3]) {
     let rgba = [color[0], color[1], color[2], 1.0];
-    out.push(MeshVertex { position: [a.x, a.y, 0.0], color: rgba });
-    out.push(MeshVertex { position: [b.x, b.y, 0.0], color: rgba });
-    out.push(MeshVertex { position: [c.x, c.y, 0.0], color: rgba });
+    out.push(MeshVertex {
+        position: [a.x, a.y, 0.0],
+        color: rgba,
+    });
+    out.push(MeshVertex {
+        position: [b.x, b.y, 0.0],
+        color: rgba,
+    });
+    out.push(MeshVertex {
+        position: [c.x, c.y, 0.0],
+        color: rgba,
+    });
 }
 
 /// Build square marker vertices (2 triangles each) in data space.
@@ -4254,31 +5100,60 @@ fn build_marker_vertices(
     width: u32,
     height: u32,
 ) -> Vec<MeshVertex> {
-    if style == 0 || every == 0 { return vec![]; }
+    if style == 0 || every == 0 {
+        return vec![];
+    }
     let px_per_x = (state.plot_right - state.plot_left) * width.max(1) as f32
-        / (state.effective_x1() - state.effective_x0()).abs().max(1e-10);
+        / (state.effective_x1() - state.effective_x0())
+            .abs()
+            .max(1e-10);
     let px_per_y = (state.plot_bottom - state.plot_top) * height.max(1) as f32
-        / (state.effective_y1() - state.effective_y0()).abs().max(1e-10);
-    if px_per_x <= 0.0 || px_per_y <= 0.0 { return vec![]; }
-    let hw = size_px * 0.5 / px_per_x;  // half-width in chart (log) units
-    let hh = size_px * 0.5 / px_per_y;  // half-height in chart (log) units
+        / (state.effective_y1() - state.effective_y0())
+            .abs()
+            .max(1e-10);
+    if px_per_x <= 0.0 || px_per_y <= 0.0 {
+        return vec![];
+    }
+    let hw = size_px * 0.5 / px_per_x; // half-width in chart (log) units
+    let hh = size_px * 0.5 / px_per_y; // half-height in chart (log) units
     let rgba = [color[0], color[1], color[2], 1.0_f32];
     let n = x.len().min(y.len());
     let every = every.max(1) as usize;
     let mut out = Vec::with_capacity((n / every + 1) * 6);
     for i in (0..n).step_by(every) {
-        let xi = state.chart_x(x[i]); let yi = state.chart_y(y[i]);
-        if !xi.is_finite() || !yi.is_finite() { continue; }
+        let xi = state.chart_x(x[i]);
+        let yi = state.chart_y(y[i]);
+        if !xi.is_finite() || !yi.is_finite() {
+            continue;
+        }
         let bl = [xi - hw, yi - hh, 0.0_f32];
         let br = [xi + hw, yi - hh, 0.0_f32];
         let tr = [xi + hw, yi + hh, 0.0_f32];
         let tl = [xi - hw, yi + hh, 0.0_f32];
-        out.push(MeshVertex { position: bl, color: rgba });
-        out.push(MeshVertex { position: br, color: rgba });
-        out.push(MeshVertex { position: tr, color: rgba });
-        out.push(MeshVertex { position: bl, color: rgba });
-        out.push(MeshVertex { position: tr, color: rgba });
-        out.push(MeshVertex { position: tl, color: rgba });
+        out.push(MeshVertex {
+            position: bl,
+            color: rgba,
+        });
+        out.push(MeshVertex {
+            position: br,
+            color: rgba,
+        });
+        out.push(MeshVertex {
+            position: tr,
+            color: rgba,
+        });
+        out.push(MeshVertex {
+            position: bl,
+            color: rgba,
+        });
+        out.push(MeshVertex {
+            position: tr,
+            color: rgba,
+        });
+        out.push(MeshVertex {
+            position: tl,
+            color: rgba,
+        });
     }
     out
 }
@@ -4292,16 +5167,22 @@ fn xy_to_thick_line_vertices(
     width: u32,
     height: u32,
 ) -> Vec<MeshVertex> {
-    let Some(state) = state else { return vec![]; };
+    let Some(state) = state else {
+        return vec![];
+    };
     let n = x.len().min(y.len());
     if n < 2 || !line_width.is_finite() || line_width <= 0.0 {
         return vec![];
     }
 
     let px_per_x = (state.plot_right - state.plot_left) * width.max(1) as f32
-        / (state.effective_x1() - state.effective_x0()).abs().max(1e-10);
+        / (state.effective_x1() - state.effective_x0())
+            .abs()
+            .max(1e-10);
     let px_per_y = (state.plot_bottom - state.plot_top) * height.max(1) as f32
-        / (state.effective_y1() - state.effective_y0()).abs().max(1e-10);
+        / (state.effective_y1() - state.effective_y0())
+            .abs()
+            .max(1e-10);
     if px_per_x <= 0.0 || px_per_y <= 0.0 {
         return vec![];
     }
@@ -4314,7 +5195,10 @@ fn xy_to_thick_line_vertices(
             continue;
         }
         let p = Vec2::new(state.chart_x(xi), state.chart_y(yi));
-        if pts.last().is_some_and(|q| (*q - p).length_squared() < 1e-12) {
+        if pts
+            .last()
+            .is_some_and(|q| (*q - p).length_squared() < 1e-12)
+        {
             continue;
         }
         pts.push(p);
@@ -4363,7 +5247,10 @@ fn xy_to_thick_line_vertices(
 
     let mut out = Vec::with_capacity((pts.len() - 1) * 6);
     for i in 0..last {
-        let off0 = Vec2::new(offsets_screen[i].x / px_per_x, offsets_screen[i].y / px_per_y);
+        let off0 = Vec2::new(
+            offsets_screen[i].x / px_per_x,
+            offsets_screen[i].y / px_per_y,
+        );
         let off1 = Vec2::new(
             offsets_screen[i + 1].x / px_per_x,
             offsets_screen[i + 1].y / px_per_y,
@@ -4382,25 +5269,38 @@ fn xy_to_thick_line_vertices(
 
 /// Build NDC-space geometry for: 4-side frame, X/Y grid lines, and X/Y tick marks.
 fn build_chart2d_axis_verts(state: &Chart2DState, width: u32, height: u32) -> Vec<LineVertex> {
-    let (pl, pr, pt, pb) = (state.plot_left, state.plot_right, state.plot_top, state.plot_bottom);
+    let (pl, pr, pt, pb) = (
+        state.plot_left,
+        state.plot_right,
+        state.plot_top,
+        state.plot_bottom,
+    );
     let ndc_l = pl * 2.0 - 1.0;
     let ndc_r = pr * 2.0 - 1.0;
     let ndc_t = 1.0 - 2.0 * pt;
     let ndc_b = 1.0 - 2.0 * pb;
 
     let frame_col: [f32; 3] = [0.55, 0.55, 0.60];
-    let grid_col:  [f32; 3] = [0.18, 0.18, 0.22];
+    let grid_col: [f32; 3] = [0.18, 0.18, 0.22];
 
     let tick_y = 7.0 / height.max(1) as f32 * 2.0;
-    let tick_x = 7.0 / width.max(1)  as f32 * 2.0;
+    let tick_x = 7.0 / width.max(1) as f32 * 2.0;
 
-    let sx = state.scale_x(); let ox = state.offset_x();
-    let sy = state.scale_y(); let oy = state.offset_y();
+    let sx = state.scale_x();
+    let ox = state.offset_x();
+    let sy = state.scale_y();
+    let oy = state.offset_y();
 
     let mut v: Vec<LineVertex> = Vec::new();
     let mut seg = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| {
-        v.push(LineVertex { position: a, color: c });
-        v.push(LineVertex { position: b, color: c });
+        v.push(LineVertex {
+            position: a,
+            color: c,
+        });
+        v.push(LineVertex {
+            position: b,
+            color: c,
+        });
     };
 
     // Frame (4 edges)
@@ -4412,7 +5312,9 @@ fn build_chart2d_axis_verts(state: &Chart2DState, width: u32, height: u32) -> Ve
     // X grid lines + tick marks
     for &xt in &chart2d_x_ticks(state) {
         let nx = sx * state.chart_x(xt) + ox;
-        if nx < ndc_l - 0.002 || nx > ndc_r + 0.002 { continue; }
+        if nx < ndc_l - 0.002 || nx > ndc_r + 0.002 {
+            continue;
+        }
         seg([nx, ndc_b, 0.0], [nx, ndc_t, 0.0], grid_col);
         seg([nx, ndc_b, 0.0], [nx, ndc_b - tick_y, 0.0], frame_col);
     }
@@ -4420,9 +5322,11 @@ fn build_chart2d_axis_verts(state: &Chart2DState, width: u32, height: u32) -> Ve
     // Y tick marks + Y grid lines
     for &yt in &chart2d_y_ticks(state) {
         let ny = sy * state.chart_y(yt) + oy;
-        if ny < ndc_b - 0.002 || ny > ndc_t + 0.002 { continue; }
+        if ny < ndc_b - 0.002 || ny > ndc_t + 0.002 {
+            continue;
+        }
         seg([ndc_l, ny, 0.0], [ndc_l - tick_x, ny, 0.0], frame_col);
-        seg([ndc_l, ny, 0.0], [ndc_r,  ny, 0.0], grid_col);
+        seg([ndc_l, ny, 0.0], [ndc_r, ny, 0.0], grid_col);
     }
 
     v
@@ -4485,13 +5389,21 @@ fn line_vertex_bounds(verts: &[LineVertex]) -> (Vec3, Vec3) {
         bmin = bmin.min(p);
         bmax = bmax.max(p);
     }
-    if verts.is_empty() { (Vec3::ZERO, Vec3::ZERO) } else { (bmin, bmax) }
+    if verts.is_empty() {
+        (Vec3::ZERO, Vec3::ZERO)
+    } else {
+        (bmin, bmax)
+    }
 }
 
 fn make_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -4530,14 +5442,33 @@ fn build_point_pipeline(
                 array_stride: stride,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32   },
-                    wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x3 },
-                    wgpu::VertexAttribute { offset: 28, shader_location: 3, format: wgpu::VertexFormat::Float32   },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 12,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 16,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 28,
+                        shader_location: 3,
+                        format: wgpu::VertexFormat::Float32,
+                    },
                 ],
             }],
         },
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: true,
@@ -4559,6 +5490,82 @@ fn build_point_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+fn build_point_lod_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    wgsl: &str,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("points_lod_shader"),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("point_lod_bind_group_layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(std::mem::size_of::<PointInstance>() as u64),
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("point_lod_layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("point_lod_pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    (pipeline, bind_group_layout)
 }
 
 fn build_line_pipeline(
@@ -4589,16 +5596,31 @@ fn build_line_pipeline(
                 array_stride: stride,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 12,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
                 ],
             }],
         },
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            ..Default::default()
+        },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: false,
-            depth_compare: if depth_test { wgpu::CompareFunction::Less } else { wgpu::CompareFunction::Always },
+            depth_compare: if depth_test {
+                wgpu::CompareFunction::Less
+            } else {
+                wgpu::CompareFunction::Always
+            },
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -4638,7 +5660,11 @@ fn build_mesh_pipeline(
     });
     let stride = std::mem::size_of::<MeshVertex>() as u64;
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(if transparent { "mesh_transparent" } else { "mesh_opaque" }),
+        label: Some(if transparent {
+            "mesh_transparent"
+        } else {
+            "mesh_opaque"
+        }),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -4648,8 +5674,16 @@ fn build_mesh_pipeline(
                 array_stride: stride,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 12,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x4,
+                    },
                 ],
             }],
         },
@@ -4672,7 +5706,11 @@ fn build_mesh_pipeline(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: if transparent { Some(wgpu::BlendState::ALPHA_BLENDING) } else { None },
+                blend: if transparent {
+                    Some(wgpu::BlendState::ALPHA_BLENDING)
+                } else {
+                    None
+                },
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -4708,8 +5746,16 @@ fn build_chart2d_line_pipeline(
                 array_stride: stride,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 12,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x4,
+                    },
                 ],
             }],
         },
@@ -4773,17 +5819,41 @@ fn build_chart2d_thick_pipeline(
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
                     // pos_prev: float32x2  @ offset  0
-                    wgpu::VertexAttribute { offset:  0, shader_location: 0, format: wgpu::VertexFormat::Float32x2 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
                     // pos_curr: float32x2  @ offset  8
-                    wgpu::VertexAttribute { offset:  8, shader_location: 1, format: wgpu::VertexFormat::Float32x2 },
+                    wgpu::VertexAttribute {
+                        offset: 8,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
                     // pos_next: float32x2  @ offset 16
-                    wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Float32x2 },
+                    wgpu::VertexAttribute {
+                        offset: 16,
+                        shader_location: 2,
+                        format: wgpu::VertexFormat::Float32x2,
+                    },
                     // side:     float32    @ offset 24
-                    wgpu::VertexAttribute { offset: 24, shader_location: 3, format: wgpu::VertexFormat::Float32 },
+                    wgpu::VertexAttribute {
+                        offset: 24,
+                        shader_location: 3,
+                        format: wgpu::VertexFormat::Float32,
+                    },
                     // line_width: float32  @ offset 28
-                    wgpu::VertexAttribute { offset: 28, shader_location: 4, format: wgpu::VertexFormat::Float32 },
+                    wgpu::VertexAttribute {
+                        offset: 28,
+                        shader_location: 4,
+                        format: wgpu::VertexFormat::Float32,
+                    },
                     // color:    float32x4  @ offset 32
-                    wgpu::VertexAttribute { offset: 32, shader_location: 5, format: wgpu::VertexFormat::Float32x4 },
+                    wgpu::VertexAttribute {
+                        offset: 32,
+                        shader_location: 5,
+                        format: wgpu::VertexFormat::Float32x4,
+                    },
                 ],
             }],
         },
@@ -4828,7 +5898,9 @@ fn xy_to_gpu_thick_verts(
     line_width: f32,
     state: Option<&Chart2DState>,
 ) -> Vec<ThickLineVert> {
-    let Some(state) = state else { return vec![]; };
+    let Some(state) = state else {
+        return vec![];
+    };
     let n = x.len().min(y.len());
     if n < 2 || !line_width.is_finite() || line_width <= 0.0 {
         return vec![];
@@ -4838,17 +5910,25 @@ fn xy_to_gpu_thick_verts(
     // deduplicate coincident points, matching xy_to_thick_line_vertices exactly.
     let mut pts: Vec<[f32; 2]> = Vec::with_capacity(n);
     for i in 0..n {
-        let xi = x[i]; let yi = y[i];
-        if !xi.is_finite() || !yi.is_finite() { continue; }
+        let xi = x[i];
+        let yi = y[i];
+        if !xi.is_finite() || !yi.is_finite() {
+            continue;
+        }
         let p = [state.chart_x(xi), state.chart_y(yi)];
         if let Some(&last) = pts.last() {
-            let dx = p[0] - last[0]; let dy = p[1] - last[1];
-            if dx * dx + dy * dy < 1e-12 { continue; }
+            let dx = p[0] - last[0];
+            let dy = p[1] - last[1];
+            if dx * dx + dy * dy < 1e-12 {
+                continue;
+            }
         }
         pts.push(p);
     }
     let m = pts.len();
-    if m < 2 { return vec![]; }
+    if m < 2 {
+        return vec![];
+    }
 
     let rgba = [color[0], color[1], color[2], 1.0_f32];
     let mut out = Vec::with_capacity((m - 1) * 6);
@@ -4856,17 +5936,45 @@ fn xy_to_gpu_thick_verts(
     for i in 0..m - 1 {
         // For endpoint caps, duplicate the endpoint as prev/next so the shader
         // detects a zero-length segment and falls back to the single-direction normal.
-        let prev  = if i > 0      { pts[i - 1] } else { pts[i] };
-        let curr  = pts[i];
-        let next  = pts[i + 1];
-        let next2 = if i + 2 < m  { pts[i + 2] } else { pts[i + 1] };
+        let prev = if i > 0 { pts[i - 1] } else { pts[i] };
+        let curr = pts[i];
+        let next = pts[i + 1];
+        let next2 = if i + 2 < m { pts[i + 2] } else { pts[i + 1] };
 
         // Left (side = +1) and right (side = -1) at the current end of this segment.
-        let curr_l = ThickLineVert { pos_prev: prev,  pos_curr: curr, pos_next: next,  side:  1.0, line_width, color: rgba };
-        let curr_r = ThickLineVert { pos_prev: prev,  pos_curr: curr, pos_next: next,  side: -1.0, line_width, color: rgba };
+        let curr_l = ThickLineVert {
+            pos_prev: prev,
+            pos_curr: curr,
+            pos_next: next,
+            side: 1.0,
+            line_width,
+            color: rgba,
+        };
+        let curr_r = ThickLineVert {
+            pos_prev: prev,
+            pos_curr: curr,
+            pos_next: next,
+            side: -1.0,
+            line_width,
+            color: rgba,
+        };
         // Left and right at the far end of this segment.
-        let next_l = ThickLineVert { pos_prev: curr,  pos_curr: next, pos_next: next2, side:  1.0, line_width, color: rgba };
-        let next_r = ThickLineVert { pos_prev: curr,  pos_curr: next, pos_next: next2, side: -1.0, line_width, color: rgba };
+        let next_l = ThickLineVert {
+            pos_prev: curr,
+            pos_curr: next,
+            pos_next: next2,
+            side: 1.0,
+            line_width,
+            color: rgba,
+        };
+        let next_r = ThickLineVert {
+            pos_prev: curr,
+            pos_curr: next,
+            pos_next: next2,
+            side: -1.0,
+            line_width,
+            color: rgba,
+        };
 
         // Triangle 1: curr_L, curr_R, next_L
         out.push(curr_l);
@@ -4907,8 +6015,16 @@ fn build_wireframe_pipeline(
                 array_stride: stride,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &[
-                    wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
-                    wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                    wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
+                    },
+                    wgpu::VertexAttribute {
+                        offset: 12,
+                        shader_location: 1,
+                        format: wgpu::VertexFormat::Float32x4,
+                    },
                 ],
             }],
         },
@@ -4952,12 +6068,18 @@ fn draw_mesh_actors<'a>(
     pass: &mut wgpu::RenderPass<'a>,
 ) {
     // 1. Wireframe actors — alpha-blended, back-to-front sorted
-    let mut wire_idx: Vec<(usize, f32)> = mesh_actors.iter().enumerate()
+    let mut wire_idx: Vec<(usize, f32)> = mesh_actors
+        .iter()
+        .enumerate()
         .filter(|(_, ma)| ma.visible && ma.wireframe && ma.index_count > 0)
         .map(|(i, ma)| {
             let c = (ma.data_min + ma.data_max) * 0.5;
             let clip = view_proj * glam::Vec4::new(c.x, c.y, c.z, 1.0);
-            let depth = if clip.w.abs() > 1e-7 { clip.z / clip.w } else { 0.0 };
+            let depth = if clip.w.abs() > 1e-7 {
+                clip.z / clip.w
+            } else {
+                0.0
+            };
             (i, depth)
         })
         .collect();
@@ -4977,10 +6099,16 @@ fn draw_mesh_actors<'a>(
     let mut opaque_idx: Vec<usize> = Vec::new();
     let mut transp_idx: Vec<(usize, f32)> = Vec::new();
     for (i, ma) in mesh_actors.iter().enumerate() {
-        if !ma.visible || ma.wireframe || ma.index_count == 0 { continue; }
+        if !ma.visible || ma.wireframe || ma.index_count == 0 {
+            continue;
+        }
         let c = (ma.data_min + ma.data_max) * 0.5;
         let clip = view_proj * glam::Vec4::new(c.x, c.y, c.z, 1.0);
-        let depth = if clip.w.abs() > 1e-7 { clip.z / clip.w } else { 0.0 };
+        let depth = if clip.w.abs() > 1e-7 {
+            clip.z / clip.w
+        } else {
+            0.0
+        };
         if ma.color[3] >= 1.0 {
             opaque_idx.push(i);
         } else {
@@ -5024,7 +6152,11 @@ fn mesh_bounds(vertices: &[[f32; 3]]) -> (Vec3, Vec3) {
         bmin = bmin.min(v);
         bmax = bmax.max(v);
     }
-    if bmin.x > bmax.x { (Vec3::ZERO, Vec3::ZERO) } else { (bmin, bmax) }
+    if bmin.x > bmax.x {
+        (Vec3::ZERO, Vec3::ZERO)
+    } else {
+        (bmin, bmax)
+    }
 }
 
 fn triangles_to_wireframe_indices(indices: &[[u32; 3]]) -> Vec<u32> {
@@ -5043,7 +6175,9 @@ mod tests {
 
     /// Identity VP on a 200×200 screen:
     ///   world [x, y, z] → screen [(x+1)*100, (1-y)*100]
-    fn unit_vp() -> glam::Mat4 { glam::Mat4::IDENTITY }
+    fn unit_vp() -> glam::Mat4 {
+        glam::Mat4::IDENTITY
+    }
     const W: f32 = 200.0;
     const H: f32 = 200.0;
 
@@ -5061,7 +6195,7 @@ mod tests {
         let cols = ((W / GRID_CELL_PX).ceil() as u32).max(1);
         let cell = (6 * cols + 6) as usize;
         let start = c.cell_start[cell] as usize;
-        let end   = c.cell_start[cell + 1] as usize;
+        let end = c.cell_start[cell + 1] as usize;
         assert_eq!(end - start, 1);
         assert_eq!(c.sorted_pts[start], 0);
     }
@@ -5070,10 +6204,10 @@ mod tests {
     fn for_each_finds_all_points_in_full_rect() {
         // Four points at screen-space corners (NDC ±0.9 → screen 10/190)
         let pos = vec![
-            [-0.9_f32,  0.9, 0.0],  // screen (10, 10)
-            [ 0.9_f32,  0.9, 0.0],  // screen (190, 10)
-            [-0.9_f32, -0.9, 0.0],  // screen (10, 190)
-            [ 0.9_f32, -0.9, 0.0],  // screen (190, 190)
+            [-0.9_f32, 0.9, 0.0],  // screen (10, 10)
+            [0.9_f32, 0.9, 0.0],   // screen (190, 10)
+            [-0.9_f32, -0.9, 0.0], // screen (10, 190)
+            [0.9_f32, -0.9, 0.0],  // screen (190, 190)
         ];
         let c = build(&pos);
         let mut all = Vec::new();
@@ -5085,14 +6219,20 @@ mod tests {
     #[test]
     fn for_each_restricts_to_quadrant() {
         let pos = vec![
-            [-0.9_f32,  0.9, 0.0],  // screen (10, 10)   — top-left
-            [ 0.9_f32, -0.9, 0.0],  // screen (190, 190) — bottom-right
+            [-0.9_f32, 0.9, 0.0], // screen (10, 10)   — top-left
+            [0.9_f32, -0.9, 0.0], // screen (190, 190) — bottom-right
         ];
         let c = build(&pos);
         let mut tl = Vec::new();
         c.for_each_in_rect(0.0, 0.0, 100.0, 100.0, |i, _| tl.push(i));
-        assert!(tl.contains(&0), "top-left point must be in top-left quadrant");
-        assert!(!tl.contains(&1), "bottom-right point must NOT be in top-left quadrant");
+        assert!(
+            tl.contains(&0),
+            "top-left point must be in top-left quadrant"
+        );
+        assert!(
+            !tl.contains(&1),
+            "bottom-right point must NOT be in top-left quadrant"
+        );
     }
 
     #[test]
@@ -5127,9 +6267,8 @@ mod tests {
         // Invert screen projection to find world coords (identity VP, 200×200).
         //   screen_x = (wx + 1) * W/2  →  wx = screen_x / (W/2) - 1
         //   screen_y = (1 - wy) * H/2  →  wy = 1 - screen_y / (H/2)
-        let world = |sx: f32, sy: f32| -> [f32; 3] {
-            [sx / (W * 0.5) - 1.0, 1.0 - sy / (H * 0.5), 0.0]
-        };
+        let world =
+            |sx: f32, sy: f32| -> [f32; 3] { [sx / (W * 0.5) - 1.0, 1.0 - sy / (H * 0.5), 0.0] };
 
         // A at screen (47, 47); B at screen (49, 0).
         let screen_a = (47.0_f32, 47.0_f32);
@@ -5138,18 +6277,30 @@ mod tests {
         let c = build(&pos);
 
         let [ax, ay] = c.screen_xy[0].expect("A must project on-screen");
-        assert!((ax - screen_a.0).abs() < 0.01 && (ay - screen_a.1).abs() < 0.01,
-            "A projects to ({ax},{ay}), expected {:?}", screen_a);
+        assert!(
+            (ax - screen_a.0).abs() < 0.01 && (ay - screen_a.1).abs() < 0.01,
+            "A projects to ({ax},{ay}), expected {:?}",
+            screen_a
+        );
 
         let [bx, by] = c.screen_xy[1].expect("B must project on-screen");
-        assert!((bx - screen_b.0).abs() < 0.01 && (by - screen_b.1).abs() < 0.01,
-            "B projects to ({bx},{by}), expected {:?}", screen_b);
+        assert!(
+            (bx - screen_b.0).abs() < 0.01 && (by - screen_b.1).abs() < 0.01,
+            "B projects to ({bx},{by}), expected {:?}",
+            screen_b
+        );
 
         // Local search around cursor (0,0): A found (cell 2), B not (cell 3).
         let mut local: Vec<u32> = Vec::new();
         c.for_each_in_rect(-R, -R, R, R, |i, _| local.push(i));
-        assert!(local.contains(&0), "A (cell 2) must be in the local search range");
-        assert!(!local.contains(&1), "B (cell 3) must be outside the local search range");
+        assert!(
+            local.contains(&0),
+            "A (cell 2) must be in the local search range"
+        );
+        assert!(
+            !local.contains(&1),
+            "B (cell 3) must be outside the local search range"
+        );
 
         // Distances from cursor (0, 0):
         let dist_a_sq = screen_a.0.powi(2) + screen_a.1.powi(2); // 47²+47² ≈ 4418
@@ -5159,8 +6310,11 @@ mod tests {
 
         // The correct fallback trigger: A's squared distance exceeds R².
         // When this holds, a closer point outside the local band (B) may exist.
-        assert!(dist_a_sq > R * R,
-            "A's dist² ({dist_a_sq}) must exceed R² ({}) so the fallback fires", R * R);
+        assert!(
+            dist_a_sq > R * R,
+            "A's dist² ({dist_a_sq}) must exceed R² ({}) so the fallback fires",
+            R * R
+        );
     }
 
     #[test]
@@ -5217,7 +6371,9 @@ mod tests {
         let y_span = verts
             .iter()
             .map(|v| v.position[1])
-            .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| (mn.min(yv), mx.max(yv)));
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| {
+                (mn.min(yv), mx.max(yv))
+            });
         assert!(y_span.1 > y_span.0);
     }
 
@@ -5254,7 +6410,9 @@ mod tests {
             let (mn, mx) = verts
                 .iter()
                 .map(|v| v.position[1])
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| (mn.min(yv), mx.max(yv)));
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| {
+                    (mn.min(yv), mx.max(yv))
+                });
             mx - mn
         };
         assert!(span(&wide) > span(&narrow));
@@ -5313,7 +6471,9 @@ mod tests {
             let (mn, mx) = verts
                 .iter()
                 .map(|v| v.position[1])
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| (mn.min(yv), mx.max(yv)));
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), yv| {
+                    (mn.min(yv), mx.max(yv))
+                });
             mx - mn
         };
         assert!(span(&line1) > span(&line0));

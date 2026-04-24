@@ -1,5 +1,7 @@
 // Colormaps defined by control points (r, g, b) in [0,1].
 // Linear interpolation between adjacent points.
+// Clippy mistakes several sampled colormap values for known math constants.
+#![allow(clippy::approx_constant)]
 
 /// Resolve the control-point table for `name` once, then call `sample` in a loop.
 pub fn resolve(name: &str) -> &'static [[f32; 3]] {
@@ -25,18 +27,18 @@ pub fn sample(cpts: &[[f32; 3]], t: f32) -> [f32; 3] {
 
 fn control_points(name: &str) -> &'static [[f32; 3]] {
     match name {
-        "plasma"   => &PLASMA,
-        "inferno"  => &INFERNO,
-        "magma"    => &MAGMA,
+        "plasma" => &PLASMA,
+        "inferno" => &INFERNO,
+        "magma" => &MAGMA,
         "coolwarm" => &COOLWARM,
-        "hot"      => &HOT,
+        "hot" => &HOT,
         "gray" | "grey" => &GRAY,
-        "turbo"    => &TURBO,
-        "cividis"  => &CIVIDIS,
-        "blues"    => &BLUES,
-        "greens"   => &GREENS,
-        "reds"     => &REDS,
-        _          => &VIRIDIS,
+        "turbo" => &TURBO,
+        "cividis" => &CIVIDIS,
+        "blues" => &BLUES,
+        "greens" => &GREENS,
+        "reds" => &REDS,
+        _ => &VIRIDIS,
     }
 }
 
@@ -166,6 +168,6 @@ static REDS: [[f32; 3]; 5] = [
 ];
 
 pub const COLORMAP_NAMES: &[&str] = &[
-    "viridis", "plasma", "inferno", "magma", "coolwarm", "hot", "gray",
-    "turbo", "cividis", "blues", "greens", "reds",
+    "viridis", "plasma", "inferno", "magma", "coolwarm", "hot", "gray", "turbo", "cividis",
+    "blues", "greens", "reds",
 ];

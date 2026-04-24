@@ -1605,6 +1605,33 @@ def test_line2d_stream_line_keeps_width_after_wrap(line2d):
     assert renderer.chart2d_update_line.call_args.args[4] == 2.5
 
 
+def test_line2d_add_line_stream_invalid_mode_raises(line2d):
+    with pytest.raises(ValueError, match="mode must be 'ring' or 'append'"):
+        line2d.add_line_stream(max_points=3, mode="typo")
+
+
+def test_line2d_ring_stream_keeps_latest_large_batch(line2d):
+    handle = line2d.add_line_stream(max_points=3, mode="ring")
+    line2d.stream_line(
+        handle,
+        np.arange(10, dtype=np.float32),
+        np.arange(10, dtype=np.float32) * 10.0,
+    )
+
+    xs, ys = line2d._stream_ordered(line2d._line_streams[handle])
+    np.testing.assert_allclose(xs, [7.0, 8.0, 9.0])
+    np.testing.assert_allclose(ys, [70.0, 80.0, 90.0])
+    assert line2d._current_data_bounds() == (7.0, 9.0, 70.0, 90.0)
+
+
+def test_line2d_ring_stream_bounds_contract_after_overwrite(line2d):
+    handle = line2d.add_line_stream(max_points=3, mode="ring")
+    line2d.stream_line(handle, [0.0, 1.0, 2.0], [10.0, 20.0, 30.0])
+    line2d.stream_line(handle, [3.0], [40.0])
+
+    assert line2d._current_data_bounds() == (1.0, 3.0, 20.0, 40.0)
+
+
 def test_line2d_invalid_width_raises(line2d):
     with pytest.raises(ValueError, match="positive finite"):
         line2d.set_line([0.0, 1.0], [0.0, 1.0], line_width=0.0)
@@ -1706,9 +1733,8 @@ def test_line2d_set_y_tick_interval_passes_override(line2d):
     assert renderer.set_chart2d.call_args.args[10] == 0.5
 
 
-def test_line2d_set_line_with_frozen_x_uses_y_fast_path(line2d):
-    """When x is frozen but y is auto, set_line must update only y via the
-    chart2d_update_ylim fast path."""
+def test_line2d_set_line_with_frozen_x_rebuilds_static_autoy(line2d):
+    """Static auto-y refits must rebuild the chart so tick spacing is recomputed."""
     import unittest.mock as mock
     import numpy as np
 
@@ -1727,12 +1753,34 @@ def test_line2d_set_line_with_frozen_x_uses_y_fast_path(line2d):
     line2d.set_line(x, y)
 
     renderer.chart2d_update_xlim.assert_not_called()
+    renderer.chart2d_update_ylim.assert_not_called()
+    renderer.set_chart2d.assert_called_once()
+    args = renderer.set_chart2d.call_args.args
+    assert args[6] <= float(y.min())
+    assert args[7] >= float(y.max())
+    assert line2d._xlim == (0.0, 10.0)
+
+
+def test_line2d_stream_with_frozen_x_keeps_y_fast_path(line2d):
+    """Streaming auto-y still uses the cheap y-limit update path."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._x_limits_frozen = True
+    line2d._y_limits_frozen = False
+    line2d._sync_limit_freeze()
+
+    handle = line2d.add_line_stream(max_points=16, mode="ring")
+    line2d.stream_line(handle, [1.0, 2.0, 3.0], [-3.0, 1.0, 4.0])
+
+    renderer.chart2d_update_xlim.assert_not_called()
     renderer.set_chart2d.assert_not_called()
     renderer.chart2d_update_ylim.assert_called_once()
-    lo, hi = renderer.chart2d_update_ylim.call_args.args
-    assert lo <= float(y.min())
-    assert hi >= float(y.max())
-    assert line2d._xlim == (0.0, 10.0)
 
 
 def test_line2d_resize_resets_fast_path_gate(line2d):
@@ -1877,6 +1925,68 @@ def test_line2d_toolbar_frame_exists(line2d):
     import tkinter as _tk
     assert hasattr(line2d, "_toolbar_frame")
     assert isinstance(line2d._toolbar_frame, _tk.Frame)
+
+
+def _line2d_toolbar_button(line2d, label):
+    import tkinter as _tk
+
+    for child in line2d._toolbar_frame.winfo_children():
+        if isinstance(child, _tk.Button) and label in child.cget("text"):
+            return child
+    raise AssertionError(f"toolbar button containing {label!r} not found")
+
+
+def test_line2d_toolbar_home_static_plot_rebuilds_chart(line2d):
+    """The Home toolbar button must refit a stationary plot and do a full chart rebuild."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    line2d.set_line([0.0, 10.0], [-2.0, 3.0])
+    line2d.set_xlim(4.0, 5.0)
+    line2d.set_ylim(-0.5, 0.5)
+    renderer.reset_mock()
+
+    _line2d_toolbar_button(line2d, "Home").invoke()
+
+    assert line2d._xlim[0] <= 0.0
+    assert line2d._xlim[1] >= 10.0
+    assert line2d._ylim[0] <= -2.0
+    assert line2d._ylim[1] >= 3.0
+    assert not line2d._x_limits_frozen
+    assert not line2d._y_limits_frozen
+    renderer.set_chart2d.assert_called_once()
+    renderer.chart2d_update_xlim.assert_not_called()
+    renderer.chart2d_update_ylim.assert_not_called()
+
+
+def test_line2d_toolbar_autoscale_y_static_plot_rebuilds_chart(line2d):
+    """The Autoscale Y toolbar button must fit Y while leaving X frozen."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    line2d.set_line([0.0, 10.0], [-8.0, 12.0])
+    line2d.set_xlim(2.0, 4.0)
+    line2d.set_ylim(-1.0, 1.0)
+    renderer.reset_mock()
+
+    _line2d_toolbar_button(line2d, "Autoscale Y").invoke()
+
+    assert line2d._xlim == (2.0, 4.0)
+    assert line2d._x_limits_frozen
+    assert not line2d._y_limits_frozen
+    assert line2d._ylim[0] <= -8.0
+    assert line2d._ylim[1] >= 12.0
+    renderer.set_chart2d.assert_called_once()
+    renderer.chart2d_update_xlim.assert_not_called()
+    renderer.chart2d_update_ylim.assert_not_called()
 
 
 def test_line2d_render_frame_is_render_target(line2d):

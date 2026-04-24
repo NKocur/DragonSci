@@ -25,6 +25,7 @@ venv/
 
 # Test and CI caches
 .pytest_cache/
+.pytest_cache_local/
 .test-cache/
 .coverage
 htmlcov/

@@ -1,5 +1,23 @@
 @echo off
-set "PATH=C:\msys64\mingw64\bin;C:\msys64\usr\bin;%PATH%"
+setlocal
+
 cd /d "%~dp0"
-C:\msys64\usr\bin\bash.exe run.sh
-if errorlevel 1 ( echo. & echo Launch failed. & pause )
+
+if not exist ".venv\Scripts\python.exe" (
+    echo Virtual environment not found.
+    echo Run start.bat first to create it and build dragonsci.
+    echo.
+    pause
+    exit /b 1
+)
+
+call ".venv\Scripts\activate.bat"
+python demo.py
+if errorlevel 1 (
+    echo.
+    echo Launch failed.
+    pause
+    exit /b 1
+)
+
+endlocal

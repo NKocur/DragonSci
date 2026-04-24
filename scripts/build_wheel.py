@@ -24,7 +24,7 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON_PKG = os.path.join(REPO_ROOT, "python", "dragonsci")
 
-DEV_ARTIFACT_PATTERNS = ["*.pyd", "*.so", "*.dylib"]
+DEV_ARTIFACT_PATTERNS = ["*.pyd", "*.so", "*.dylib", "*.pdb"]
 
 
 def remove_dev_artifacts() -> list[str]:
@@ -48,10 +48,14 @@ def main() -> int:
         for r in removed:
             print(f"  {r}")
 
-    cmd = ["maturin", "build"]
+    maturin_args = args.maturin_args
+    if maturin_args and maturin_args[0] == "--":
+        maturin_args = maturin_args[1:]
+
+    cmd = [sys.executable, "-m", "maturin", "build"]
     if args.release:
         cmd.append("--release")
-    cmd.extend(args.maturin_args)
+    cmd.extend(maturin_args)
 
     env = os.environ.copy()
     env.setdefault("PYO3_PYTHON", sys.executable)

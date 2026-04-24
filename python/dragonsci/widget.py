@@ -1367,6 +1367,10 @@ class Scatter3D(tk.Frame):
         _handle = self._renderer.set_points(pos, clr, scl, colormap, float(point_size),
                                              sizes, clim_arr, nan_arr,
                                              bool(log_scale), float(opacity))
+        if _handle is None:
+            self._total_n = 0
+            self._mark_dirty()
+            return
         self._set_scene_metadata(meta, actor_handle=_handle)
         self._actor_n[int(_handle)] = n
         self._total_n = n
@@ -1529,6 +1533,8 @@ class Scatter3D(tk.Frame):
         int
             Handle for use with :meth:`stream` and :meth:`clear_stream`.
         """
+        if mode not in ("ring", "append"):
+            raise ValueError(f"mode must be 'ring' or 'append', got {mode!r}")
         mode_int = 0 if mode == "append" else 1
 
         pos: "np.ndarray | None" = None
@@ -3992,16 +3998,15 @@ class Line2D(Scatter3D):
             if len(x) > 0:
                 xmins.append(float(x.min())); xmaxs.append(float(x.max()))
                 ymins.append(float(y.min())); ymaxs.append(float(y.max()))
-        # Live stream buffers — always re-scan so scrolled-off data is excluded.
+        # Stream bounds: use per-stream cache (O(num_streams), not O(total_points)).
         for st in self._line_streams.values():
-            cnt = st["count"]
-            if cnt < 1:
+            if st["count"] < 1:
                 continue
-            xs, ys = self._stream_ordered(st)
-            if xs is None:
-                xs, ys = st["buf_x"][:cnt], st["buf_y"][:cnt]
-            xmins.append(float(xs.min())); xmaxs.append(float(xs.max()))
-            ymins.append(float(ys.min())); ymaxs.append(float(ys.max()))
+            self._ensure_stream_bounds(st)
+            if st["bnd_x_min"] is None:
+                continue
+            xmins.append(st["bnd_x_min"]); xmaxs.append(st["bnd_x_max"])
+            ymins.append(st["bnd_y_min"]); ymaxs.append(st["bnd_y_max"])
         if not xmins:
             return None
         return min(xmins), max(xmaxs), min(ymins), max(ymaxs)
@@ -4033,10 +4038,18 @@ class Line2D(Scatter3D):
         if xmins:
             self._data_xmin = min(xmins); self._data_xmax = max(xmaxs)
             self._data_ymin = min(ymins); self._data_ymax = max(ymaxs)
+            changed = False
             if not self._x_limits_frozen:
-                self._apply_xlim(*_nice_bounds_1d(self._data_xmin, self._data_xmax), freeze=False)
+                self._xlim = _nice_bounds_1d(self._data_xmin, self._data_xmax)
+                changed = True
             if not self._y_limits_frozen:
-                self._apply_ylim(*_nice_bounds_1d(self._data_ymin, self._data_ymax), freeze=False)
+                self._ylim = _nice_bounds_1d(self._data_ymin, self._data_ymax)
+                changed = True
+            self._sync_limit_freeze()
+            if changed:
+                # Static refits are infrequent and must recompute tick intervals.
+                # The x/y fast paths intentionally preserve tick spacing for live streams.
+                self._push_chart2d()
         else:
             # All static data removed; reset accumulator but leave limits alone.
             self._data_xmin = self._data_xmax = None
@@ -4077,11 +4090,14 @@ class Line2D(Scatter3D):
         if bounds is None:
             return
         xmin, xmax, ymin, ymax = bounds
+        self._data_xmin = xmin; self._data_xmax = xmax
+        self._data_ymin = ymin; self._data_ymax = ymax
         self._x_limits_frozen = False
         self._y_limits_frozen = False
+        self._xlim = _nice_bounds_1d(xmin, xmax)
+        self._ylim = _nice_bounds_1d(ymin, ymax)
         self._sync_limit_freeze()
-        self._apply_xlim(*_nice_bounds_1d(xmin, xmax), freeze=False)
-        self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
+        self._push_chart2d()
 
     def autoscale_y(self) -> None:
         """Unfreeze Y and fit it to currently-buffered data."""
@@ -4089,9 +4105,11 @@ class Line2D(Scatter3D):
         if bounds is None:
             return
         _, _, ymin, ymax = bounds
+        self._data_ymin = ymin; self._data_ymax = ymax
         self._y_limits_frozen = False
+        self._ylim = _nice_bounds_1d(ymin, ymax)
         self._sync_limit_freeze()
-        self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
+        self._push_chart2d()
 
     def autoscale_both(self) -> None:
         """Alias for :meth:`home` — unfreeze both axes and fit to data."""
@@ -4556,7 +4574,7 @@ class Line2D(Scatter3D):
         if len(x) != len(y):
             raise ValueError(
                 f"x and y must have equal length, got {len(x)} vs {len(y)}")
-        if self._renderer is None and handle in self._pending_named_lines:
+        if handle in self._pending_named_lines:
             _old_x, _old_y, old_color, old_width, old_label, old_vis = \
                 self._pending_named_lines[handle]
             c = color if color is not None else old_color
@@ -4573,7 +4591,9 @@ class Line2D(Scatter3D):
             return
 
         real = self._resolve_line_handle(handle)
-        meta = self._named_lines.get(real, {})
+        if real not in self._named_lines:
+            raise KeyError(f"No line with handle {handle!r}")
+        meta = self._named_lines[real]
         c = color if color is not None else meta.get("color", (0.3, 0.7, 1.0))
         lw = (
             _normalize_line2d_width(line_width)
@@ -4582,16 +4602,10 @@ class Line2D(Scatter3D):
         )
         if self._renderer is not None:
             self._renderer.chart2d_update_line(real, x, y, c, lw)
-        # Upsert into _named_lines so geometry is always available for bounds recomputation.
-        if real not in self._named_lines:
-            self._named_lines[real] = {"color": c, "line_width": lw,
-                                       "label": None, "visible": True,
-                                       "x": x.copy(), "y": y.copy()}
-        else:
-            self._named_lines[real]["color"] = c
-            self._named_lines[real]["line_width"] = lw
-            self._named_lines[real]["x"] = x.copy()
-            self._named_lines[real]["y"] = y.copy()
+        meta["color"] = c
+        meta["line_width"] = lw
+        meta["x"] = x.copy()
+        meta["y"] = y.copy()
         if label is not None:
             new_label = str(label)
             self._named_lines[real]["label"] = new_label
@@ -4768,6 +4782,8 @@ class Line2D(Scatter3D):
         ----------
         scale : ``"linear"`` | ``"log"``
         """
+        if scale not in ("linear", "log"):
+            raise ValueError(f"scale must be 'linear' or 'log', got {scale!r}")
         enabled = scale == "log"
         self._x_log_scale = enabled
         if self._renderer is not None:
@@ -4781,6 +4797,8 @@ class Line2D(Scatter3D):
         ----------
         scale : ``"linear"`` | ``"log"``
         """
+        if scale not in ("linear", "log"):
+            raise ValueError(f"scale must be 'linear' or 'log', got {scale!r}")
         enabled = scale == "log"
         self._y_log_scale = enabled
         if self._renderer is not None:
@@ -4819,6 +4837,8 @@ class Line2D(Scatter3D):
         """
         if max_points < 2:
             raise ValueError("max_points must be >= 2")
+        if mode not in ("ring", "append"):
+            raise ValueError(f"mode must be 'ring' or 'append', got {mode!r}")
         line_width = _normalize_line2d_width(line_width)
         sid = self._next_stream
         self._next_stream += 1
@@ -4837,6 +4857,12 @@ class Line2D(Scatter3D):
             "line_width":   line_width,
             "label":        str(label) if label is not None else None,
             "render_handle": None,  # chart2d line handle, created on first upload
+            # Cached bounds so _current_data_bounds is O(num_streams) not O(total_points).
+            "bnd_x_min":    None,
+            "bnd_x_max":    None,
+            "bnd_y_min":    None,
+            "bnd_y_max":    None,
+            "bnd_dirty":    False,  # True when a ring-wrap may have removed the previous extremes
         }
         if self._legend_visible and label is not None:
             self._push_legend()
@@ -4865,6 +4891,7 @@ class Line2D(Scatter3D):
             return
 
         buf_x, buf_y, max_pts = st["buf_x"], st["buf_y"], st["max_pts"]
+        evicted = False
         if st["mode"] == "append":
             remaining = max_pts - st["count"]
             if remaining <= 0:
@@ -4874,7 +4901,13 @@ class Line2D(Scatter3D):
             buf_x[s:s + n] = x[:n]; buf_y[s:s + n] = y[:n]
             st["count"] += n
         else:  # ring
+            if n > max_pts:
+                x = x[-max_pts:]
+                y = y[-max_pts:]
+                n = max_pts
             head  = st["head"]
+            old_count = st["count"]
+            evicted = old_count == max_pts or old_count + n > max_pts
             space = max_pts - head
             if n <= space:
                 buf_x[head:head + n] = x; buf_y[head:head + n] = y
@@ -4886,6 +4919,23 @@ class Line2D(Scatter3D):
                 buf_y[:overflow] = y[space:space + overflow]
                 st["head"] = overflow
             st["count"] = min(st["count"] + n, max_pts)
+
+        # Maintain per-stream cached bounds so _current_data_bounds is O(num_streams).
+        if evicted:
+            # Old extremes may have been evicted; rescan this buffer only.
+            st["bnd_dirty"] = True
+        else:
+            nx = x[:n]; ny = y[:n]
+            xmn = float(nx.min()); xmx = float(nx.max())
+            ymn = float(ny.min()); ymx = float(ny.max())
+            if st["bnd_x_min"] is None:
+                st["bnd_x_min"] = xmn; st["bnd_x_max"] = xmx
+                st["bnd_y_min"] = ymn; st["bnd_y_max"] = ymx
+            else:
+                if xmn < st["bnd_x_min"]: st["bnd_x_min"] = xmn
+                if xmx > st["bnd_x_max"]: st["bnd_x_max"] = xmx
+                if ymn < st["bnd_y_min"]: st["bnd_y_min"] = ymn
+                if ymx > st["bnd_y_max"]: st["bnd_y_max"] = ymx
 
         cnt = st["count"]
         if cnt < 2:
@@ -4910,6 +4960,21 @@ class Line2D(Scatter3D):
                 st["render_handle"], xs, ys, st["color"], st["line_width"]
             )
         self._mark_dirty()
+
+    def _ensure_stream_bounds(self, st: dict) -> None:
+        """Rescan a stream's buffer to refresh cached bounds (called only after a ring-wrap)."""
+        if not st.get("bnd_dirty", False):
+            return
+        cnt = st["count"]
+        if cnt == 0:
+            st["bnd_x_min"] = st["bnd_x_max"] = None
+            st["bnd_y_min"] = st["bnd_y_max"] = None
+        else:
+            xs = st["buf_x"][:cnt]
+            ys = st["buf_y"][:cnt]
+            st["bnd_x_min"] = float(xs.min()); st["bnd_x_max"] = float(xs.max())
+            st["bnd_y_min"] = float(ys.min()); st["bnd_y_max"] = float(ys.max())
+        st["bnd_dirty"] = False
 
     def _stream_ordered(self, st: dict):
         """Return (x_ordered, y_ordered) arrays oldest-to-newest, or (None, None).
@@ -4939,6 +5004,9 @@ class Line2D(Scatter3D):
         if st is None:
             raise KeyError(f"No line stream with handle {handle!r}")
         st["count"] = 0; st["head"] = 0
+        st["bnd_x_min"] = st["bnd_x_max"] = None
+        st["bnd_y_min"] = st["bnd_y_max"] = None
+        st["bnd_dirty"] = False
         if st["render_handle"] is not None and self._renderer is not None:
             empty = np.array([], dtype=np.float32)
             self._renderer.chart2d_update_line(

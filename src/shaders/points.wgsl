@@ -3,7 +3,7 @@ struct Uniforms {
     screen_size: vec2<f32>,
     // style: 0 = circle (soft), 1 = square, 2 = gaussian
     style: u32,
-    _pad: f32,
+    lod_factor: u32,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;

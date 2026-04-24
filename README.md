@@ -1,7 +1,7 @@
 # dragonsci
 
 <p align="center">
-  <img src="dragonscilogo.png" alt="DragonSci logo" width="320"/>
+  <img src="https://raw.githubusercontent.com/nashkocur/dragonsci/master/dragonscilogo.png" alt="DragonSci logo" width="320"/>
 </p>
 
 GPU-accelerated scientific visualization for Python, written in Rust.
@@ -25,9 +25,8 @@ pip install "dragonsci[notebook]"
 
 The `[notebook]` extra adds `jupyter_rfb`, `ipywidgets`, and `Pillow`.
 
-Pre-built wheels will be published to PyPI for Python 3.9–3.12 on Windows,
-macOS, and Linux once a CI release pipeline is in place. Until then, install
-from source (see **Building from source** below).
+The release workflow builds pre-built wheels for Python 3.9–3.12 on Windows,
+macOS, and Linux, plus a source distribution for source installs.
 
 ## GitHub release publishing
 
@@ -315,7 +314,7 @@ the in-place extension collides with the freshly-compiled one:
 ```bash
 python scripts/build_wheel.py           # produces target/wheels/*.whl
 # or equivalently:
-rm -f python/dragonsci/_dragonsci*.{pyd,so,dylib}
+rm -f python/dragonsci/_dragonsci*.{pyd,so,dylib,pdb}
 maturin build --release
 ```
 

@@ -57,7 +57,11 @@ impl Camera {
     pub fn view_matrix(&self) -> Mat4 {
         // For exactly top/front/side views the default up=Y can be degenerate.
         // Pick Z as up when looking straight down/up.
-        let up = if self.pitch.abs() > 1.5 { Vec3::Z } else { Vec3::Y };
+        let up = if self.pitch.abs() > 1.5 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
         Mat4::look_at_rh(self.position(), self.target, up)
     }
 
@@ -94,10 +98,10 @@ impl Camera {
     pub fn pan(&mut self, delta: Vec2) {
         let view = self.view_matrix();
         let right = Vec3::new(view.x_axis.x, view.x_axis.y, view.x_axis.z);
-        let up    = Vec3::new(view.y_axis.x, view.y_axis.y, view.y_axis.z);
+        let up = Vec3::new(view.y_axis.x, view.y_axis.y, view.y_axis.z);
         let scale = self.distance * 0.001;
         self.target -= right * delta.x * scale;
-        self.target += up   * delta.y * scale;
+        self.target += up * delta.y * scale;
     }
 
     pub fn state(&self) -> CameraState {
@@ -111,11 +115,11 @@ impl Camera {
     }
 
     pub fn apply_state(&mut self, s: CameraState) {
-        self.target       = Vec3::from(s.target);
-        self.distance     = s.distance.max(self.near * 10.0);
-        self.yaw          = s.yaw;
-        self.pitch        = s.pitch.clamp(-1.55, 1.55);
-        self.parallel     = s.parallel;
+        self.target = Vec3::from(s.target);
+        self.distance = s.distance.max(self.near * 10.0);
+        self.yaw = s.yaw;
+        self.pitch = s.pitch.clamp(-1.55, 1.55);
+        self.parallel = s.parallel;
         // Clear explicit scale so set_camera() restores default distance-based math.
         self.ortho_half_w = 0.0;
         self.ortho_half_h = 0.0;
