@@ -584,6 +584,48 @@ pub fn build_grid(
 
 pub fn format_tick_pub(v: f32) -> String { format_tick(v) }
 
+/// Format a tick value using a named preset.
+///
+/// Presets:
+/// - `"default"` — adaptive decimal / scientific (existing behaviour)
+/// - `"sci"`     — always scientific notation: `1.23e4`
+/// - `"int"`     — integer (no decimal places)
+/// - `"time"`    — interpret value as seconds → `MM:SS` or `H:MM:SS`
+pub fn format_tick_with_fmt(v: f32, fmt: &str) -> String {
+    match fmt {
+        "sci" => format!("{:.2e}", v),
+        "int" => format!("{:.0}", v),
+        "time" => {
+            let neg = v < 0.0;
+            let secs = v.abs() as u64;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            let sign = if neg { "-" } else { "" };
+            if h > 0 {
+                format!("{sign}{h}:{m:02}:{s:02}")
+            } else {
+                format!("{sign}{m:02}:{s:02}")
+            }
+        }
+        _ => format_tick(v),   // "default" and anything else
+    }
+}
+
+/// Generate log-spaced tick values (powers of 10) within `[lo, hi]`.
+/// Returns the data-space values; the caller is responsible for mapping to
+/// chart (log) space for NDC computation.
+/// Returns an empty vec for degenerate or non-positive ranges.
+pub fn axis_ticks_log(lo: f32, hi: f32) -> Vec<f32> {
+    if lo <= 0.0 || hi <= 0.0 || lo >= hi { return vec![]; }
+    let log_lo = lo.log10().floor() as i32;
+    let log_hi = hi.log10().ceil() as i32;
+    (log_lo..=log_hi)
+        .map(|e| 10_f32.powi(e))
+        .filter(|&v| v >= lo * (1.0 - 1e-5) && v <= hi * (1.0 + 1e-5))
+        .collect()
+}
+
 fn format_tick(v: f32) -> String {
     if v.abs() >= 1000.0 || (v.abs() < 0.01 && v != 0.0) {
         format!("{:.2e}", v)

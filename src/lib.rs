@@ -556,7 +556,11 @@ impl PyScatterRenderer {
             };
 
         let (ok, bounds_grew) = self.inner.append_to_stream(handle, &instances, &pos_cpu, bmin, bmax);
-        if ok && bounds_grew { self.refresh_scene_bounds(false); }
+        if ok && (bounds_grew || !self.camera_fitted) {
+            // Streams are often created empty and populated later, so the first
+            // append needs the same "fit if unfitted" behavior as set_points().
+            self.refresh_scene_bounds(true);
+        }
         Ok(ok)
     }
 
@@ -710,7 +714,8 @@ impl PyScatterRenderer {
     /// ``top`` and ``bottom`` are measured from the *top* of the window
     /// (so ``top < bottom``).
     #[pyo3(signature = (plot_left, plot_right, plot_top, plot_bottom,
-                        x0, x1, y0, y1, x_label="", y_label="", y_tick_step=None))]
+                        x0, x1, y0, y1, x_label="", y_label="",
+                        y_tick_step=None, title="", x_tick_step=None))]
     #[allow(clippy::too_many_arguments)]
     fn set_chart2d(
         &mut self,
@@ -718,12 +723,16 @@ impl PyScatterRenderer {
         x0: f32, x1: f32, y0: f32, y1: f32,
         x_label: &str, y_label: &str,
         y_tick_step: Option<f32>,
+        title: &str,
+        x_tick_step: Option<f32>,
     ) {
         self.inner.set_chart2d(
             plot_left, plot_right, plot_top, plot_bottom,
             x0, x1, y0, y1,
             x_label.to_string(), y_label.to_string(),
             y_tick_step,
+            title.to_string(),
+            x_tick_step,
         );
     }
 
@@ -788,6 +797,105 @@ impl PyScatterRenderer {
     /// Fast path: update only the y data-range; keeps the Y tick interval fixed.
     fn chart2d_update_ylim(&mut self, y0: f32, y1: f32) {
         self.inner.chart2d_update_ylim(y0, y1);
+    }
+
+    /// Toggle visibility of a chart2d line without removing it.
+    fn chart2d_set_line_visible(&mut self, handle: u32, visible: bool) {
+        self.inner.chart2d_set_line_visible(handle, visible);
+    }
+
+    /// Set marker style / size / spacing on an existing line.
+    ///
+    /// ``style``: 0 = none, 1 = square.
+    /// ``size_px``: marker size in screen pixels.
+    /// ``every``: draw one marker every N data points (1 = every point).
+    #[pyo3(signature = (handle, style=1, size_px=6.0, every=1))]
+    fn chart2d_set_line_markers(&mut self, handle: u32, style: u8, size_px: f32, every: u32) -> bool {
+        self.inner.chart2d_set_line_markers(handle, style, size_px, every)
+    }
+
+    // ── Reference overlays ────────────────────────────────────────────────────
+
+    /// Add a filled horizontal band from y0 to y1 spanning the full x extent.
+    /// ``color`` is ``(r, g, b, a)`` with a in 0..1.  Returns an overlay handle.
+    #[pyo3(signature = (y0, y1, color=(0.5, 0.5, 0.5, 0.25)))]
+    fn chart2d_add_hspan(&mut self, y0: f32, y1: f32, color: (f32, f32, f32, f32)) -> u32 {
+        self.inner.chart2d_add_hspan(y0, y1, [color.0, color.1, color.2, color.3])
+    }
+
+    /// Add a filled vertical band from x0 to x1 spanning the full y extent.
+    /// ``color`` is ``(r, g, b, a)``.  Returns an overlay handle.
+    #[pyo3(signature = (x0, x1, color=(0.5, 0.5, 0.5, 0.25)))]
+    fn chart2d_add_vspan(&mut self, x0: f32, x1: f32, color: (f32, f32, f32, f32)) -> u32 {
+        self.inner.chart2d_add_vspan(x0, x1, [color.0, color.1, color.2, color.3])
+    }
+
+    /// Add an infinite horizontal reference line at data y = ``y``.
+    /// Returns an overlay handle.
+    #[pyo3(signature = (y, color=(0.7, 0.7, 0.3), line_width=1.5))]
+    fn chart2d_add_hline(&mut self, y: f32, color: (f32, f32, f32), line_width: f32) -> u32 {
+        self.inner.chart2d_add_hline(y, [color.0, color.1, color.2], line_width)
+    }
+
+    /// Add an infinite vertical reference line at data x = ``x``.
+    /// Returns an overlay handle.
+    #[pyo3(signature = (x, color=(0.7, 0.7, 0.3), line_width=1.5))]
+    fn chart2d_add_vline(&mut self, x: f32, color: (f32, f32, f32), line_width: f32) -> u32 {
+        self.inner.chart2d_add_vline(x, [color.0, color.1, color.2], line_width)
+    }
+
+    /// Remove a span or reference line by its overlay handle.
+    fn chart2d_remove_overlay(&mut self, handle: u32) -> bool {
+        self.inner.chart2d_remove_overlay(handle)
+    }
+
+    /// Remove all reference spans and lines.
+    fn chart2d_clear_overlays(&mut self) {
+        self.inner.chart2d_clear_overlays();
+    }
+
+    // ── Axis formatting / scale ───────────────────────────────────────────────
+
+    /// Set the tick-label format for an axis.
+    ///
+    /// ``axis`` is ``"x"`` or ``"y"``.
+    /// ``fmt`` is one of ``"default"``, ``"sci"``, ``"int"``, ``"time"``.
+    fn chart2d_set_tick_format(&mut self, axis: &str, fmt: &str) {
+        self.inner.chart2d_set_tick_format(axis, fmt);
+    }
+
+    /// Enable or disable log₁₀ scale for an axis.
+    ///
+    /// ``axis`` is ``"x"`` or ``"y"``.
+    fn chart2d_set_log_scale(&mut self, axis: &str, enabled: bool) {
+        self.inner.chart2d_set_log_scale(axis, enabled);
+    }
+
+    /// Show or move the chart2d crosshair cursor to ``(x_data, y_data)``.
+    ///
+    /// The crosshair is clipped to the plot-rect scissor automatically.
+    /// Pass ``visible=False`` to hide it.
+    #[pyo3(signature = (x, y, visible=true))]
+    fn chart2d_set_cursor(&mut self, x: f32, y: f32, visible: bool) {
+        self.inner.chart2d_set_cursor(x, y, visible);
+    }
+
+    /// Build or update the chart2d legend.
+    ///
+    /// ``entries`` is a list of ``(label, (r, g, b))`` pairs.
+    /// ``position`` is one of ``"top-right"``, ``"top-left"``,
+    /// ``"bottom-right"``, ``"bottom-left"``.
+    #[pyo3(signature = (entries, position="top-right", visible=true))]
+    fn chart2d_set_legend(
+        &mut self,
+        entries: Vec<(String, (f32, f32, f32))>,
+        position: &str,
+        visible: bool,
+    ) {
+        let entries_rust: Vec<(String, [f32; 3])> = entries.into_iter()
+            .map(|(lbl, (r, g, b))| (lbl, [r, g, b]))
+            .collect();
+        self.inner.chart2d_set_legend(entries_rust, position, visible);
     }
 
     /// Restore a camera state previously returned by ``get_camera()``.
@@ -1173,6 +1281,10 @@ impl PyScatterRenderer {
         let idxs: Vec<[u32; 3]> = (0..nf).map(|i| [idx[[i,0]], idx[[i,1]], idx[[i,2]]]).collect();
         self.inner.update_mesh_actor(handle, &verts, &idxs, color, wireframe);
         self.refresh_scene_bounds(false);
+    }
+
+    fn update_mesh_style(&mut self, handle: u64, color: [f32; 4], wireframe: bool) {
+        self.inner.update_mesh_style_actor(handle, color, wireframe);
     }
 
     fn remove_mesh(&mut self, handle: u64) {

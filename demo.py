@@ -1519,57 +1519,98 @@ class DemoApp(tk.Tk):
         stream_handle: "list[int | None]" = [None]
         running:       "list[bool]"        = [False]
         after_id:      "list[str | None]"  = [None]
-        total_pts:     "list[int]"         = [0]
+        frame_no:      "list[int]"         = [0]
 
-        n_var    = tk.IntVar(value=500)
-        rate_var = tk.IntVar(value=33)    # ms between ticks ≈ 30 fps
-        max_var  = tk.IntVar(value=50_000)
-        mode_var = tk.StringVar(value="ring")
-        shape_var = tk.StringVar(value="helix")
+        FRAME_POINTS = 125_000
+        GRID_W = 500
+        GRID_H = 250
+
+        frame_sec_var = tk.DoubleVar(value=0.30)
         cmap_var  = tk.StringVar(value="plasma")
-        count_var = tk.StringVar(value="0 pts streamed")
+        frame_info_var = tk.StringVar(value="")
+        count_var = tk.StringVar(value=f"{FRAME_POINTS:,} pts / frame · 0 frames")
 
-        def _gen_pts(n: int):
-            t_start = total_pts[0] / 2_000.0
-            t_end   = (total_pts[0] + n) / 2_000.0
-            t = np.linspace(t_start, t_end, n, dtype=np.float32)
-            shape = shape_var.get()
-            if shape == "helix":
-                pts = np.stack([np.cos(t * 8), np.sin(t * 8), t * 0.5], axis=1)
-                scl = (t * 0.5).astype(np.float32)
-            elif shape == "wave":
-                decay = np.exp(-t * 0.3).astype(np.float32)
-                pts = np.stack([
-                    t - t_start,
-                    np.sin(t * 12) * decay,
-                    np.cos(t * 7)  * decay * 0.5,
-                ], axis=1)
-                scl = decay
-            else:  # "random"
-                pts = RNG.standard_normal((n, 3)).astype(np.float32) * 1.5
-                scl = np.linalg.norm(pts, axis=1).astype(np.float32)
+        # This section reuses the shared Scatter3D widget. Clear any points,
+        # streams, overlays, labels, or meshes left behind by the previous tab
+        # before building the fixed-frame streaming demo.
+        self.scatter.clear()
+
+        grid_x = np.linspace(-12.0, 12.0, GRID_W, dtype=np.float32)
+        grid_y = np.linspace(-6.0, 6.0, GRID_H, dtype=np.float32)
+        gx, gy = np.meshgrid(grid_x, grid_y)
+        base_x = gx.reshape(-1).astype(np.float32)
+        base_y = gy.reshape(-1).astype(np.float32)
+
+        def _frame_ms() -> int:
+            return max(50, int(round(float(frame_sec_var.get()) * 1000.0)))
+
+        def _update_frame_info() -> None:
+            frame_info_var.set(f"new frame every {float(frame_sec_var.get()):.2f} seconds")
+
+        def _schedule_next_tick() -> None:
+            after_id[0] = self.scatter.after(_frame_ms(), _tick)
+
+        def _gen_pts(phase: float):
+            # Fixed-bounds flat-field LiDAR-style frame:
+            # dense rectangular raster with a stable XY footprint and a few moving
+            # depth features. This keeps the axes bounded while still showing motion.
+            z = (
+                18.0
+                + 1.1 * np.sin(base_x * 0.22 + phase * 0.9)
+                + 0.8 * np.cos(base_y * 0.35 - phase * 0.6)
+            ).astype(np.float32)
+
+            # A moving "near" obstacle.
+            obj1 = np.exp(
+                -(((base_x - 4.0 * np.sin(phase * 0.55)) / 2.1) ** 2
+                  + ((base_y + 1.6 * np.cos(phase * 0.40)) / 1.4) ** 2)
+            ).astype(np.float32)
+            z -= obj1 * 6.0
+
+            # A second broader obstacle sweeping across the field.
+            obj2 = np.exp(
+                -(((base_x + 6.5 * np.cos(phase * 0.28)) / 3.2) ** 2
+                  + ((base_y - 2.5 * np.sin(phase * 0.33)) / 2.0) ** 2)
+            ).astype(np.float32)
+            z -= obj2 * 3.2
+
+            # Small bounded sensor shimmer to keep frames from looking static.
+            z += (0.10 * np.sin(base_x * 1.7 + base_y * 0.8 + phase * 2.2)).astype(np.float32)
+
+            pts = np.column_stack((base_x, base_y, z)).astype(np.float32, copy=False)
+            scl = z.copy()
             return pts, scl
 
         def _make_stream():
             if stream_handle[0] is not None:
                 self.scatter.remove_actor(stream_handle[0])
             stream_handle[0] = self.scatter.add_stream(
-                max_points=max_var.get(),
-                mode=mode_var.get(),
+                max_points=FRAME_POINTS,
+                mode="ring",
             )
-            total_pts[0] = 0
-            count_var.set("0 pts streamed")
+            frame_no[0] = 0
+            count_var.set(f"{FRAME_POINTS:,} pts / frame · 0 frames")
 
         def _tick():
             if not running[0] or stream_handle[0] is None:
                 after_id[0] = None
                 return
-            pts, scl = _gen_pts(n_var.get())
+            phase = frame_no[0] * float(frame_sec_var.get())
+            pts, scl = _gen_pts(phase)
             self.scatter.stream(stream_handle[0], pts, scalars=scl,
-                                colormap=cmap_var.get(), point_size=2.0)
-            total_pts[0] += n_var.get()
-            count_var.set(f"{total_pts[0]:,} pts streamed")
-            after_id[0] = self.scatter.after(rate_var.get(), _tick)
+                                colormap=cmap_var.get(), point_size=1.6)
+            frame_no[0] += 1
+            count_var.set(f"{FRAME_POINTS:,} pts / frame · {frame_no[0]:,} frames")
+            _schedule_next_tick()
+
+        def _apply_frame_interval(*_) -> None:
+            _update_frame_info()
+            if running[0] and after_id[0] is not None:
+                try:
+                    self.scatter.after_cancel(after_id[0])
+                except Exception:
+                    pass
+                _schedule_next_tick()
 
         def _start():
             if stream_handle[0] is None:
@@ -1577,7 +1618,7 @@ class DemoApp(tk.Tk):
             running[0] = True
             if after_id[0] is None:
                 _tick()
-            self._status("Streaming…")
+            self._status("Streaming flat-field LiDAR frames…")
 
         def _pause():
             running[0] = False
@@ -1607,37 +1648,16 @@ class DemoApp(tk.Tk):
 
         p.bind("<Destroy>", lambda e: _cleanup() if e.widget is p else None)
 
-        _head(p, "BUFFER")
-        _label(p, "max_points (capacity):", fg=DIM)
-        tk.Scale(p, variable=max_var, from_=5_000, to=500_000, resolution=5_000,
-                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
-                 highlightthickness=0, command=lambda _: _reset()).pack(fill="x")
-
-        _head(p, "RATE")
-        for lbl, var, lo, hi, res in [
-            ("pts / tick", n_var,    100, 5_000, 100),
-            ("ms / tick",  rate_var,  16,   500,   1),
-        ]:
-            row = tk.Frame(p, bg=PANEL)
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text=lbl, bg=PANEL, fg=FG, font=FM,
-                     width=11, anchor="w").pack(side="left")
-            tk.Scale(row, variable=var, from_=lo, to=hi, resolution=res,
-                     orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
-                     highlightthickness=0).pack(side="left", fill="x", expand=True)
-
-        _head(p, "MODE")
-        _radio_group(p, mode_var,
-                     [("Ring  — overwrite oldest", "ring"),
-                      ("Append — stop when full",  "append")],
-                     lambda: _reset())
-
-        _head(p, "DATA SHAPE")
-        _radio_group(p, shape_var,
-                     [("Helix",  "helix"),
-                      ("Wave",   "wave"),
-                      ("Random", "random")],
-                     lambda: _reset())
+        _head(p, "FRAME")
+        _label(p, f"{FRAME_POINTS:,} points / frame", fg=FG)
+        _label(p, textvariable=frame_info_var, fg=FG)
+        _label(p, "ring buffer: one full LiDAR frame replaces the previous frame", fg=DIM)
+        _label(p, "fixed XY footprint keeps the scene bounds stable", fg=DIM)
+        tk.Scale(
+            p, variable=frame_sec_var, from_=0.05, to=1.00, resolution=0.05,
+            orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+            highlightthickness=0, command=lambda _v: _apply_frame_interval(),
+        ).pack(fill="x")
 
         _head(p, "COLORMAP")
         _radio_group(p, cmap_var,
@@ -1653,6 +1673,7 @@ class DemoApp(tk.Tk):
         _label(p, textvariable=count_var, fg=ACT)
 
         # Create stream actor and start immediately
+        _update_frame_info()
         _make_stream()
         _start()
 
@@ -1767,6 +1788,11 @@ class DemoApp(tk.Tk):
         after_id:  "list[str | None]" = [None]
         total_pts: "list[int]"        = [0]
 
+        # Named-line handles (for visibility toggles); None until a static plot loads.
+        line_b_handle: "list[int | None]" = [None]
+        line_c_handle: "list[int | None]" = [None]
+        ts_stream_handle_for_legend: "list[int | None]" = [None]
+
         color_map = {
             "Blue":   (0.3,  0.7,  1.0),
             "Orange": (1.0,  0.55, 0.1),
@@ -1787,6 +1813,15 @@ class DemoApp(tk.Tk):
         line_c_width_var = tk.DoubleVar(value=2.5)
         stream_width_var = tk.DoubleVar(value=2.5)
         y_tick_var = tk.DoubleVar(value=1.0)
+        x_tick_auto_var  = tk.BooleanVar(value=True)
+        x_tick_var       = tk.DoubleVar(value=1.0)
+        title_var        = tk.StringVar(value="")
+        legend_var       = tk.BooleanVar(value=False)
+        legend_pos_var   = tk.StringVar(value="top-right")
+        line_b_vis_var   = tk.BooleanVar(value=True)
+        line_c_vis_var   = tk.BooleanVar(value=True)
+        cursor_var       = tk.BooleanVar(value=False)
+        box_zoom_var     = tk.BooleanVar(value=False)
         current_plot: "list[str]" = ["static"]
         count_var = tk.StringVar(value="—")
 
@@ -1834,6 +1869,12 @@ class DemoApp(tk.Tk):
             w._y_limits_frozen = False
             w._limits_frozen = False
             w._chart2d_sent = False
+            # Clear stored handles — they point to lines that no longer exist.
+            line_b_handle[0] = None
+            line_c_handle[0] = None
+            ts_stream_handle_for_legend[0] = None
+            line_b_vis_var.set(True)
+            line_c_vis_var.set(True)
             w.set_y_tick_interval(y_tick_var.get())
 
         # ── Static examples ───────────────────────────────────────────────────
@@ -1847,18 +1888,21 @@ class DemoApp(tk.Tk):
                 np.sin(x),
                 color=color_map[line_a_color_var.get()],
                 line_width=line_a_width_var.get(),
+                label="sin(x)",
             )
-            w.add_line(
+            line_b_handle[0] = w.add_line(
                 x,
                 np.cos(x),
                 color=color_map[line_b_color_var.get()],
                 line_width=line_b_width_var.get(),
+                label="cos(x)",
             )
-            w.add_line(
+            line_c_handle[0] = w.add_line(
                 x,
                 np.sin(2 * x) * 0.5,
                 color=color_map[line_c_color_var.get()],
                 line_width=line_c_width_var.get(),
+                label="sin(2x)·½",
             )
             count_var.set("3 static lines")
             self._status("Line2D — static plot loaded")
@@ -1877,12 +1921,18 @@ class DemoApp(tk.Tk):
                 line_b_width_var.get(),
                 line_c_width_var.get(),
             ]
+            labels = ["3:2", "5:4", "7:6"]
             for i, (a, b, delta) in enumerate([(3, 2, np.pi / 4),
                                                (5, 4, np.pi / 2),
                                                (7, 6, np.pi / 3)]):
-                w.add_line(np.sin(a * t + delta), np.sin(b * t),
-                           color=colors[i],
-                           line_width=widths[i])
+                h = w.add_line(np.sin(a * t + delta), np.sin(b * t),
+                               color=colors[i],
+                               line_width=widths[i],
+                               label=labels[i])
+                if i == 0:
+                    line_b_handle[0] = h
+                elif i == 1:
+                    line_c_handle[0] = h
             count_var.set("3 Lissajous curves")
             self._status("Line2D — Lissajous curves")
 
@@ -1937,12 +1987,19 @@ class DemoApp(tk.Tk):
             ts_last_batch_wall[0] = ts_start_wall[0]
             noise_y_last[0] = 0.0
             clr = color_map[stream_color_var.get()]
+            stream_label = {
+                "sine":     "sine",
+                "sawtooth": "sawtooth",
+                "noise":    "noise",
+            }.get(shape_var.get(), "live")
             ts_handle[0] = w.add_line_stream(
                 max_points=max_var.get(),
                 mode="ring",
                 color=clr,
                 line_width=stream_width_var.get(),
+                label=stream_label,
             )
+            ts_stream_handle_for_legend[0] = ts_handle[0]
             w.set_y_tick_interval(y_tick_var.get())
             w.set_xlim(0.0, WINDOW_SEC)
             count_var.set("0 pts")
@@ -1970,8 +2027,10 @@ class DemoApp(tk.Tk):
             if not running[0]:
                 anim_id[0] = None
                 return
-            t_now = time.monotonic() - ts_start_wall[0]
-            w.set_xlim(max(0.0, t_now - WINDOW_SEC), max(WINDOW_SEC, t_now))
+            # Box zoom suspends live axis animation until Resume Live is pressed.
+            if not w._box_zoom_active:
+                t_now = time.monotonic() - ts_start_wall[0]
+                w.set_xlim(max(0.0, t_now - WINDOW_SEC), max(WINDOW_SEC, t_now))
             anim_id[0] = w.after(16, _axis_animate)
 
         def _tick():
@@ -2032,12 +2091,51 @@ class DemoApp(tk.Tk):
                 w.set_xlim(0.0, WINDOW_SEC)
                 count_var.set("cleared")
 
+        # ── Phase 1 feature helpers ───────────────────────────────────────────
+        def _apply_title(*_) -> None:
+            w.set_title(title_var.get())
+
+        def _apply_legend(*_) -> None:
+            w.show_legend(legend_var.get())
+            w.legend_position = legend_pos_var.get()
+
+        def _apply_x_tick(*_) -> None:
+            if x_tick_auto_var.get():
+                w.set_x_tick_interval(None)
+            else:
+                w.set_x_tick_interval(x_tick_var.get())
+
+        def _toggle_b_vis(*_) -> None:
+            h = line_b_handle[0]
+            if h is not None:
+                w.set_line_visibility(h, line_b_vis_var.get())
+
+        def _toggle_c_vis(*_) -> None:
+            h = line_c_handle[0]
+            if h is not None:
+                w.set_line_visibility(h, line_c_vis_var.get())
+
+        # ── Phase 3 feature helpers ───────────────────────────────────────────
+        def _apply_cursor(*_) -> None:
+            w.enable_cursor(cursor_var.get())
+
+        def _apply_box_zoom(*_) -> None:
+            w.enable_box_zoom(box_zoom_var.get())
+
         # Stop timers both when the widget itself is replaced and when the
         # section controls are torn down during navigation.
         w.bind("<Destroy>", lambda _: _stop_stream(), add="+")
         p.bind("<Destroy>", lambda e: _stop_stream() if e.widget is p else None, add="+")
 
         # ── Controls ──────────────────────────────────────────────────────────
+        _head(p, "TOOLBAR")
+        tk.Label(p, text="⌂ Home  ↕ Autoscale Y  ⤢ Autoscale  💾 Save PNG",
+                 bg=PANEL, fg=DIM, font=("Consolas", 8),
+                 anchor="w", wraplength=180, justify="left").pack(fill="x", pady=(0, 2))
+        _btn(p, "Home",         w.home)
+        _btn(p, "Autoscale Y",  w.autoscale_y)
+        _btn(p, "Autoscale",    w.autoscale_both)
+
         _head(p, "STATIC PLOTS")
         _btn(p, "sin / cos / sin(2x)", _load_static)
         _btn(p, "Lissajous curves",    _load_lissajous)
@@ -2113,6 +2211,204 @@ class DemoApp(tk.Tk):
                  orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
                  highlightthickness=0,
                  command=lambda v: w.set_y_tick_interval(float(v))).pack(fill="x")
+
+        _head(p, "X GRID INTERVAL")
+        tk.Checkbutton(
+            p, text="Auto", variable=x_tick_auto_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_apply_x_tick,
+        ).pack(anchor="w")
+        tk.Scale(p, variable=x_tick_var, from_=0.1, to=5.0, resolution=0.1,
+                 orient="horizontal", bg=PANEL, fg=FG, troughcolor="#333",
+                 highlightthickness=0,
+                 command=lambda _v: _apply_x_tick()).pack(fill="x")
+
+        _head(p, "CHART TITLE")
+        title_row = tk.Frame(p, bg=PANEL)
+        title_row.pack(fill="x", pady=2)
+        title_entry = tk.Entry(title_row, textvariable=title_var,
+                               bg="#222", fg=FG, insertbackground=FG,
+                               relief="flat", font=FM)
+        title_entry.pack(side="left", fill="x", expand=True)
+        _btn_inline = tk.Button(
+            title_row, text="Set", bg="#333", fg=ACT, activebackground="#444",
+            activeforeground=ACT, relief="flat", font=FM,
+            command=_apply_title,
+        )
+        _btn_inline.pack(side="left", padx=(4, 0))
+        title_entry.bind("<Return>", lambda _: _apply_title())
+
+        _head(p, "LEGEND")
+        tk.Checkbutton(
+            p, text="Show legend", variable=legend_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_apply_legend,
+        ).pack(anchor="w")
+        pos_row = tk.Frame(p, bg=PANEL)
+        pos_row.pack(fill="x", pady=1)
+        tk.Label(pos_row, text="Position", bg=PANEL, fg=FG, font=FM,
+                 anchor="w").pack(side="left")
+        pos_menu = tk.OptionMenu(
+            pos_row, legend_pos_var,
+            "top-right", "top-left", "bottom-right", "bottom-left",
+            command=lambda *_: _apply_legend(),
+        )
+        pos_menu.configure(bg="#222", fg=FG, activebackground="#333",
+                           activeforeground=ACT, relief="flat", bd=0,
+                           font=FM, highlightthickness=0)
+        pos_menu["menu"].configure(bg="#222", fg=FG, activebackground="#333",
+                                   activeforeground=ACT, font=FM)
+        pos_menu.pack(side="right", fill="x", expand=True)
+
+        _head(p, "SERIES VISIBILITY")
+        tk.Checkbutton(
+            p, text="Line B visible", variable=line_b_vis_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_toggle_b_vis,
+        ).pack(anchor="w")
+        tk.Checkbutton(
+            p, text="Line C visible", variable=line_c_vis_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_toggle_c_vis,
+        ).pack(anchor="w")
+
+        _head(p, "CURSOR & BOX ZOOM")
+        tk.Checkbutton(
+            p, text="Cursor readout", variable=cursor_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_apply_cursor,
+        ).pack(anchor="w")
+        tk.Checkbutton(
+            p, text="Box zoom (drag)", variable=box_zoom_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_apply_box_zoom,
+        ).pack(anchor="w")
+        tk.Label(p, text="Use toolbar ▶ Resume Live\nafter box-zooming a stream",
+                 bg=PANEL, fg=DIM, font=("Consolas", 8),
+                 anchor="w", justify="left").pack(fill="x", pady=(2, 0))
+
+        # ── OVERLAYS & MARKERS ──────────────────────────────────────────────────
+        _head(p, "OVERLAYS & MARKERS")
+
+        # State
+        overlay_handles: list[int] = []
+
+        def _add_hspan() -> None:
+            h = w.axhspan(-0.5, 0.5, color=(0.4, 0.6, 1.0, 0.18))
+            overlay_handles.append(h)
+            self._status("Added hspan y∈[−0.5, 0.5]")
+
+        def _add_vspan() -> None:
+            h = w.axvspan(1.0, 3.0, color=(1.0, 0.5, 0.2, 0.18))
+            overlay_handles.append(h)
+            self._status("Added vspan x∈[1, 3]")
+
+        def _add_hline() -> None:
+            h = w.axhline(0.0, color=(0.9, 0.9, 0.2), line_width=1.5)
+            overlay_handles.append(h)
+            self._status("Added hline y=0")
+
+        def _add_vline() -> None:
+            h = w.axvline(2.0, color=(0.9, 0.9, 0.2), line_width=1.5)
+            overlay_handles.append(h)
+            self._status("Added vline x=2")
+
+        def _clear_overlays() -> None:
+            w.clear_chart_overlays()
+            overlay_handles.clear()
+            self._status("All overlays cleared")
+
+        def _remove_last() -> None:
+            if overlay_handles:
+                h = overlay_handles.pop()
+                w.remove_overlay(h)
+                self._status(f"Removed overlay {h}")
+
+        btn_row1 = tk.Frame(p, bg=PANEL)
+        btn_row1.pack(fill="x", pady=(2, 0))
+        _btn(btn_row1, "hspan", _add_hspan)
+        _btn(btn_row1, "vspan", _add_vspan)
+
+        btn_row2 = tk.Frame(p, bg=PANEL)
+        btn_row2.pack(fill="x", pady=(2, 0))
+        _btn(btn_row2, "hline", _add_hline)
+        _btn(btn_row2, "vline", _add_vline)
+
+        btn_row3 = tk.Frame(p, bg=PANEL)
+        btn_row3.pack(fill="x", pady=(2, 0))
+        _btn(btn_row3, "undo", _remove_last)
+        _btn(btn_row3, "clear all", _clear_overlays)
+
+        # Markers
+        marker_var = tk.IntVar(value=0)
+
+        def _toggle_markers() -> None:
+            enabled = bool(marker_var.get())
+            if not enabled:
+                # Remove markers from primary handle if present.
+                if w._primary_handle is not None and w._renderer is not None:
+                    w._renderer.chart2d_set_line_markers(
+                        w._primary_handle, 0, 6.0, 1)
+                    w._mark_dirty()
+                self._status("Markers off")
+            else:
+                if w._primary_handle is not None and w._renderer is not None:
+                    w._renderer.chart2d_set_line_markers(
+                        w._primary_handle, 1, 7.0, 10)
+                    w._mark_dirty()
+                self._status("Markers on (square, every 10 pts)")
+
+        tk.Checkbutton(
+            p, text="Square markers (primary line)", variable=marker_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM, command=_toggle_markers,
+        ).pack(anchor="w", pady=(4, 0))
+
+        # ── AXIS FORMAT / SCALE ─────────────────────────────────────────────
+        _head(p, "AXIS FORMAT / SCALE")
+
+        # Tick formatter row
+        fmt_row = tk.Frame(p, bg=PANEL)
+        fmt_row.pack(fill="x", pady=(2, 0))
+        _label(fmt_row, "X fmt:").pack(side="left")
+        x_fmt_var = tk.StringVar(value="default")
+        for fmt in ("default", "sci", "int", "time"):
+            tk.Radiobutton(
+                fmt_row, text=fmt, variable=x_fmt_var, value=fmt,
+                bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+                selectcolor=PANEL, font=FM,
+                command=lambda: w.set_x_tick_formatter(x_fmt_var.get()),
+            ).pack(side="left", padx=2)
+
+        fmt_row2 = tk.Frame(p, bg=PANEL)
+        fmt_row2.pack(fill="x", pady=(2, 0))
+        _label(fmt_row2, "Y fmt:").pack(side="left")
+        y_fmt_var = tk.StringVar(value="default")
+        for fmt in ("default", "sci", "int", "time"):
+            tk.Radiobutton(
+                fmt_row2, text=fmt, variable=y_fmt_var, value=fmt,
+                bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+                selectcolor=PANEL, font=FM,
+                command=lambda: w.set_y_tick_formatter(y_fmt_var.get()),
+            ).pack(side="left", padx=2)
+
+        # Log scale toggles
+        scale_row = tk.Frame(p, bg=PANEL)
+        scale_row.pack(fill="x", pady=(4, 0))
+        x_log_var = tk.IntVar(value=0)
+        y_log_var = tk.IntVar(value=0)
+        tk.Checkbutton(
+            scale_row, text="X log scale", variable=x_log_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM,
+            command=lambda: w.set_xscale("log" if x_log_var.get() else "linear"),
+        ).pack(side="left", padx=(0, 8))
+        tk.Checkbutton(
+            scale_row, text="Y log scale", variable=y_log_var,
+            bg=PANEL, fg=FG, activebackground=PANEL, activeforeground=ACT,
+            selectcolor=PANEL, font=FM,
+            command=lambda: w.set_yscale("log" if y_log_var.get() else "linear"),
+        ).pack(side="left")
 
         _head(p, "STATUS")
         _label(p, textvariable=count_var, fg=ACT)

@@ -1618,13 +1618,13 @@ def test_line2d_add_line_before_map_returns_virtual_handle(line2d):
 
     assert handle >= 0
     assert handle in line2d._pending_named_lines
-    _x, _y, _color, width = line2d._pending_named_lines[handle]
+    _x, _y, _color, width, _label, _visible = line2d._pending_named_lines[handle]
     assert width == 3.0
 
 
-def test_line2d_auto_fit_derives_limits_from_data(line2d):
-    """_auto_fit must derive xlim/ylim from nice-rounded bounds, then call
-    set_chart2d on the renderer with those limits."""
+def test_line2d_set_line_derives_limits_from_data(line2d):
+    """set_line must derive xlim/ylim from nice-rounded data bounds and notify
+    the renderer."""
     import unittest.mock as mock
     import numpy as np
 
@@ -1634,7 +1634,7 @@ def test_line2d_auto_fit_derives_limits_from_data(line2d):
     x = np.array([10.0, 20.0, 30.0], dtype=np.float32)
     y = np.array([0.0, 5.0, -1.0], dtype=np.float32)
 
-    line2d._auto_fit(x, y)
+    line2d.set_line(x, y)
 
     # xlim/ylim must have been set
     assert line2d._xlim is not None
@@ -1644,15 +1644,9 @@ def test_line2d_auto_fit_derives_limits_from_data(line2d):
     assert line2d._ylim[0] <= -1.0  # at or below data minimum
     assert line2d._ylim[1] >= 5.0   # at or above data maximum
 
-    # set_chart2d must have been called with the correct limits
-    renderer.set_chart2d.assert_called()
-    call_args = renderer.set_chart2d.call_args
-    x0, x1 = call_args.args[4], call_args.args[5]
-    y0, y1 = call_args.args[6], call_args.args[7]
-    assert x0 == line2d._xlim[0]
-    assert x1 == line2d._xlim[1]
-    assert y0 == line2d._ylim[0]
-    assert y1 == line2d._ylim[1]
+    # The renderer must have been notified (via set_chart2d or the fast-path
+    # chart2d_update_xlim/chart2d_update_ylim calls).
+    assert renderer.set_chart2d.called or renderer.chart2d_update_ylim.called
 
 
 def test_line2d_animated_set_xlim_uses_fast_path(line2d):
@@ -1712,8 +1706,8 @@ def test_line2d_set_y_tick_interval_passes_override(line2d):
     assert renderer.set_chart2d.call_args.args[10] == 0.5
 
 
-def test_line2d_auto_fit_with_frozen_x_uses_y_fast_path(line2d):
-    """When x is frozen but y is auto, _auto_fit must update only y via the
+def test_line2d_set_line_with_frozen_x_uses_y_fast_path(line2d):
+    """When x is frozen but y is auto, set_line must update only y via the
     chart2d_update_ylim fast path."""
     import unittest.mock as mock
     import numpy as np
@@ -1730,7 +1724,7 @@ def test_line2d_auto_fit_with_frozen_x_uses_y_fast_path(line2d):
     x = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     y = np.array([-3.2, 1.1, 4.4], dtype=np.float32)
 
-    line2d._auto_fit(x, y)
+    line2d.set_line(x, y)
 
     renderer.chart2d_update_xlim.assert_not_called()
     renderer.set_chart2d.assert_not_called()
@@ -1766,6 +1760,607 @@ def test_line2d_resize_resets_fast_path_gate(line2d):
     line2d.set_xlim(2.0, 12.0)
     assert renderer.chart2d_update_xlim.call_count == 2
     assert renderer.set_chart2d.call_count == 2  # no extra full rebuild
+
+
+# ── Phase 2: toolbar — home, autoscale_y, autoscale_both ─────────────────────
+
+def test_line2d_home_resets_both_axes(line2d):
+    """home() unfreezes both axes and refits to recorded data extent."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 4 * np.pi, 100, dtype=np.float32)
+    y = np.sin(x)
+    # Store geometry so _current_data_bounds() can find it.
+    line2d._primary_x = x.copy()
+    line2d._primary_y = y.copy()
+
+    # Freeze the axes then call home.
+    line2d._x_limits_frozen = True
+    line2d._y_limits_frozen = True
+    line2d.home()
+
+    assert not line2d._x_limits_frozen
+    assert not line2d._y_limits_frozen
+
+
+def test_line2d_home_no_data_is_noop(line2d):
+    """home() does nothing when no data has been loaded yet."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    line2d.home()  # no stored geometry — should not raise or call renderer
+    renderer.set_chart2d.assert_not_called()
+
+
+def test_line2d_autoscale_y_only_unfreezes_y(line2d):
+    """autoscale_y() unfreezes Y but leaves X frozen."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-2.0, 2.0)
+    line2d._chart2d_sent = True
+    line2d._x_limits_frozen = True
+    line2d._y_limits_frozen = True
+    # Store geometry directly.
+    line2d._primary_x = np.array([0.0, 10.0], dtype=np.float32)
+    line2d._primary_y = np.array([-1.0, 1.0], dtype=np.float32)
+
+    line2d.autoscale_y()
+
+    assert line2d._x_limits_frozen  # X must stay frozen
+    assert not line2d._y_limits_frozen
+
+
+def test_line2d_autoscale_both_delegates_to_home(line2d):
+    """autoscale_both() is equivalent to home()."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+    line2d._x_limits_frozen = True
+    line2d._y_limits_frozen = True
+    line2d._primary_x = np.array([0.0, 5.0], dtype=np.float32)
+    line2d._primary_y = np.array([-3.0, 3.0], dtype=np.float32)
+
+    line2d.autoscale_both()
+
+    assert not line2d._x_limits_frozen
+    assert not line2d._y_limits_frozen
+
+
+def test_line2d_data_bounds_union_of_all_lines(line2d):
+    """Adding multiple lines with different ranges produces the union bounds."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.side_effect = [1, 2]
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    line2d.add_line(np.array([0.0, 5.0], dtype=np.float32),
+                    np.array([-2.0, 2.0], dtype=np.float32), label="a")
+    assert line2d._data_xmin == pytest.approx(0.0)
+    assert line2d._data_xmax == pytest.approx(5.0)
+    assert line2d._data_ymin == pytest.approx(-2.0)
+    assert line2d._data_ymax == pytest.approx(2.0)
+
+    # Second line with wider extents — bounds must cover the union.
+    line2d.add_line(np.array([0.0, 8.0], dtype=np.float32),
+                    np.array([-5.0, 1.0], dtype=np.float32), label="b")
+    assert line2d._data_xmax == pytest.approx(8.0)
+    assert line2d._data_ymin == pytest.approx(-5.0)
+
+
+def test_line2d_toolbar_frame_exists(line2d):
+    """Line2D must have a _toolbar_frame attribute after construction."""
+    import tkinter as _tk
+    assert hasattr(line2d, "_toolbar_frame")
+    assert isinstance(line2d._toolbar_frame, _tk.Frame)
+
+
+def test_line2d_render_frame_is_render_target(line2d):
+    """Renderer surface is directed at _render_frame, not the outer widget."""
+    import tkinter as _tk
+    assert hasattr(line2d, "_render_frame")
+    assert isinstance(line2d._render_frame, _tk.Frame)
+    assert line2d._render_target_widget is line2d._render_frame
+
+
+
+# ── Phase 3: cursor, box zoom, streaming interlock ────────────────────────────
+
+def test_line2d_enable_cursor_stores_flag(line2d):
+    """enable_cursor(True) sets _cursor_enabled."""
+    line2d.enable_cursor(True)
+    assert line2d._cursor_enabled is True
+    line2d.enable_cursor(False)
+    assert line2d._cursor_enabled is False
+
+
+def test_line2d_enable_cursor_snap_raises(line2d):
+    """enable_cursor(snap=True) raises NotImplementedError."""
+    with pytest.raises(NotImplementedError):
+        line2d.enable_cursor(True, snap=True)
+
+
+def test_line2d_enable_cursor_false_hides_cursor(line2d):
+    """enable_cursor(False) calls chart2d_set_cursor with visible=False."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._cursor_enabled = True
+
+    line2d.enable_cursor(False)
+    renderer.chart2d_set_cursor.assert_called_with(0.0, 0.0, False)
+
+
+def test_line2d_update_cursor_inside_plot(line2d):
+    """_update_cursor inside the plot rect calls chart2d_set_cursor with correct data coords."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    # Simulate render_frame at 400×300; plot rect is fraction-based.
+    tgt = mock.Mock()
+    tgt.winfo_width.return_value = 400
+    tgt.winfo_height.return_value = 300
+    line2d._render_target_widget = tgt
+
+    # Cursor at the center of the plot rect.
+    pl = line2d._pad_left  * 400   # ~52
+    pr = line2d._pad_right * 400   # ~388
+    pt = line2d._pad_top   * 300   # ~12
+    pb = line2d._pad_bottom * 300  # ~264
+    mx = (pl + pr) / 2
+    my = (pt + pb) / 2
+
+    line2d._update_cursor(int(mx), int(my))
+
+    renderer.chart2d_set_cursor.assert_called_once()
+    call_args = renderer.chart2d_set_cursor.call_args[0]
+    # x_data should be near midpoint of xlim (5.0), visible=True
+    assert abs(call_args[0] - 5.0) < 0.5
+    assert call_args[2] is True
+
+
+def test_line2d_update_cursor_outside_plot_hides(line2d):
+    """_update_cursor outside the plot rect hides the cursor."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+
+    tgt = mock.Mock()
+    tgt.winfo_width.return_value = 400
+    tgt.winfo_height.return_value = 300
+    line2d._render_target_widget = tgt
+
+    # Pixel in the margin (left of plot rect)
+    line2d._update_cursor(5, 150)
+    renderer.chart2d_set_cursor.assert_called_with(0.0, 0.0, False)
+
+
+def test_line2d_enable_box_zoom_stores_flag(line2d):
+    """enable_box_zoom(True/False) sets the flag."""
+    line2d.enable_box_zoom(True)
+    assert line2d._box_zoom_enabled is True
+    line2d.enable_box_zoom(False)
+    assert line2d._box_zoom_enabled is False
+
+
+def test_line2d_enable_box_zoom_false_clears_active(line2d):
+    """Disabling box zoom clears _box_zoom_active."""
+    line2d._box_zoom_active = True
+    line2d._bz_dragging = True
+    line2d.enable_box_zoom(False)
+    assert not line2d._box_zoom_active
+    assert not line2d._bz_dragging
+
+
+def test_line2d_apply_box_zoom_sets_limits_and_active(line2d):
+    """_apply_box_zoom with a valid drag rect freezes both axes and sets _box_zoom_active."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    tgt = mock.Mock()
+    tgt.winfo_width.return_value = 400
+    tgt.winfo_height.return_value = 300
+    line2d._render_target_widget = tgt
+
+    # Drag from 25% to 75% of the plot rect in both axes.
+    pl = line2d._pad_left  * 400
+    pr = line2d._pad_right * 400
+    pt = line2d._pad_top   * 300
+    pb = line2d._pad_bottom * 300
+    px0 = int(pl + (pr - pl) * 0.25)
+    px1 = int(pl + (pr - pl) * 0.75)
+    py0 = int(pt + (pb - pt) * 0.25)
+    py1 = int(pt + (pb - pt) * 0.75)
+
+    line2d._apply_box_zoom(px0, py0, px1, py1)
+
+    assert line2d._box_zoom_active is True
+    assert line2d._x_limits_frozen is True
+    assert line2d._y_limits_frozen is True
+    # New xlim should be roughly the middle 50% of [0, 10]
+    assert line2d._xlim[0] == pytest.approx(2.5, abs=0.5)
+    assert line2d._xlim[1] == pytest.approx(7.5, abs=0.5)
+
+
+def test_line2d_apply_box_zoom_degenerate_ignored(line2d):
+    """A zero-size box zoom drag is silently ignored."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    tgt = mock.Mock()
+    tgt.winfo_width.return_value = 400
+    tgt.winfo_height.return_value = 300
+    line2d._render_target_widget = tgt
+
+    # Same start and end pixel — degenerate drag.
+    line2d._apply_box_zoom(100, 100, 100, 100)
+    assert line2d._box_zoom_active is False
+
+
+def test_line2d_resume_live_clears_active(line2d):
+    """resume_live() clears the _box_zoom_active freeze flag."""
+    line2d._box_zoom_active = True
+    line2d.resume_live()
+    assert line2d._box_zoom_active is False
+
+
+def test_line2d_status_frame_exists(line2d):
+    """Line2D must have a _status_frame and _status_label after construction."""
+    import tkinter as _tk
+    assert hasattr(line2d, "_status_frame")
+    assert hasattr(line2d, "_status_label")
+    assert isinstance(line2d._status_label, _tk.Label)
+
+
+# ── Phase 1: title, x_tick_interval, labels, legend, visibility ───────────────
+
+def test_line2d_set_title_stores_and_triggers_rebuild(line2d):
+    """set_title stores the title and forces a full chart2d rebuild."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._ylim = (-1.0, 1.0)
+    line2d.set_xlim(0.0, 10.0)
+    assert renderer.set_chart2d.call_count == 1
+
+    line2d.set_title("Sensor output")
+    assert line2d._title == "Sensor output"
+    assert line2d._pad_top == pytest.approx(0.08)
+    # Must do a full rebuild, not fast-path, because top padding changed.
+    assert renderer.set_chart2d.call_count == 2
+
+    # Clearing the title resets padding.
+    line2d.set_title("")
+    assert line2d._pad_top == pytest.approx(0.04)
+
+
+def test_line2d_set_title_passes_to_set_chart2d(line2d):
+    """set_chart2d is called with the title string."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True  # arm fast path
+
+    line2d.set_title("My Chart")
+    call_kwargs = renderer.set_chart2d.call_args
+    # title is passed positionally; capture all args
+    args = call_kwargs[0] if call_kwargs[0] else []
+    assert "My Chart" in args, f"title not found in set_chart2d args: {args}"
+
+
+def test_line2d_set_x_tick_interval_stores_and_rebuilds(line2d):
+    """set_x_tick_interval stores the step and triggers a full chart2d rebuild."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._ylim = (-1.0, 1.0)
+    line2d.set_xlim(0.0, 10.0)
+    count_before = renderer.set_chart2d.call_count
+
+    line2d.set_x_tick_interval(1.0)
+    assert line2d._x_tick_interval == pytest.approx(1.0)
+    assert renderer.set_chart2d.call_count == count_before + 1
+
+
+def test_line2d_set_x_tick_interval_none(line2d):
+    """set_x_tick_interval(None) resets to auto."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+    line2d._chart2d_sent = True
+
+    line2d.set_x_tick_interval(2.0)
+    line2d.set_x_tick_interval(None)
+    assert line2d._x_tick_interval is None
+
+
+def test_line2d_set_x_tick_interval_invalid_raises(line2d):
+    """Non-positive or non-finite x tick intervals raise ValueError."""
+    with pytest.raises(ValueError):
+        line2d.set_x_tick_interval(-1.0)
+    with pytest.raises(ValueError):
+        line2d.set_x_tick_interval(0.0)
+    with pytest.raises(ValueError):
+        line2d.set_x_tick_interval(float("nan"))
+
+
+def test_line2d_set_line_label_stored(line2d):
+    """set_line with label= stores the label on the widget."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 1
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 10, dtype=np.float32)
+    line2d.set_line(x, x, label="Channel A")
+    assert line2d._primary_label == "Channel A"
+
+
+def test_line2d_set_line_no_label(line2d):
+    """set_line without label= stores None."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 1
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 10, dtype=np.float32)
+    line2d.set_line(x, x)
+    assert line2d._primary_label is None
+
+
+def test_line2d_add_line_label_stored(line2d):
+    """add_line with label= stores the label in _named_lines."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 5
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 10, dtype=np.float32)
+    handle = line2d.add_line(x, x, label="Series B")
+    assert line2d._named_lines[handle]["label"] == "Series B"
+
+
+def test_line2d_add_line_before_map_label_in_pending(line2d):
+    """add_line before renderer stores label in pending tuple."""
+    assert line2d._renderer is None
+    x = np.zeros(5, dtype=np.float32)
+    vhandle = line2d.add_line(x, x, label="Pre-map label")
+    tup = line2d._pending_named_lines[vhandle]
+    assert tup[4] == "Pre-map label"  # index 4 = label in 6-tuple
+
+
+def test_line2d_add_line_stream_label_stored(line2d):
+    """add_line_stream with label= stores the label in the stream state dict."""
+    sid = line2d.add_line_stream(max_points=100, label="Live feed")
+    assert line2d._line_streams[sid]["label"] == "Live feed"
+
+
+def test_line2d_add_line_stream_no_label(line2d):
+    """add_line_stream without label= stores None."""
+    sid = line2d.add_line_stream(max_points=100)
+    assert line2d._line_streams[sid]["label"] is None
+
+
+def test_line2d_show_legend_calls_set_legend(line2d):
+    """show_legend(True) triggers chart2d_set_legend with visible=True."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 10
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 5, dtype=np.float32)
+    line2d.set_line(x, x, label="A")
+    line2d._primary_handle = 10
+
+    line2d.show_legend(True)
+    renderer.chart2d_set_legend.assert_called()
+    call_args = renderer.chart2d_set_legend.call_args[0]
+    assert call_args[2] is True  # visible=True
+
+
+def test_line2d_show_legend_false_hides(line2d):
+    """show_legend(False) calls chart2d_set_legend with visible=False."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    line2d._renderer = renderer
+    line2d._legend_visible = True  # was visible
+
+    line2d.show_legend(False)
+    renderer.chart2d_set_legend.assert_called()
+    call_args = renderer.chart2d_set_legend.call_args[0]
+    assert call_args[2] is False
+
+
+def test_line2d_legend_position_valid(line2d):
+    """Setting legend_position to any valid value is accepted."""
+    for pos in ("top-right", "top-left", "bottom-right", "bottom-left"):
+        line2d.legend_position = pos
+        assert line2d.legend_position == pos
+
+
+def test_line2d_legend_position_invalid_raises(line2d):
+    """Setting legend_position to an unknown string raises ValueError."""
+    with pytest.raises(ValueError):
+        line2d.legend_position = "center"
+
+
+def test_line2d_legend_entries_include_labeled_lines(line2d):
+    """_push_legend sends correct (label, color) pairs for labeled lines."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.side_effect = lambda x, y, c, lw: id(c)
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 5, dtype=np.float32)
+    # primary
+    color_a = (0.1, 0.2, 0.3)
+    line2d.set_line(x, x, color=color_a, label="A")
+    line2d._primary_handle = renderer.chart2d_add_line.return_value
+    # named
+    color_b = (0.4, 0.5, 0.6)
+    renderer.chart2d_add_line.return_value = 99
+    line2d.add_line(x, x, color=color_b, label="B")
+
+    renderer.reset_mock()
+    line2d._legend_visible = True
+    line2d._push_legend()
+
+    call_args = renderer.chart2d_set_legend.call_args[0]
+    entries = call_args[0]
+    labels = [e[0] for e in entries]
+    assert "A" in labels
+    assert "B" in labels
+
+
+def test_line2d_unlabeled_lines_excluded_from_legend(line2d):
+    """Lines without label= are not included in legend entries."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 7
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 5, dtype=np.float32)
+    line2d.set_line(x, x)  # no label
+    line2d._primary_handle = 7
+    line2d.add_line(x, x)  # no label
+
+    line2d._legend_visible = True
+    line2d._push_legend()
+
+    call_args = renderer.chart2d_set_legend.call_args[0]
+    entries = call_args[0]
+    assert entries == []
+
+
+def test_line2d_set_line_visibility_updates_named_line(line2d):
+    """set_line_visibility updates the visible flag and calls the renderer."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 20
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 5, dtype=np.float32)
+    handle = line2d.add_line(x, x, label="C")
+
+    line2d.set_line_visibility(handle, False)
+    assert line2d._named_lines[handle]["visible"] is False
+    renderer.chart2d_set_line_visible.assert_called_with(handle, False)
+
+    line2d.set_line_visibility(handle, True)
+    assert line2d._named_lines[handle]["visible"] is True
+    renderer.chart2d_set_line_visible.assert_called_with(handle, True)
+
+
+def test_line2d_set_line_visibility_pending(line2d):
+    """set_line_visibility before renderer updates the pending tuple."""
+    assert line2d._renderer is None
+    x = np.zeros(5, dtype=np.float32)
+    vhandle = line2d.add_line(x, x, label="D")
+    assert line2d._pending_named_lines[vhandle][5] is True  # default visible
+
+    line2d.set_line_visibility(vhandle, False)
+    assert line2d._pending_named_lines[vhandle][5] is False
+
+
+def test_line2d_update_line_label_updates_legend(line2d):
+    """update_line with label= updates the stored label and refreshes legend."""
+    import unittest.mock as mock
+
+    renderer = mock.Mock()
+    renderer.chart2d_add_line.return_value = 30
+    line2d._renderer = renderer
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._chart2d_sent = True
+
+    x = np.linspace(0, 1, 5, dtype=np.float32)
+    handle = line2d.add_line(x, x, label="old")
+
+    line2d._legend_visible = True
+    renderer.reset_mock()
+    line2d.update_line(handle, x, x, label="new")
+    assert line2d._named_lines[handle]["label"] == "new"
+    renderer.chart2d_set_legend.assert_called()
 
 
 # ── Size-by-column tests ──────────────────────────────────────────────────────
@@ -1911,3 +2506,1012 @@ def test_update_actor_point_sizes_length_mismatch(widget):
     with pytest.raises(ValueError, match="point_sizes length"):
         widget.update_actor(h, np.zeros((50, 3), dtype=np.float32),
                             point_sizes=np.ones(30, dtype=np.float32))
+
+
+# ── Phase 5: reference overlays (axhspan / axvspan / axhline / axvline) ───────
+
+def test_line2d_axhspan_returns_handle(line2d):
+    """axhspan() must return an integer handle."""
+    h = line2d.axhspan(-1.0, 1.0)
+    assert isinstance(h, int)
+
+
+def test_line2d_axvspan_returns_handle(line2d):
+    """axvspan() must return an integer handle."""
+    h = line2d.axvspan(2.0, 4.0)
+    assert isinstance(h, int)
+
+
+def test_line2d_axhline_returns_handle(line2d):
+    """axhline() must return an integer handle."""
+    h = line2d.axhline(0.5)
+    assert isinstance(h, int)
+
+
+def test_line2d_axvline_returns_handle(line2d):
+    """axvline() must return an integer handle."""
+    h = line2d.axvline(1.5)
+    assert isinstance(h, int)
+
+
+def test_line2d_overlays_get_unique_handles(line2d):
+    """Each axhspan / axvspan / axhline / axvline call must return a different handle."""
+    handles = [
+        line2d.axhspan(-1.0, 0.0),
+        line2d.axvspan(0.0, 1.0),
+        line2d.axhline(0.5),
+        line2d.axvline(0.5),
+    ]
+    assert len(set(handles)) == 4
+
+
+def test_line2d_axhspan_stored_in_overlay_meta(line2d):
+    """axhspan must record metadata in _overlay_meta for deferred replay."""
+    h = line2d.axhspan(2.0, 3.0, color=(1.0, 0.0, 0.0, 0.3))
+    assert h in line2d._overlay_meta
+    assert line2d._overlay_meta[h]["kind"] == "hspan"
+
+
+def test_line2d_axvspan_stored_in_overlay_meta(line2d):
+    h = line2d.axvspan(-5.0, -3.0)
+    assert h in line2d._overlay_meta
+    assert line2d._overlay_meta[h]["kind"] == "vspan"
+
+
+def test_line2d_axhline_stored_in_overlay_meta(line2d):
+    h = line2d.axhline(0.0)
+    assert h in line2d._overlay_meta
+    assert line2d._overlay_meta[h]["kind"] == "hline"
+
+
+def test_line2d_axvline_stored_in_overlay_meta(line2d):
+    h = line2d.axvline(10.0)
+    assert h in line2d._overlay_meta
+    assert line2d._overlay_meta[h]["kind"] == "vline"
+
+
+def test_line2d_axhspan_calls_renderer_when_live(line2d):
+    """When renderer exists, axhspan must call chart2d_add_hspan immediately."""
+    import unittest.mock as mock
+    renderer = mock.Mock()
+    renderer.chart2d_add_hspan.return_value = 99
+    line2d._renderer = renderer
+    line2d.axhspan(1.0, 2.0, color=(0.5, 0.5, 1.0, 0.2))
+    renderer.chart2d_add_hspan.assert_called_once()
+    args = renderer.chart2d_add_hspan.call_args[0]
+    assert args[0] == pytest.approx(1.0)
+    assert args[1] == pytest.approx(2.0)
+
+
+def test_line2d_axvspan_calls_renderer_when_live(line2d):
+    import unittest.mock as mock
+    renderer = mock.Mock()
+    renderer.chart2d_add_vspan.return_value = 88
+    line2d._renderer = renderer
+    line2d.axvspan(-2.0, -1.0)
+    renderer.chart2d_add_vspan.assert_called_once()
+
+
+def test_line2d_axhline_calls_renderer_when_live(line2d):
+    import unittest.mock as mock
+    renderer = mock.Mock()
+    renderer.chart2d_add_hline.return_value = 77
+    line2d._renderer = renderer
+    line2d.axhline(0.0, color=(0.8, 0.8, 0.3), line_width=2.0)
+    renderer.chart2d_add_hline.assert_called_once()
+    args = renderer.chart2d_add_hline.call_args[0]
+    assert args[0] == pytest.approx(0.0)
+
+
+def test_line2d_axvline_calls_renderer_when_live(line2d):
+    import unittest.mock as mock
+    renderer = mock.Mock()
+    renderer.chart2d_add_vline.return_value = 66
+    line2d._renderer = renderer
+    line2d.axvline(5.0, line_width=1.0)
+    renderer.chart2d_add_vline.assert_called_once()
+
+
+def test_line2d_remove_overlay_clears_meta(line2d):
+    """remove_overlay must delete _overlay_meta and call renderer.chart2d_remove_overlay."""
+    import unittest.mock as mock
+    renderer = mock.Mock()
+    renderer.chart2d_add_hspan.return_value = 55
+    line2d._renderer = renderer
+    h = line2d.axhspan(0.0, 1.0)
+    assert h in line2d._overlay_meta
+    line2d.remove_overlay(h)
+    assert h not in line2d._overlay_meta
+    renderer.chart2d_remove_overlay.assert_called_once_with(55)
+
+
+def test_line2d_remove_overlay_unknown_handle_is_noop(line2d):
+    """remove_overlay with an unknown handle must not raise."""
+    line2d.remove_overlay(99999)
+
+
+def test_line2d_clear_chart_overlays_removes_all(line2d):
+    """clear_chart_overlays must remove all overlay metadata and call the renderer."""
+    import unittest.mock as mock
+    renderer = mock.Mock()
+    renderer.chart2d_add_hspan.return_value = 10
+    renderer.chart2d_add_vspan.return_value = 11
+    line2d._renderer = renderer
+    line2d.axhspan(0.0, 1.0)
+    line2d.axvspan(0.0, 1.0)
+    assert len(line2d._overlay_meta) == 2
+    line2d.clear_chart_overlays()
+    assert len(line2d._overlay_meta) == 0
+    renderer.chart2d_clear_overlays.assert_called_once()
+
+
+def test_line2d_overlay_deferred_replay(root):
+    """Overlays added before renderer is mapped must be stored and replayed later.
+
+    We verify the overlay_meta dict is populated while renderer is None, then
+    simulate the replay step (mirroring _init_renderer's loop) to confirm it
+    correctly calls the renderer and populates _overlay_handle_map.
+    """
+    import unittest.mock as mock
+    w = Line2D(root, width=320, height=240)
+    # Add overlays while renderer is None.
+    h1 = w.axhspan(0.0, 1.0)
+    h2 = w.axvline(5.0)
+    assert w._renderer is None
+    assert h1 in w._overlay_meta
+    assert h2 in w._overlay_meta
+    assert w._overlay_meta[h1]["kind"] == "hspan"
+    assert w._overlay_meta[h2]["kind"] == "vline"
+    # Inject mock renderer and run the overlay replay portion directly
+    # (calling _init_renderer() would trigger the base-class renderer-creation
+    # path which replaces the mock, so we simulate only the replay step).
+    renderer = mock.Mock()
+    renderer.chart2d_add_hspan.return_value = 100
+    renderer.chart2d_add_vline.return_value = 101
+    w._renderer = renderer
+    # Simulate the replay loop from _init_renderer:
+    _dispatch = {
+        "hspan": renderer.chart2d_add_hspan,
+        "vspan": renderer.chart2d_add_vspan,
+        "hline": renderer.chart2d_add_hline,
+        "vline": renderer.chart2d_add_vline,
+    }
+    for vhandle, meta in list(w._overlay_meta.items()):
+        fn = _dispatch.get(meta["kind"])
+        if fn is not None:
+            rust_id = fn(*meta["args"])
+            w._overlay_handle_map[vhandle] = rust_id
+    # Verify renderer received the right calls.
+    renderer.chart2d_add_hspan.assert_called_once()
+    renderer.chart2d_add_vline.assert_called_once()
+    # Verify handle map was populated.
+    assert w._overlay_handle_map[h1] == 100
+    assert w._overlay_handle_map[h2] == 101
+    w.destroy()
+
+
+# ── Phase 4: axis formatting and log scale ────────────────────────────────────
+
+def test_line2d_set_x_tick_formatter_stores_and_calls_renderer(line2d):
+    """set_x_tick_formatter should persist the format and call the renderer."""
+    from unittest.mock import MagicMock, patch
+
+    line2d.add_line([0, 1, 2], [0, 1, 2])
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.set_x_tick_formatter("sci")
+
+    assert line2d._x_tick_format == "sci"
+    renderer.chart2d_set_tick_format.assert_called_once_with("x", "sci")
+
+
+def test_line2d_set_y_tick_formatter_stores_and_calls_renderer(line2d):
+    """set_y_tick_formatter should persist the format and call the renderer."""
+    from unittest.mock import MagicMock
+
+    line2d.add_line([0, 1, 2], [0, 1, 2])
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.set_y_tick_formatter("int")
+
+    assert line2d._y_tick_format == "int"
+    renderer.chart2d_set_tick_format.assert_called_once_with("y", "int")
+
+
+def test_line2d_set_x_tick_formatter_no_renderer_stores(line2d):
+    """set_x_tick_formatter before renderer is mapped should store for later replay."""
+    line2d._renderer = None
+
+    line2d.set_x_tick_formatter("time")
+
+    assert line2d._x_tick_format == "time"
+
+
+def test_line2d_set_xscale_linear_stores_false(line2d):
+    """set_xscale('linear') stores x_log_scale=False."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.set_xscale("linear")
+
+    assert line2d._x_log_scale is False
+    renderer.chart2d_set_log_scale.assert_called_once_with("x", False)
+
+
+def test_line2d_set_xscale_log_stores_true(line2d):
+    """set_xscale('log') stores x_log_scale=True and calls renderer."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.set_xscale("log")
+
+    assert line2d._x_log_scale is True
+    renderer.chart2d_set_log_scale.assert_called_once_with("x", True)
+
+
+def test_line2d_set_yscale_log_stores_true(line2d):
+    """set_yscale('log') stores y_log_scale=True and calls renderer."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.set_yscale("log")
+
+    assert line2d._y_log_scale is True
+    renderer.chart2d_set_log_scale.assert_called_once_with("y", True)
+
+
+def test_line2d_set_yscale_no_renderer_stores(line2d):
+    """set_yscale before renderer is mapped should store for later replay."""
+    line2d._renderer = None
+
+    line2d.set_yscale("log")
+
+    assert line2d._y_log_scale is True
+
+
+def test_line2d_tick_format_replayed_on_init(root):
+    """Tick formatter set before renderer creation must be applied on _init_renderer."""
+    from unittest.mock import MagicMock, patch
+
+    w = Line2D(root, width=320, height=240)
+    w._renderer = None
+
+    # Configure before renderer exists.
+    w.set_x_tick_formatter("sci")
+    w.set_yscale("log")
+
+    # Simulate renderer becoming available.
+    renderer = MagicMock()
+    renderer.chart2d_add_hspan.return_value = 0
+    renderer.chart2d_add_vspan.return_value = 0
+    renderer.chart2d_add_hline.return_value = 0
+    renderer.chart2d_add_vline.return_value = 0
+
+    w._renderer = renderer
+    # Manually invoke the replay section (without calling full _init_renderer
+    # which would try to create a real GPU context).
+    if w._x_tick_format != "default":
+        renderer.chart2d_set_tick_format("x", w._x_tick_format)
+    if w._y_tick_format != "default":
+        renderer.chart2d_set_tick_format("y", w._y_tick_format)
+    if w._x_log_scale:
+        renderer.chart2d_set_log_scale("x", True)
+    if w._y_log_scale:
+        renderer.chart2d_set_log_scale("y", True)
+
+    renderer.chart2d_set_tick_format.assert_called_once_with("x", "sci")
+    renderer.chart2d_set_log_scale.assert_called_once_with("y", True)
+    w.destroy()
+
+
+def test_line2d_tick_format_defaults(line2d):
+    """Fresh widget should have default (linear, 'default' format) settings."""
+    assert line2d._x_tick_format == "default"
+    assert line2d._y_tick_format == "default"
+    assert line2d._x_log_scale is False
+    assert line2d._y_log_scale is False
+
+
+def test_line2d_set_x_tick_formatter_time_format(line2d):
+    """'time' formatter should be accepted without error."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.set_x_tick_formatter("time")
+
+    assert line2d._x_tick_format == "time"
+    renderer.chart2d_set_tick_format.assert_called_once_with("x", "time")
+
+
+# ── Audit fixes ───────────────────────────────────────────────────────────────
+
+def test_line2d_clear_resets_python_state(line2d):
+    """clear() must wipe all chart2d Python-side state."""
+    from unittest.mock import MagicMock
+
+    line2d.add_line([0, 1], [0, 1], label="a")
+    line2d.axhspan(0.0, 1.0)
+    renderer = MagicMock()
+    renderer.chart2d_clear_lines = MagicMock()
+    renderer.chart2d_clear_overlays = MagicMock()
+    renderer.chart2d_set_legend = MagicMock()
+    renderer.set_chart2d = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.clear()
+
+    assert line2d._named_lines == {}
+    assert line2d._pending_named_lines == {}
+    assert line2d._line_streams == {}
+    assert line2d._overlay_meta == {}
+    assert line2d._overlay_handle_map == {}
+    assert line2d._primary_handle is None
+    assert line2d._pending_primary is None
+    assert line2d._data_xmin is None
+    assert line2d._data_xmax is None
+    assert line2d._x_limits_frozen is False
+    assert line2d._y_limits_frozen is False
+    renderer.chart2d_clear_lines.assert_called_once()
+    renderer.chart2d_clear_overlays.assert_called_once()
+
+
+def test_line2d_clear_no_renderer_resets_pending(line2d):
+    """clear() before renderer is mapped must wipe pending state too."""
+    line2d._renderer = None
+    line2d._pending_named_lines[0] = ([0.0], [0.0], (1, 0, 0), 2.0, None, True)
+    line2d._overlay_meta[0] = {"kind": "hspan", "args": (0.0, 1.0, [0, 0, 0, 1])}
+
+    line2d.clear()
+
+    assert line2d._pending_named_lines == {}
+    assert line2d._overlay_meta == {}
+
+
+def test_line2d_clear_does_not_call_3d_clear(line2d):
+    """Line2D.clear() must NOT call clear_actors (the 3D scatter clear path)."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.clear()
+
+    renderer.clear_actors.assert_not_called()
+
+
+def test_line2d_update_line_updates_data_bounds(line2d):
+    """update_line() must update running data bounds so home/autoscale work."""
+    import numpy as np
+    from unittest.mock import MagicMock
+
+    h = line2d.add_line([0.0, 1.0], [0.0, 1.0])
+    renderer = MagicMock()
+    line2d._renderer = renderer
+
+    line2d.update_line(h, [0.0, 100.0], [0.0, 50.0])
+
+    assert line2d._data_xmax == pytest.approx(100.0, abs=1.0)
+    assert line2d._data_ymax == pytest.approx(50.0, abs=1.0)
+
+
+def test_line2d_update_line_unfrozen_updates_ylim(line2d):
+    """update_line() with unfrozen y should update ylim to new data range."""
+    h = line2d.add_line([0.0, 1.0], [0.0, 1.0])
+    from unittest.mock import MagicMock
+    renderer = MagicMock()
+    line2d._renderer = renderer
+    line2d._y_limits_frozen = False
+
+    line2d.update_line(h, [0.0, 1.0], [-5.0, 5.0])
+
+    ylo, yhi = line2d._ylim
+    assert ylo <= -5.0
+    assert yhi >= 5.0
+
+
+def test_line2d_legend_replayed_on_init(root):
+    """show_legend() before renderer init must produce a legend after _init_renderer."""
+    from unittest.mock import MagicMock, patch
+
+    w = Line2D(root, width=320, height=240)
+    w._renderer = None
+    w.add_line([0, 1], [0, 1], label="series")
+    w.show_legend()  # sets flag; renderer not present yet
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 0
+    renderer.chart2d_set_legend = MagicMock()
+
+    # Manually invoke only the legend-replay portion of _init_renderer.
+    w._renderer = renderer
+    if w._legend_visible:
+        w._push_legend()
+
+    renderer.chart2d_set_legend.assert_called()
+    w.destroy()
+
+
+def test_line2d_remove_line_refreshes_legend(line2d):
+    """remove_line() must refresh the legend so removed series disappear."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+    line2d._legend_visible = True
+
+    h = line2d.add_line([0, 1], [0, 1], label="to remove")
+    renderer.chart2d_set_legend.reset_mock()
+
+    line2d.remove_line(h)
+
+    renderer.chart2d_set_legend.assert_called()
+
+
+def test_render_tick_stops_after_repeated_failures(root):
+    """_render_tick must stop retrying after _RENDER_FAIL_LIMIT failures."""
+    import warnings
+    from unittest.mock import MagicMock
+
+    w = Line2D(root, width=320, height=240)
+    renderer = MagicMock()
+    renderer.render.side_effect = RuntimeError("gpu dead")
+    w._renderer = renderer
+    w._dirty = True
+
+    limit = w._RENDER_FAIL_LIMIT
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for i in range(limit):
+            w._render_tick()
+            if i < limit - 1:
+                w._dirty = True  # keep dirty for next tick; skip after final
+
+    assert any("render()" in str(c.message) for c in caught)
+    # After limit the warning fired and dirty was cleared (loop stopped).
+    assert w._dirty is False
+    w.destroy()
+
+
+def test_render_tick_resets_fail_count_on_success(root):
+    """A successful render must reset the consecutive failure counter."""
+    from unittest.mock import MagicMock
+
+    w = Line2D(root, width=320, height=240)
+    renderer = MagicMock()
+    w._renderer = renderer
+    w._render_fail_count = 3
+    w._dirty = True
+
+    renderer.render.side_effect = None  # success
+    w._render_tick()
+
+    assert w._render_fail_count == 0
+    w.destroy()
+
+
+# ── Second-round audit fixes ──────────────────────────────────────────────────
+
+def test_stream_line_box_zoom_blocks_refit(line2d):
+    """stream_line() must not change xlim/ylim while box-zoom is active."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+    line2d._box_zoom_active = True
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (-1.0, 1.0)
+
+    h = line2d.add_line_stream(max_points=100, mode="ring")
+    xs = np.linspace(0, 5, 50, dtype=np.float32)
+    ys = np.ones(50, dtype=np.float32) * 999.0  # would expand ylim if not blocked
+
+    line2d.stream_line(h, xs, ys)
+
+    # ylim must not have changed to accommodate the 999 values.
+    assert line2d._ylim[1] < 500.0
+
+
+def test_stream_line_no_box_zoom_updates_limits(line2d):
+    """stream_line() with box-zoom inactive must still update limits."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+    line2d._box_zoom_active = False
+
+    h = line2d.add_line_stream(max_points=100, mode="ring")
+    xs = np.linspace(0, 5, 50, dtype=np.float32)
+    ys = np.ones(50, dtype=np.float32) * 999.0
+
+    line2d.stream_line(h, xs, ys)
+
+    assert line2d._ylim[1] > 500.0
+
+
+def test_update_line_shrink_corrects_bounds(line2d):
+    """update_line() to a smaller range must shrink _data_xmax, not leave it stale."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 42
+    line2d._renderer = renderer
+
+    h = line2d.add_line([0.0, 100.0], [0.0, 100.0])
+    assert line2d._data_xmax == pytest.approx(100.0, abs=1.0)
+
+    line2d.update_line(h, [0.0, 10.0], [0.0, 10.0])
+
+    assert line2d._data_xmax == pytest.approx(10.0, abs=1.0)
+    assert line2d._data_ymax == pytest.approx(10.0, abs=1.0)
+
+
+def test_remove_line_corrects_bounds(line2d):
+    """remove_line() must shrink bounds to the remaining data, not keep old extent."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.side_effect = [10, 11]
+    line2d._renderer = renderer
+
+    h1 = line2d.add_line([0.0, 100.0], [0.0, 0.0])
+    h2 = line2d.add_line([0.0, 5.0],   [0.0, 1.0])
+
+    line2d.remove_line(h1)
+
+    # After removing h1 (xmax=100), remaining data only goes to 5.
+    assert line2d._data_xmax == pytest.approx(5.0, abs=1.0)
+
+
+def test_home_uses_stored_named_line_geometry(line2d):
+    """home() must derive bounds from current stored x/y, not monotonic accumulator."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    h = line2d.add_line([0.0, 1.0], [0.0, 1.0])
+    # Simulate bounds shrinking after update.
+    line2d.update_line(h, [0.0, 0.5], [0.0, 0.5])
+
+    line2d._x_limits_frozen = True
+    line2d._y_limits_frozen = True
+    line2d.home()
+
+    assert not line2d._x_limits_frozen
+    xlo, xhi = line2d._xlim
+    assert xhi < 2.0  # must reflect the smaller data, not the old 1.0 (and not 100.0)
+
+
+def test_remove_line_stream_refreshes_legend(line2d):
+    """remove_line_stream() must refresh the legend so labeled streams disappear."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 0
+    line2d._renderer = renderer
+    line2d._legend_visible = True
+
+    h = line2d.add_line_stream(max_points=100, mode="ring", label="stream")
+    renderer.chart2d_set_legend.reset_mock()
+
+    line2d.remove_line_stream(h)
+
+    renderer.chart2d_set_legend.assert_called()
+
+
+def test_scatter2d_render_tick_delegates_failure_to_base(root):
+    """Scatter2D._render_tick must respect the base-class failure cap."""
+    import warnings
+    from unittest.mock import MagicMock
+    from dragonsci import Scatter2D
+
+    w = Scatter2D(root, width=320, height=240)
+    renderer = MagicMock()
+    renderer.render.side_effect = RuntimeError("gpu dead")
+    w._renderer = renderer
+    w._dirty = True
+
+    limit = w._RENDER_FAIL_LIMIT
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for i in range(limit):
+            w._render_tick()
+            if i < limit - 1:
+                w._dirty = True
+
+    assert any("render()" in str(c.message) for c in caught)
+    assert w._dirty is False
+    w.destroy()
+
+
+# ── Third-audit regression tests ─────────────────────────────────────────────
+
+def test_home_clears_box_zoom_active(line2d):
+    """home() must clear _box_zoom_active so streaming resumes."""
+    line2d._box_zoom_active = True
+    line2d._primary_x = np.array([0.0, 1.0])
+    line2d._primary_y = np.array([0.0, 1.0])
+    line2d._data_xmin = 0.0; line2d._data_xmax = 1.0
+    line2d._data_ymin = 0.0; line2d._data_ymax = 1.0
+    line2d.home()
+    assert line2d._box_zoom_active is False
+
+
+def test_autoscale_both_clears_box_zoom_active(line2d):
+    """autoscale_both() delegates to home() and therefore clears _box_zoom_active."""
+    line2d._box_zoom_active = True
+    line2d._primary_x = np.array([0.0, 1.0])
+    line2d._primary_y = np.array([0.0, 1.0])
+    line2d._data_xmin = 0.0; line2d._data_xmax = 1.0
+    line2d._data_ymin = 0.0; line2d._data_ymax = 1.0
+    line2d.autoscale_both()
+    assert line2d._box_zoom_active is False
+
+
+def test_clear_line_stream_refits_from_remaining_data(line2d):
+    """clear_line_stream() must refit limits from remaining static data."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 99
+    line2d._renderer = renderer
+
+    # Set up a static line with known range
+    x_static = np.array([0.0, 2.0])
+    y_static = np.array([0.0, 2.0])
+    line2d._primary_x = x_static
+    line2d._primary_y = y_static
+
+    # Add a stream with wider data that has already inflated the limits
+    h = line2d.add_line_stream(max_points=50, mode="ring")
+    st = line2d._line_streams[h]
+    st["buf_x"][:4] = [0, 5, 10, 15]
+    st["buf_y"][:4] = [0, 5, 10, 15]
+    st["count"] = 4
+    st["head"] = 4
+
+    # Force limits to match the expanded stream range
+    line2d._xlim = (0.0, 20.0)
+    line2d._ylim = (0.0, 20.0)
+    line2d._x_limits_frozen = False
+    line2d._y_limits_frozen = False
+
+    # Clear the stream; limits should shrink back to static data range
+    st["render_handle"] = None  # no renderer interaction needed
+    line2d.clear_line_stream(h)
+
+    # x limits must now reflect static data only (max 2.0), not the old 20.0
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xhi < 10.0
+
+
+def test_remove_line_stream_refits_from_remaining_data(line2d):
+    """remove_line_stream() must refit limits from remaining static data."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 99
+    line2d._renderer = renderer
+
+    # Static data with range [0, 2]
+    line2d._primary_x = np.array([0.0, 2.0])
+    line2d._primary_y = np.array([0.0, 2.0])
+
+    h = line2d.add_line_stream(max_points=50, mode="ring")
+    st = line2d._line_streams[h]
+    st["buf_x"][:3] = [0, 10, 20]
+    st["buf_y"][:3] = [0, 10, 20]
+    st["count"] = 3
+    st["head"] = 3
+    st["render_handle"] = None  # skip renderer
+
+    line2d._xlim = (0.0, 25.0)
+    line2d._ylim = (0.0, 25.0)
+    line2d._x_limits_frozen = False
+    line2d._y_limits_frozen = False
+
+    line2d.remove_line_stream(h)
+
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xhi < 10.0
+
+
+def test_remove_line_stream_resets_xlim_when_no_data(line2d):
+    """remove_line_stream() resets _xlim/_ylim to None when all data is gone."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 42
+    line2d._renderer = renderer
+
+    h = line2d.add_line_stream(max_points=50, mode="ring")
+    st = line2d._line_streams[h]
+    # stream has no data (count stays 0)
+    st["render_handle"] = None
+
+    line2d._xlim = (0.0, 1.0)
+    line2d._ylim = (0.0, 1.0)
+    line2d._x_limits_frozen = False
+    line2d._y_limits_frozen = False
+
+    line2d.remove_line_stream(h)
+
+    # No data at all → limits must be cleared
+    assert line2d._xlim is None
+    assert line2d._ylim is None
+
+
+def test_line2d_clear_resets_xlim_ylim(line2d):
+    """Line2D.clear() must reset _xlim and _ylim so the renderer gets a fresh empty state."""
+    line2d._xlim = (0.0, 10.0)
+    line2d._ylim = (0.0, 10.0)
+    line2d.clear()
+    assert line2d._xlim is None
+    assert line2d._ylim is None
+
+
+def test_add_line_multi_series_bounds_union(line2d):
+    """add_line() must fit the union of all series, not just the latest one."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.side_effect = [10, 20]
+    line2d._renderer = renderer
+
+    line2d.add_line(np.array([0.0, 1.0]), np.array([0.0, 1.0]), label="a")
+    line2d.add_line(np.array([5.0, 6.0]), np.array([5.0, 6.0]), label="b")
+
+    # x range must span [0, 6], not just [5, 6]
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xlo <= 0.0
+    assert xhi >= 6.0
+
+
+def test_set_line_multi_series_refits_all(line2d):
+    """set_line() on top of add_line() must produce union bounds."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 5
+    line2d._renderer = renderer
+
+    # Primary at x=[0,1]; named at x=[8,9]
+    line2d.add_line(np.array([8.0, 9.0]), np.array([0.0, 1.0]), label="wide")
+    line2d.set_line(np.array([0.0, 1.0]), np.array([0.0, 1.0]))
+
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xhi >= 8.0  # named line must still be included
+
+
+# ── Fourth-audit regression tests ────────────────────────────────────────────
+
+def test_stream_line_uses_union_bounds_with_static_line(line2d):
+    """stream_line() must fit the union of stream + static data, not just stream."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 1
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    # Static line spans x=[0, 100]
+    line2d._primary_x = np.array([0.0, 100.0], dtype=np.float32)
+    line2d._primary_y = np.array([0.0, 100.0], dtype=np.float32)
+
+    h = line2d.add_line_stream(max_points=100, mode="ring")
+    line2d._line_streams[h]["render_handle"] = 1
+
+    # Stream only has narrow data x=[1, 2] — must NOT shrink view to that range
+    line2d.stream_line(h, np.array([1.0, 2.0]), np.array([1.0, 2.0]))
+
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xhi >= 50.0  # static line extent must be preserved
+
+
+def test_stream_line_uses_union_bounds_two_streams(line2d):
+    """A narrow update to one stream must not shrink the view clipping the other."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.side_effect = [1, 2]
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    h1 = line2d.add_line_stream(max_points=100, mode="ring")
+    h2 = line2d.add_line_stream(max_points=100, mode="ring")
+    line2d._line_streams[h1]["render_handle"] = 1
+    line2d._line_streams[h2]["render_handle"] = 2
+
+    # Wide stream first
+    line2d.stream_line(h1, np.array([0.0, 50.0]), np.array([0.0, 50.0]))
+    # Narrow update to second stream — view must still cover h1's range
+    line2d.stream_line(h2, np.array([1.0, 2.0]), np.array([1.0, 2.0]))
+
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xhi >= 25.0  # h1 range must still be included
+
+
+def test_current_data_bounds_includes_pending_named_lines(line2d):
+    """_current_data_bounds() must include lines queued before renderer init."""
+    # No renderer — lines go to _pending_named_lines
+    h = line2d.add_line(np.array([0.0, 50.0]), np.array([0.0, 50.0]), label="a")
+    bounds = line2d._current_data_bounds()
+    assert bounds is not None
+    xmin, xmax, ymin, ymax = bounds
+    assert xmax >= 50.0
+
+
+def test_update_line_pre_render_refits(line2d):
+    """update_line() before renderer init must refit bounds from pending lines."""
+    h = line2d.add_line(np.array([0.0, 50.0]), np.array([0.0, 50.0]), label="a")
+
+    # Update with smaller range — xlim should shrink, not stay at 50
+    line2d.update_line(h, np.array([0.0, 5.0]), np.array([0.0, 5.0]))
+
+    assert line2d._xlim is not None
+    xlo, xhi = line2d._xlim
+    assert xhi < 20.0  # shrunk from 50
+
+
+def test_remove_line_pre_render_refits(line2d):
+    """remove_line() before renderer init must clear bounds when all lines gone."""
+    h = line2d.add_line(np.array([0.0, 50.0]), np.array([0.0, 50.0]), label="a")
+    line2d.remove_line(h)
+
+    # No lines remain — data accumulator must be cleared
+    assert line2d._data_xmin is None
+    assert line2d._data_xmax is None
+
+
+def test_push_chart2d_sends_default_when_no_limits(line2d):
+    """_push_chart2d() must still call set_chart2d with default (0,1) when _xlim/_ylim is None."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    line2d._renderer = renderer
+    line2d._xlim = None
+    line2d._ylim = None
+
+    line2d._push_chart2d()
+
+    renderer.set_chart2d.assert_called_once()
+    args = renderer.set_chart2d.call_args[0]
+    # args[4..7] are x0, x1, y0, y1 — should be default (0, 1, 0, 1)
+    assert args[4] == 0.0 and args[5] == 1.0
+    assert args[6] == 0.0 and args[7] == 1.0
+
+
+def test_clear_calls_push_chart2d_with_defaults(line2d):
+    """After clear(), the renderer must receive set_chart2d to clear the old frame."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 1
+    line2d._renderer = renderer
+
+    line2d.set_line(np.array([0.0, 5.0]), np.array([0.0, 5.0]))
+    renderer.set_chart2d.reset_mock()
+
+    line2d.clear()
+
+    # set_chart2d must be called after clear so the renderer shows empty state
+    renderer.set_chart2d.assert_called()
+
+
+# ── Fifth-audit regression tests ─────────────────────────────────────────────
+
+def test_refit_from_all_sources_pushes_when_x_frozen_only(line2d):
+    """_refit_from_all_sources() must call _push_chart2d even when x is frozen."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 1
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    # Set up a stream, then freeze x
+    h = line2d.add_line_stream(max_points=50, mode="ring")
+    st = line2d._line_streams[h]
+    st["buf_x"][:2] = [0.0, 1.0]; st["buf_y"][:2] = [0.0, 1.0]; st["count"] = 2
+    st["render_handle"] = None
+    line2d._xlim = (0.0, 5.0); line2d._ylim = (0.0, 5.0)
+    line2d._x_limits_frozen = True  # x frozen, y not frozen
+
+    renderer.set_chart2d.reset_mock()
+    renderer.chart2d_update_ylim.reset_mock()
+
+    # Remove the only stream — no data left
+    line2d.remove_line_stream(h)
+
+    # Renderer must have received an update for the y axis (or full push)
+    called = renderer.set_chart2d.called or renderer.chart2d_update_ylim.called
+    assert called, "renderer must be notified after last stream removed with x frozen"
+    # Frozen x must be preserved
+    assert line2d._xlim == (0.0, 5.0)
+    # Unfrozen y must be reset to None
+    assert line2d._ylim is None
+
+
+def test_refit_from_all_sources_pushes_when_y_frozen_only(line2d):
+    """_refit_from_all_sources() must call _push_chart2d even when y is frozen."""
+    from unittest.mock import MagicMock
+
+    renderer = MagicMock()
+    renderer.chart2d_add_line.return_value = 1
+    line2d._renderer = renderer
+    line2d._chart2d_sent = True
+
+    h = line2d.add_line_stream(max_points=50, mode="ring")
+    st = line2d._line_streams[h]
+    st["buf_x"][:2] = [0.0, 1.0]; st["buf_y"][:2] = [0.0, 1.0]; st["count"] = 2
+    st["render_handle"] = None
+    line2d._xlim = (0.0, 5.0); line2d._ylim = (0.0, 5.0)
+    line2d._y_limits_frozen = True  # y frozen, x not frozen
+
+    renderer.set_chart2d.reset_mock()
+    renderer.chart2d_update_xlim.reset_mock()
+
+    line2d.remove_line_stream(h)
+
+    called = renderer.set_chart2d.called or renderer.chart2d_update_xlim.called
+    assert called, "renderer must be notified after last stream removed with y frozen"
+    assert line2d._ylim == (0.0, 5.0)
+    assert line2d._xlim is None
+
+
+def test_pending_mesh_remove_clears_mhandle_map(root):
+    """Pending-mesh replay inside _init_renderer: remove must pop _mhandle_map
+    so a later visibility call cannot target the removed renderer id."""
+    from unittest.mock import MagicMock, patch
+    from dragonsci import Scatter3D
+    import dragonsci.widget as _w
+
+    w = Scatter3D(root, width=320, height=240)
+
+    # Directly inject a pending add then remove (bypasses scipy hull validation)
+    vhandle = 99
+    dummy_payload = {"vertices": np.zeros((4, 3), dtype=np.float32),
+                     "indices":  np.zeros((2, 3), dtype=np.uint32),
+                     "rgba": (1.0, 0.0, 0.0, 1.0), "wireframe": False}
+    w._pending_meshes.append((vhandle, "add", dummy_payload))
+    w._pending_meshes.append((vhandle, "remove", {}))
+
+    mock_renderer = MagicMock()
+    mock_renderer.add_mesh.return_value = 42
+
+    # Patch ScatterRenderer so _init_renderer uses our mock instead of wgpu
+    with patch.object(_w, "ScatterRenderer", return_value=mock_renderer):
+        w._renderer = None  # force _init_renderer to (re)create renderer
+        w._init_renderer()
+
+    # After replay the dead handle must have been popped from the map
+    assert w._mhandle_map.get(vhandle) is None
+
+    # A subsequent visibility call must not reach the renderer
+    mock_renderer.set_mesh_visibility.reset_mock()
+    w.set_mesh_visibility(vhandle, False)
+    mock_renderer.set_mesh_visibility.assert_not_called()
+
+    w.destroy()

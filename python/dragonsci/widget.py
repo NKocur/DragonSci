@@ -77,6 +77,13 @@ _CATEGORICAL_PALETTE: tuple[tuple[float, float, float], ...] = (
     (0.737, 0.741, 0.133),
     (0.090, 0.745, 0.812),
 )
+_LEGEND_POSITION_IDX: dict[str, int] = {
+    "top-right":    0,
+    "top-left":     1,
+    "bottom-right": 2,
+    "bottom-left":  3,
+}
+
 _FLATTEN_PLANES: dict[str, tuple[float, float]] = {
     # Maps plane name → (yaw_rad, pitch_rad) for the camera position formula
     # pos = target + (cos(p)*sin(y), sin(p), cos(p)*cos(y)) * dist
@@ -86,13 +93,6 @@ _FLATTEN_PLANES: dict[str, tuple[float, float]] = {
     "xz-": (0.0,                        -(_math.pi / 2 - 0.001)),  # from -Y
     "yz":  (_math.pi / 2,                0.0),                      # from +X: Y up, Z right
     "yz-": (-_math.pi / 2,               0.0),                      # from -X
-}
-
-_LEGEND_POSITION_IDX: dict[str, int] = {
-    "top-right": 0,
-    "top-left": 1,
-    "bottom-right": 2,
-    "bottom-left": 3,
 }
 
 
@@ -658,6 +658,7 @@ class Scatter3D(tk.Frame):
 
         # Dirty-frame model: only call render() when something changed
         self._dirty: bool = False
+        self._render_fail_count: int = 0  # consecutive render() failures
 
         # Drag state
         self._drag_btn: Optional[int] = None
@@ -910,8 +911,13 @@ class Scatter3D(tk.Frame):
                     real = self._mhandle_map.get(vhandle)
                     if real is not None:
                         self._renderer.update_mesh(real, **payload)
-                elif action == "remove":
+                elif action == "style":
                     real = self._mhandle_map.get(vhandle)
+                    if real is not None:
+                        self._renderer.update_mesh_style(
+                            real, payload["color"], payload["wireframe"])
+                elif action == "remove":
+                    real = self._mhandle_map.pop(vhandle, None)
                     if real is not None:
                         self._renderer.remove_mesh(real)
                         self._mesh_handles.discard(vhandle)
@@ -964,6 +970,10 @@ class Scatter3D(tk.Frame):
             except Exception:
                 pass
             self._tooltip_win = None
+        try:
+            self.close_gif()  # flush and clean up any in-progress recording
+        except Exception:
+            pass
         self._clear_all_point_metadata()
         self._renderer = None
         super().destroy()
@@ -980,14 +990,27 @@ class Scatter3D(tk.Frame):
         if self._after_id is None and self._renderer is not None:
             self._schedule_render()
 
+    _RENDER_FAIL_LIMIT = 5  # consecutive failures before giving up
+
     def _render_tick(self) -> None:
         self._after_id = None  # cleared first so _mark_dirty can re-arm
         if self._renderer is not None and self._dirty:
             try:
                 self._renderer.render()
-                self._dirty = False  # only clear on success; error keeps dirty for retry
-            except Exception:
-                pass
+                self._dirty = False
+                self._render_fail_count = 0
+            except Exception as exc:
+                self._render_fail_count += 1
+                if self._render_fail_count >= self._RENDER_FAIL_LIMIT:
+                    import warnings
+                    warnings.warn(
+                        f"DragonSci: render() failed {self._render_fail_count} times in a row "
+                        f"({type(exc).__name__}: {exc}); stopping render loop.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self._dirty = False  # stop retrying
+                    self._render_fail_count = 0
         # Re-arm only while there is work to do; stops firing when idle
         if self._dirty and self._after_id is None:
             self._schedule_render()
@@ -2010,31 +2033,37 @@ class Scatter3D(tk.Frame):
         return vhandle
 
     def _update_mesh_actor(self, handle, verts, idxs, rgba, wireframe) -> None:
-        # Style-only path: verts/idxs are None — reuse geometry stored in meta.
-        if verts is None or idxs is None:
-            meta = self._mesh_meta.get(handle, {})
-            verts = meta.get("_verts")
-            idxs  = meta.get("_idxs")
-            if verts is None or idxs is None:
-                return  # geometry not yet known (pre-map, will be replayed correctly)
+        style_only = verts is None or idxs is None
+        if style_only:
+            # Style-only (color / opacity / wireframe toggle): Rust uses its stored
+            # positions/triangle-indices to re-bake the buffers without Python
+            # retransferring geometry arrays.
+            if self._renderer is not None:
+                real = self._mhandle_map.get(handle)
+                if real is not None:
+                    self._renderer.update_mesh_style(real, list(rgba), bool(wireframe))
+                    self._mark_dirty()
+            else:
+                self._pending_meshes.append(
+                    (handle, "style", {"color": list(rgba), "wireframe": bool(wireframe)}))
         else:
-            # Persist geometry in meta so future style-only updates can reuse it.
+            # Full geometry update: persist geometry in meta for Rust-side storage.
             if handle in self._mesh_meta:
                 self._mesh_meta[handle]["_verts"] = np.ascontiguousarray(verts, dtype=np.float32)
                 self._mesh_meta[handle]["_idxs"]  = np.ascontiguousarray(idxs,  dtype=np.uint32)
-        payload = {
-            "vertices": np.ascontiguousarray(verts, dtype=np.float32),
-            "indices":  np.ascontiguousarray(idxs,  dtype=np.uint32),
-            "color":    list(rgba),
-            "wireframe": wireframe,
-        }
-        if self._renderer is not None:
-            real = self._mhandle_map.get(handle)
-            if real is not None:
-                self._renderer.update_mesh(real, **payload)
-                self._mark_dirty()
-        else:
-            self._pending_meshes.append((handle, "update", payload))
+            payload = {
+                "vertices": np.ascontiguousarray(verts, dtype=np.float32),
+                "indices":  np.ascontiguousarray(idxs,  dtype=np.uint32),
+                "color":    list(rgba),
+                "wireframe": wireframe,
+            }
+            if self._renderer is not None:
+                real = self._mhandle_map.get(handle)
+                if real is not None:
+                    self._renderer.update_mesh(real, **payload)
+                    self._mark_dirty()
+            else:
+                self._pending_meshes.append((handle, "update", payload))
 
     # ── Line / overlay actors ─────────────────────────────────────────────────
 
@@ -3528,16 +3557,12 @@ class Scatter2D(Scatter3D):
         super().destroy()
 
     def _render_tick(self) -> None:
-        self._after_id = None
-        if self._renderer is not None and self._dirty:
-            try:
-                self._renderer.render()
-                self._dirty = False
-                self._check_camera_changed_for_marginals()
-            except Exception:
-                pass
-        if self._dirty and self._after_id is None:
-            self._schedule_render()
+        was_dirty = self._dirty
+        super()._render_tick()
+        # After a successful render (_dirty flipped to False), check whether the
+        # camera moved so marginal histograms can be updated.
+        if was_dirty and not self._dirty:
+            self._check_camera_changed_for_marginals()
 
     # ── Data lifecycle hooks ──────────────────────────────────────────────
 
@@ -3724,15 +3749,28 @@ class Line2D(Scatter3D):
         self._xlim: "tuple[float, float] | None" = None
         self._ylim: "tuple[float, float] | None" = None
 
-        # Axis label text
+        # Axis / chart label text
         self._xlabel: str = "X"
         self._ylabel: str = "Y"
+        self._title:  str = ""
         self._y_tick_interval: "float | None" = None
+        self._x_tick_interval: "float | None" = None
 
         # Axis freeze flags: x is often explicit for time-series windows while y stays auto.
         self._x_limits_frozen: bool = False
         self._y_limits_frozen: bool = False
         self._limits_frozen: bool = False
+
+        # Running data extent — updated by _refit_all_static/_refit_from_all_sources; used by home/autoscale.
+        self._data_xmin: "float | None" = None
+        self._data_xmax: "float | None" = None
+        self._data_ymin: "float | None" = None
+        self._data_ymax: "float | None" = None
+
+        # Stored geometry for the primary (set_line) line; kept so that
+        # _current_data_bounds() can scan it after update_line / clear.
+        self._primary_x: "np.ndarray | None" = None
+        self._primary_y: "np.ndarray | None" = None
 
         # Plot rect (viewport fractions). Left/right/top/bottom from the edges.
         # top < bottom because both are measured from the top of the window.
@@ -3745,14 +3783,21 @@ class Line2D(Scatter3D):
         self._primary_handle: "int | None" = None
         self._primary_color: tuple = (0.3, 0.7, 1.0)
         self._primary_width: float = 2.0
-        # Pending primary line (set before renderer existed)
+        self._primary_label: "str | None" = None
+        # Pending primary line (set before renderer existed); 5-tuple (x,y,color,lw,label)
         self._pending_primary: "tuple | None" = None
 
-        # Named extra lines: handle -> {"color": tuple, "line_width": float}
+        # Named extra lines: handle -> {"color": tuple, "line_width": float,
+        #                               "label": str|None, "visible": bool}
         self._named_lines: "dict[int, dict]" = {}
-        self._pending_named_lines: "dict[int, tuple[np.ndarray, np.ndarray, tuple, float]]" = {}
+        # Pre-renderer queue: vhandle -> (x, y, color, line_width, label, visible)
+        self._pending_named_lines: "dict[int, tuple]" = {}
         self._next_nhandle: int = 0
         self._nhandle_map: "dict[int, int]" = {}
+
+        # Legend state
+        self._legend_visible:  bool = False
+        self._legend_position: str  = "top-right"
 
         # Streaming line state: stream-handle (int) → state dict
         self._line_streams: "dict[int, dict]" = {}
@@ -3762,7 +3807,452 @@ class Line2D(Scatter3D):
         # Used to gate the fast-path chart2d_update_xlim optimization.
         self._chart2d_sent: bool = False
 
+        # Reference overlays: overlay-handle -> {"kind": str, "args": tuple}
+        # kind in {"hspan", "vspan", "hline", "vline"}
+        # Stored for replay after renderer is created and for clear_chart_overlays.
+        self._overlay_meta: "dict[int, dict]" = {}
+        # Maps overlay handle back to the Rust id (for remove_overlay).
+        self._overlay_handle_map: "dict[int, int]" = {}
+        # Next virtual overlay handle.
+        self._next_overlay_handle: int = 0
+
+        # Axis formatting / scale (persisted so they survive renderer re-init).
+        self._x_tick_format: str = "default"
+        self._y_tick_format: str = "default"
+        self._x_log_scale: bool = False
+        self._y_log_scale: bool = False
+
+        # Cursor and box-zoom state
+        self._cursor_enabled: bool = False
+        self._box_zoom_enabled: bool = False
+        self._box_zoom_active: bool = False   # True while streaming is frozen by box zoom
+        self._bz_dragging: bool = False
+        self._bz_px0: int = 0
+        self._bz_py0: int = 0
+
+        # ── Sub-frame layout ──────────────────────────────────────────────
+        # Row 0: toolbar strip (fixed height)
+        # Row 1: render surface (expands)
+        # Row 2: status readout strip (fixed height)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=0)   # toolbar
+        self.rowconfigure(1, weight=1)   # render surface
+        self.rowconfigure(2, weight=0)   # status readout
+
+        self._toolbar_frame = tk.Frame(self, bg="#111118", height=28)
+        self._toolbar_frame.grid(row=0, column=0, sticky="ew")
+        self._toolbar_frame.pack_propagate(False)
+
+        self._render_frame = tk.Frame(self, bg="black")
+        self._render_frame.grid(row=1, column=0, sticky="nsew")
+
+        self._status_frame = tk.Frame(self, bg="#0d0d1a", height=18)
+        self._status_frame.grid(row=2, column=0, sticky="ew")
+        self._status_frame.pack_propagate(False)
+        self._status_label = tk.Label(
+            self._status_frame, text="",
+            bg="#0d0d1a", fg="#666688", font=("Consolas", 8),
+            anchor="w", padx=8,
+        )
+        self._status_label.pack(fill="x")
+
+        # Redirect renderer surface to the inner render frame.
+        self._render_target_widget = self._render_frame
+
+        # Resize events on the render frame trigger the debounced resize.
+        self._render_frame.bind("<Configure>", self._on_configure, add="+")
+
+        # Re-bind all input events from the outer frame to the render frame so
+        # event.x/y are in render-surface space (origin = top-left of _render_frame).
+        _INPUT_EVENTS = (
+            "<ButtonPress-1>", "<ButtonPress-2>",
+            "<B1-Motion>", "<B2-Motion>",
+            "<ButtonRelease-1>", "<ButtonRelease-2>",
+            "<MouseWheel>", "<Button-4>", "<Button-5>",
+            "<Double-Button-1>", "<Motion>", "<Leave>",
+        )
+        for ev in _INPUT_EVENTS:
+            self.unbind(ev)
+        self._render_frame.bind("<ButtonPress-1>",   lambda e: self._drag_start(e, 1))
+        self._render_frame.bind("<ButtonPress-2>",   lambda e: self._drag_start(e, 2))
+        self._render_frame.bind("<B1-Motion>",       lambda e: self._drag_move(e, 1))
+        self._render_frame.bind("<B2-Motion>",       lambda e: self._drag_move(e, 2))
+        self._render_frame.bind("<ButtonRelease-1>", self._drag_end)
+        self._render_frame.bind("<ButtonRelease-2>", self._drag_end)
+        self._render_frame.bind("<MouseWheel>",      self._on_scroll)
+        self._render_frame.bind("<Button-4>",        self._on_scroll_up_x11)
+        self._render_frame.bind("<Button-5>",        self._on_scroll_down_x11)
+        self._render_frame.bind("<Motion>",          self._on_hover_motion, add="+")
+        self._render_frame.bind("<Leave>",           self._on_hover_leave, add="+")
+
+        self._build_toolbar()
+
+    # ── Toolbar ───────────────────────────────────────────────────────────────
+
+    def _build_toolbar(self) -> None:
+        """Populate the compact chart toolbar strip."""
+        _BTN_BG  = "#1e1e2e"
+        _BTN_FG  = "#c0c0d0"
+        _BTN_ABG = "#2a2a3e"
+        _BTN_AFG = "#7ecfff"
+        _FONT    = ("Consolas", 9)
+
+        def _tbtn(text: str, cmd, tooltip: str = "") -> tk.Button:
+            b = tk.Button(
+                self._toolbar_frame,
+                text=text,
+                command=cmd,
+                bg=_BTN_BG, fg=_BTN_FG,
+                activebackground=_BTN_ABG, activeforeground=_BTN_AFG,
+                relief="flat", bd=0,
+                font=_FONT,
+                padx=8, pady=3,
+                cursor="hand2",
+            )
+            b.pack(side="left", padx=1, pady=2)
+            if tooltip:
+                self._toolbar_tooltip(b, tooltip)
+            return b
+
+        _tbtn("⌂ Home",         self.home,           "Reset to full data extent")
+        _tbtn("↕ Autoscale Y",  self.autoscale_y,    "Fit Y axis to data")
+        _tbtn("⤢ Autoscale",    self.autoscale_both, "Fit both axes to data")
+
+        # Separator
+        tk.Frame(self._toolbar_frame, bg="#333344", width=1).pack(
+            side="left", fill="y", padx=4, pady=4)
+
+        _tbtn("▶ Resume Live",  self.resume_live,    "Resume live axis scrolling after box zoom")
+
+        # Separator
+        tk.Frame(self._toolbar_frame, bg="#333344", width=1).pack(
+            side="left", fill="y", padx=4, pady=4)
+
+        _tbtn("💾 Save PNG",    self._toolbar_save,  "Save chart to PNG")
+
+    def _toolbar_tooltip(self, widget: tk.Widget, text: str) -> None:
+        """Attach a simple hover tooltip to a toolbar button."""
+        tip: "list[tk.Toplevel | None]" = [None]
+
+        def _show(event: tk.Event) -> None:
+            if tip[0] is not None:
+                return
+            x = widget.winfo_rootx() + widget.winfo_width() // 2
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tw = tk.Toplevel(widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            tk.Label(tw, text=text, bg="#2a2a3e", fg="#c0c0d0",
+                     relief="flat", font=("Consolas", 8), padx=4, pady=2).pack()
+            tip[0] = tw
+
+        def _hide(_event: tk.Event) -> None:
+            if tip[0] is not None:
+                tip[0].destroy()
+                tip[0] = None
+
+        widget.bind("<Enter>", _show, add="+")
+        widget.bind("<Leave>", _hide, add="+")
+
+    def _toolbar_save(self) -> None:
+        """Prompt for a path and save the chart as PNG."""
+        import tkinter.filedialog as _fd
+        path = _fd.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+            title="Save chart as PNG",
+        )
+        if path:
+            self.save_png(path)
+
+    # ── Toolbar actions ───────────────────────────────────────────────────────
+
+    def _current_data_bounds(self) -> "tuple[float,float,float,float] | None":
+        """Return (xmin, xmax, ymin, ymax) across all currently-buffered data.
+
+        Scans stored geometry in ``_named_lines`` and the primary line directly,
+        so bounds are always accurate even after ``update_line`` shrinks data or
+        ``remove_line`` drops a series.  Stream buffers are always scanned live.
+        """
+        xmins, xmaxs, ymins, ymaxs = [], [], [], []
+        # Primary (set_line) geometry.
+        if self._primary_x is not None and len(self._primary_x) > 0:
+            xmins.append(float(self._primary_x.min()))
+            xmaxs.append(float(self._primary_x.max()))
+            ymins.append(float(self._primary_y.min()))
+            ymaxs.append(float(self._primary_y.max()))
+        # Named static lines — scan stored geometry directly (not monotonic accumulator).
+        for meta in self._named_lines.values():
+            x, y = meta.get("x"), meta.get("y")
+            if x is not None and len(x) > 0:
+                xmins.append(float(x.min())); xmaxs.append(float(x.max()))
+                ymins.append(float(y.min())); ymaxs.append(float(y.max()))
+        # Pre-renderer pending named lines.
+        for (x, y, *_rest) in self._pending_named_lines.values():
+            if len(x) > 0:
+                xmins.append(float(x.min())); xmaxs.append(float(x.max()))
+                ymins.append(float(y.min())); ymaxs.append(float(y.max()))
+        # Live stream buffers — always re-scan so scrolled-off data is excluded.
+        for st in self._line_streams.values():
+            cnt = st["count"]
+            if cnt < 1:
+                continue
+            xs, ys = self._stream_ordered(st)
+            if xs is None:
+                xs, ys = st["buf_x"][:cnt], st["buf_y"][:cnt]
+            xmins.append(float(xs.min())); xmaxs.append(float(xs.max()))
+            ymins.append(float(ys.min())); ymaxs.append(float(ys.max()))
+        if not xmins:
+            return None
+        return min(xmins), max(xmaxs), min(ymins), max(ymaxs)
+
+    def _refit_all_static(self) -> None:
+        """Recompute data bounds from all static line geometry and apply to unfrozen axes.
+
+        Unlike the old monotonic accumulator, this
+        scans the current stored geometry — including pre-renderer pending lines —
+        so adding, removing, or shrinking a line immediately corrects both the
+        accumulator and the visible range.
+        """
+        xmins, xmaxs, ymins, ymaxs = [], [], [], []
+        if self._primary_x is not None and len(self._primary_x) > 0:
+            xmins.append(float(self._primary_x.min()))
+            xmaxs.append(float(self._primary_x.max()))
+            ymins.append(float(self._primary_y.min()))
+            ymaxs.append(float(self._primary_y.max()))
+        for meta in self._named_lines.values():
+            x, y = meta.get("x"), meta.get("y")
+            if x is not None and len(x) > 0:
+                xmins.append(float(x.min())); xmaxs.append(float(x.max()))
+                ymins.append(float(y.min())); ymaxs.append(float(y.max()))
+        # Also scan lines that are queued but not yet sent to the renderer.
+        for (x, y, *_rest) in self._pending_named_lines.values():
+            if len(x) > 0:
+                xmins.append(float(x.min())); xmaxs.append(float(x.max()))
+                ymins.append(float(y.min())); ymaxs.append(float(y.max()))
+        if xmins:
+            self._data_xmin = min(xmins); self._data_xmax = max(xmaxs)
+            self._data_ymin = min(ymins); self._data_ymax = max(ymaxs)
+            if not self._x_limits_frozen:
+                self._apply_xlim(*_nice_bounds_1d(self._data_xmin, self._data_xmax), freeze=False)
+            if not self._y_limits_frozen:
+                self._apply_ylim(*_nice_bounds_1d(self._data_ymin, self._data_ymax), freeze=False)
+        else:
+            # All static data removed; reset accumulator but leave limits alone.
+            self._data_xmin = self._data_xmax = None
+            self._data_ymin = self._data_ymax = None
+
+    def _refit_from_all_sources(self) -> None:
+        """Refit unfrozen axes from *all* data (static + streams).
+
+        Used after a stream is cleared or removed so that stale limits are
+        corrected.  When no data remains at all, ``_xlim`` and ``_ylim`` are
+        reset to ``None`` so the chart shows a default empty state.
+        """
+        bounds = self._current_data_bounds()
+        if bounds is None:
+            self._data_xmin = self._data_xmax = None
+            self._data_ymin = self._data_ymax = None
+            # Only reset unfrozen axes; frozen axes keep the user-specified range.
+            if not self._x_limits_frozen:
+                self._xlim = None
+            if not self._y_limits_frozen:
+                self._ylim = None
+            # Always push so the renderer gets an updated empty state regardless
+            # of which combination of axes is frozen.
+            self._push_chart2d()
+        else:
+            xmin, xmax, ymin, ymax = bounds
+            self._data_xmin = xmin; self._data_xmax = xmax
+            self._data_ymin = ymin; self._data_ymax = ymax
+            if not self._x_limits_frozen:
+                self._apply_xlim(*_nice_bounds_1d(xmin, xmax), freeze=False)
+            if not self._y_limits_frozen:
+                self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
+
+    def home(self) -> None:
+        """Reset both axes to the full recorded data extent."""
+        self._box_zoom_active = False  # release any streaming freeze
+        bounds = self._current_data_bounds()
+        if bounds is None:
+            return
+        xmin, xmax, ymin, ymax = bounds
+        self._x_limits_frozen = False
+        self._y_limits_frozen = False
+        self._sync_limit_freeze()
+        self._apply_xlim(*_nice_bounds_1d(xmin, xmax), freeze=False)
+        self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
+
+    def autoscale_y(self) -> None:
+        """Unfreeze Y and fit it to currently-buffered data."""
+        bounds = self._current_data_bounds()
+        if bounds is None:
+            return
+        _, _, ymin, ymax = bounds
+        self._y_limits_frozen = False
+        self._sync_limit_freeze()
+        self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
+
+    def autoscale_both(self) -> None:
+        """Alias for :meth:`home` — unfreeze both axes and fit to data."""
+        self.home()
+
+    # ── Cursor and box-zoom API ───────────────────────────────────────────────
+
+    def enable_cursor(self, enabled: bool, *, snap: bool = False) -> None:
+        """Show a crosshair cursor that tracks the mouse over the plot area.
+
+        Parameters
+        ----------
+        enabled : bool
+        snap : bool
+            Must be ``False`` in v1.  Passing ``True`` raises
+            ``NotImplementedError`` until nearest-sample snapping is implemented.
+        """
+        if snap:
+            raise NotImplementedError(
+                "snap=True is not yet supported; use snap=False")
+        self._cursor_enabled = bool(enabled)
+        if not enabled and self._renderer is not None:
+            self._renderer.chart2d_set_cursor(0.0, 0.0, False)
+            self._status_label.configure(text="")
+            self._mark_dirty()
+
+    def enable_box_zoom(self, enabled: bool) -> None:
+        """Enable or disable left-drag box zoom on the plot area.
+
+        When box zoom is active on a streaming chart the live axis animation is
+        suspended until the user calls :meth:`resume_live`, :meth:`home`, or
+        :meth:`autoscale_both`.
+        """
+        self._box_zoom_enabled = bool(enabled)
+        if not enabled:
+            self._box_zoom_active = False
+            self._bz_dragging = False
+
+    def resume_live(self) -> None:
+        """Release the box-zoom streaming freeze so axis animation resumes."""
+        self._box_zoom_active = False
+
+    # ── Mouse overrides ───────────────────────────────────────────────────────
+
+    def _drag_start(self, event: tk.Event, button: int) -> None:
+        if button == 1 and self._box_zoom_enabled:
+            self._bz_dragging = True
+            self._bz_px0 = event.x
+            self._bz_py0 = event.y
+            self._drag_btn = button
+            return
+        super()._drag_start(event, button)
+
+    def _drag_end(self, event: tk.Event) -> None:
+        if self._bz_dragging:
+            self._bz_dragging = False
+            self._drag_btn = None
+            if self._renderer is not None:
+                self._renderer.clear_selection_rect()
+                self._mark_dirty()
+            self._apply_box_zoom(self._bz_px0, self._bz_py0, event.x, event.y)
+            return
+        super()._drag_end(event)
+
+    def _on_hover_motion(self, event: tk.Event) -> None:
+        if self._cursor_enabled:
+            self._update_cursor(event.x, event.y)
+
+    def _on_hover_leave(self, event: tk.Event) -> None:
+        if self._cursor_enabled and self._renderer is not None:
+            self._renderer.chart2d_set_cursor(0.0, 0.0, False)
+            self._mark_dirty()
+        self._status_label.configure(text="")
+
+    def _update_cursor(self, mx: int, my: int) -> None:
+        """Convert pixel position to data coords and update the renderer cursor."""
+        tgt = self._render_target_widget
+        w = tgt.winfo_width()
+        h = tgt.winfo_height()
+        if w < 1 or h < 1 or self._xlim is None or self._ylim is None:
+            return
+        pl = self._pad_left   * w
+        pr = self._pad_right  * w
+        pt = self._pad_top    * h
+        pb = self._pad_bottom * h
+        if not (pl <= mx <= pr and pt <= my <= pb):
+            if self._renderer is not None:
+                self._renderer.chart2d_set_cursor(0.0, 0.0, False)
+                self._mark_dirty()
+            self._status_label.configure(text="")
+            return
+        x0, x1 = self._xlim
+        y0, y1 = self._ylim
+        x_data = x0 + (mx - pl) / (pr - pl) * (x1 - x0)
+        y_data = y1 - (my - pt) / (pb - pt) * (y1 - y0)
+        if self._renderer is not None:
+            self._renderer.chart2d_set_cursor(float(x_data), float(y_data), True)
+            self._mark_dirty()
+        self._status_label.configure(text=f"x = {x_data:.4g}   y = {y_data:.4g}")
+
+    def _apply_box_zoom(self, px0: int, py0: int, px1: int, py1: int) -> None:
+        """Convert a pixel drag rect to data-space limits and apply them."""
+        tgt = self._render_target_widget
+        w = tgt.winfo_width()
+        h = tgt.winfo_height()
+        if w < 1 or h < 1 or self._xlim is None or self._ylim is None:
+            return
+        pl = self._pad_left   * w
+        pr = self._pad_right  * w
+        pt = self._pad_top    * h
+        pb = self._pad_bottom * h
+        pw = pr - pl; ph = pb - pt
+        if pw < 1 or ph < 1:
+            return
+        x0, x1 = self._xlim
+        y0, y1 = self._ylim
+        # Map pixel corners to data space, clamped to plot rect.
+        xa = x0 + (max(pl, min(pr, float(px0))) - pl) / pw * (x1 - x0)
+        xb = x0 + (max(pl, min(pr, float(px1))) - pl) / pw * (x1 - x0)
+        ya = y1 - (max(pt, min(pb, float(py0))) - pt) / ph * (y1 - y0)
+        yb = y1 - (max(pt, min(pb, float(py1))) - pt) / ph * (y1 - y0)
+        new_x0, new_x1 = min(xa, xb), max(xa, xb)
+        new_y0, new_y1 = min(ya, yb), max(ya, yb)
+        if abs(new_x1 - new_x0) < 1e-10 or abs(new_y1 - new_y0) < 1e-10:
+            return  # Degenerate drag — ignore
+        self._apply_xlim(new_x0, new_x1, freeze=True)
+        self._apply_ylim(new_y0, new_y1, freeze=True)
+        self._box_zoom_active = True  # Freeze streaming axis animation
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def clear(self) -> None:
+        """Remove all lines, overlays, and streams and reset chart bounds."""
+        # Python-side state
+        self._pending_primary = None
+        self._primary_handle = None
+        self._primary_label = None
+        self._primary_x = self._primary_y = None
+        self._pending_named_lines.clear()
+        self._named_lines.clear()
+        self._nhandle_map.clear()
+        self._next_nhandle = 0
+        self._line_streams.clear()
+        self._next_stream = 0
+        self._overlay_meta.clear()
+        self._overlay_handle_map.clear()
+        self._next_overlay_handle = 0
+        self._data_xmin = self._data_xmax = None
+        self._data_ymin = self._data_ymax = None
+        self._xlim = None
+        self._ylim = None
+        self._x_limits_frozen = False
+        self._y_limits_frozen = False
+        self._chart2d_sent = False
+        # Renderer-side state
+        if self._renderer is not None:
+            self._renderer.chart2d_clear_lines()
+            self._renderer.chart2d_clear_overlays()
+            self._push_chart2d()
+            self._push_legend()
+            self._mark_dirty()
 
     def _init_renderer(self) -> None:
         super()._init_renderer()
@@ -3771,17 +4261,24 @@ class Line2D(Scatter3D):
         self._push_chart2d()
         # Replay primary line set before renderer existed.
         if self._pending_primary is not None:
-            x, y, color, line_width = self._pending_primary
+            x, y, color, line_width, label = self._pending_primary
             self._pending_primary = None
+            self._primary_label = label
             self._primary_handle = self._renderer.chart2d_add_line(
                 x, y, color, line_width
             )
             self._mark_dirty()
         # Replay any streams that have data buffered already.
-        for vhandle, (x, y, color, line_width) in list(self._pending_named_lines.items()):
+        for vhandle, (x, y, color, line_width, label, visible) in list(self._pending_named_lines.items()):
             real = self._renderer.chart2d_add_line(x, y, color, line_width)
             self._nhandle_map[vhandle] = real
-            self._named_lines[real] = {"color": color, "line_width": line_width}
+            self._named_lines[real] = {
+                "color": color, "line_width": line_width,
+                "label": label, "visible": visible,
+                "x": x.copy(), "y": y.copy(),
+            }
+            if not visible:
+                self._renderer.chart2d_set_line_visible(real, False)
             self._mark_dirty()
         self._pending_named_lines.clear()
         for st in self._line_streams.values():
@@ -3793,12 +4290,45 @@ class Line2D(Scatter3D):
                         xs, ys, st["color"], st["line_width"]
                     )
                     self._mark_dirty()
+        # Replay any overlays that were added before the renderer existed.
+        for vhandle, meta in list(self._overlay_meta.items()):
+            kind = meta["kind"]
+            args = meta["args"]
+            if kind == "hspan":
+                rust_id = self._renderer.chart2d_add_hspan(*args)
+            elif kind == "vspan":
+                rust_id = self._renderer.chart2d_add_vspan(*args)
+            elif kind == "hline":
+                rust_id = self._renderer.chart2d_add_hline(*args)
+            elif kind == "vline":
+                rust_id = self._renderer.chart2d_add_vline(*args)
+            else:
+                continue
+            self._overlay_handle_map[vhandle] = rust_id
+            self._mark_dirty()
+        # Restore axis formatting and log scale settings.
+        if self._x_tick_format != "default":
+            self._renderer.chart2d_set_tick_format("x", self._x_tick_format)
+            self._mark_dirty()
+        if self._y_tick_format != "default":
+            self._renderer.chart2d_set_tick_format("y", self._y_tick_format)
+            self._mark_dirty()
+        if self._x_log_scale:
+            self._renderer.chart2d_set_log_scale("x", True)
+            self._mark_dirty()
+        if self._y_log_scale:
+            self._renderer.chart2d_set_log_scale("y", True)
+            self._mark_dirty()
+        # Replay legend (show_legend() before renderer init only stored the flag).
+        if self._legend_visible:
+            self._push_legend()
 
     def _do_resize(self, w: int, h: int) -> None:
         super()._do_resize(w, h)
         # Force a full set_chart2d rebuild after resize (axis geometry is in px).
         self._chart2d_sent = False
         self._push_chart2d()
+        self._push_legend()  # legend positions are pixel-space; recompute on resize
 
     # ── Axis setup ────────────────────────────────────────────────────────────
 
@@ -3831,6 +4361,61 @@ class Line2D(Scatter3D):
             self._y_tick_interval = step
         self._push_chart2d()
 
+    def set_x_tick_interval(self, step: "float | None") -> None:
+        """Set a fixed X-axis grid/tick interval, or ``None`` to auto-pick it."""
+        if step is None:
+            self._x_tick_interval = None
+        else:
+            step = float(step)
+            if not np.isfinite(step) or step <= 0.0:
+                raise ValueError("x tick interval must be a positive finite number")
+            self._x_tick_interval = step
+        self._push_chart2d()
+
+    def set_title(self, title: str) -> None:
+        """Set the chart title displayed above the plot area."""
+        self._title = str(title)
+        # Reserve extra top padding so the title clears the frame.
+        self._pad_top = 0.08 if title else 0.04
+        self._chart2d_sent = False  # resize of top margin requires full rebuild
+        self._push_chart2d()
+
+    # ── Legend API ────────────────────────────────────────────────────────────
+
+    def show_legend(self, visible: bool = True) -> None:
+        """Show or hide the chart legend.  Entries come from ``label=`` on lines."""
+        self._legend_visible = bool(visible)
+        self._push_legend()
+
+    @property
+    def legend_position(self) -> str:
+        """Legend anchor: ``"top-right"``, ``"top-left"``, ``"bottom-right"``, or
+        ``"bottom-left"``."""
+        return self._legend_position
+
+    @legend_position.setter
+    def legend_position(self, value: str) -> None:
+        valid = {"top-right", "top-left", "bottom-right", "bottom-left"}
+        if value not in valid:
+            raise ValueError(
+                f"legend_position must be one of {sorted(valid)!r}, got {value!r}")
+        self._legend_position = value
+        if self._legend_visible:
+            self._push_legend()
+
+    def set_line_visibility(self, handle: int, visible: bool) -> None:
+        """Show or hide a named line (from :meth:`add_line`) without removing it."""
+        visible = bool(visible)
+        real = self._resolve_line_handle(handle)
+        if real in self._named_lines:
+            self._named_lines[real]["visible"] = visible
+        elif handle in self._pending_named_lines:
+            t = self._pending_named_lines[handle]
+            self._pending_named_lines[handle] = (t[0], t[1], t[2], t[3], t[4], visible)
+        if self._renderer is not None:
+            self._renderer.chart2d_set_line_visible(real, visible)
+            self._mark_dirty()
+
     def reset_camera(self) -> None:
         """Re-send chart2d state (no camera to reset in chart mode)."""
         self._push_chart2d()
@@ -3844,6 +4429,7 @@ class Line2D(Scatter3D):
         *,
         color: "tuple[float, float, float]" = (0.3, 0.7, 1.0),
         line_width: float = 2.0,
+        label: "str | None" = None,
     ) -> None:
         """Replace the primary polyline.
 
@@ -3854,6 +4440,8 @@ class Line2D(Scatter3D):
         color : (r, g, b) in [0, 1]
         line_width : float, optional
             Line width in screen pixels.
+        label : str, optional
+            Series label shown in the legend when :meth:`show_legend` is True.
         """
         x = np.asarray(x, dtype=np.float32).ravel()
         y = np.asarray(y, dtype=np.float32).ravel()
@@ -3861,9 +4449,13 @@ class Line2D(Scatter3D):
         if len(x) != len(y):
             raise ValueError(
                 f"x and y must have equal length, got {len(x)} vs {len(y)}")
-        self._auto_fit(x, y)
+        self._primary_x = x.copy()
+        self._primary_y = y.copy()
+        self._refit_all_static()  # union of all current static lines, not just this one
+        label = str(label) if label is not None else None
+        self._primary_label = label
         if self._renderer is None:
-            self._pending_primary = (x.copy(), y.copy(), color, line_width)
+            self._pending_primary = (x.copy(), y.copy(), color, line_width, label)
             self._primary_color = color
             self._primary_width = line_width
             return
@@ -3877,6 +4469,8 @@ class Line2D(Scatter3D):
             )
         self._primary_color = color
         self._primary_width = line_width
+        if self._legend_visible:
+            self._push_legend()
         self._mark_dirty()
 
     def add_line(
@@ -3886,6 +4480,7 @@ class Line2D(Scatter3D):
         *,
         color: "tuple[float, float, float]" = (0.9, 0.5, 0.2),
         line_width: float = 2.0,
+        label: "str | None" = None,
     ) -> int:
         """Add a new polyline; returns a handle.
 
@@ -3895,6 +4490,8 @@ class Line2D(Scatter3D):
         color : (r, g, b) in [0, 1]
         line_width : float, optional
             Line width in screen pixels.
+        label : str, optional
+            Series label shown in the legend when :meth:`show_legend` is True.
 
         Returns
         -------
@@ -3907,16 +4504,26 @@ class Line2D(Scatter3D):
         if len(x) != len(y):
             raise ValueError(
                 f"x and y must have equal length, got {len(x)} vs {len(y)}")
-        self._auto_fit(x, y)
+        label = str(label) if label is not None else None
         if self._renderer is None:
             vhandle = self._next_nhandle
             self._next_nhandle += 1
             self._pending_named_lines[vhandle] = (
-                x.copy(), y.copy(), color, line_width
+                x.copy(), y.copy(), color, line_width, label, True
             )
+            # Refit from all static geometry (including this new pending line).
+            self._refit_all_static()
             return vhandle
         handle = self._renderer.chart2d_add_line(x, y, color, line_width)
-        self._named_lines[handle] = {"color": color, "line_width": line_width}
+        self._named_lines[handle] = {
+            "color": color, "line_width": line_width,
+            "label": label, "visible": True,
+            "x": x.copy(), "y": y.copy(),
+        }
+        # Refit from all static geometry now that the new line is stored.
+        self._refit_all_static()
+        if self._legend_visible and label is not None:
+            self._push_legend()
         self._mark_dirty()
         return handle
 
@@ -3931,6 +4538,7 @@ class Line2D(Scatter3D):
         *,
         color: "tuple[float, float, float] | None" = None,
         line_width: "float | None" = None,
+        label: "str | None" = None,
     ) -> None:
         """Replace the geometry of an existing line.
 
@@ -3941,6 +4549,7 @@ class Line2D(Scatter3D):
         x, y : array-like, shape (N,)
         color : (r, g, b), optional — keeps existing colour when omitted.
         line_width : float, optional — keeps existing width when omitted.
+        label : str, optional — updates the legend label when provided.
         """
         x = np.asarray(x, dtype=np.float32).ravel()
         y = np.asarray(y, dtype=np.float32).ravel()
@@ -3948,14 +4557,19 @@ class Line2D(Scatter3D):
             raise ValueError(
                 f"x and y must have equal length, got {len(x)} vs {len(y)}")
         if self._renderer is None and handle in self._pending_named_lines:
-            _old_x, _old_y, old_color, old_width = self._pending_named_lines[handle]
+            _old_x, _old_y, old_color, old_width, old_label, old_vis = \
+                self._pending_named_lines[handle]
             c = color if color is not None else old_color
             lw = (
                 _normalize_line2d_width(line_width)
                 if line_width is not None
                 else old_width
             )
-            self._pending_named_lines[handle] = (x.copy(), y.copy(), c, lw)
+            new_label = str(label) if label is not None else old_label
+            self._pending_named_lines[handle] = (
+                x.copy(), y.copy(), c, lw, new_label, old_vis
+            )
+            self._refit_all_static()
             return
 
         real = self._resolve_line_handle(handle)
@@ -3968,21 +4582,210 @@ class Line2D(Scatter3D):
         )
         if self._renderer is not None:
             self._renderer.chart2d_update_line(real, x, y, c, lw)
-        if real in self._named_lines:
+        # Upsert into _named_lines so geometry is always available for bounds recomputation.
+        if real not in self._named_lines:
+            self._named_lines[real] = {"color": c, "line_width": lw,
+                                       "label": None, "visible": True,
+                                       "x": x.copy(), "y": y.copy()}
+        else:
             self._named_lines[real]["color"] = c
             self._named_lines[real]["line_width"] = lw
+            self._named_lines[real]["x"] = x.copy()
+            self._named_lines[real]["y"] = y.copy()
+        if label is not None:
+            new_label = str(label)
+            self._named_lines[real]["label"] = new_label
+            if self._legend_visible:
+                self._push_legend()
+        # Recompute bounds from scratch so shrinking data doesn't leave stale extents.
+        self._refit_all_static()
         self._mark_dirty()
 
     def remove_line(self, handle: int) -> None:
         """Remove a line by handle."""
         if self._renderer is None:
             self._pending_named_lines.pop(handle, None)
+            self._refit_all_static()
             return
         real = self._resolve_line_handle(handle)
         if self._renderer is not None:
             self._renderer.chart2d_remove_line(real)
         self._named_lines.pop(real, None)
+        self._refit_all_static()
+        if self._legend_visible:
+            self._push_legend()
         self._mark_dirty()
+
+    # ── Reference overlays ────────────────────────────────────────────────────
+
+    def axhspan(
+        self,
+        ymin: float,
+        ymax: float,
+        *,
+        color: "tuple[float, float, float, float]" = (0.4, 0.6, 1.0, 0.20),
+    ) -> int:
+        """Add a filled horizontal band from *ymin* to *ymax* (data coordinates).
+
+        The band spans the full x extent of the chart and is clipped by the plot
+        scissor rect.  Returns an overlay handle for :meth:`remove_overlay`.
+
+        Parameters
+        ----------
+        ymin, ymax : float
+            Data-space y bounds of the band.
+        color : (r, g, b, a) in [0, 1]
+            Fill colour including alpha (e.g. 0.2 for 20 % opacity).
+        """
+        r, g, b, a = float(color[0]), float(color[1]), float(color[2]), float(color[3])
+        vhandle = self._next_overlay_handle
+        self._next_overlay_handle += 1
+        args = (float(ymin), float(ymax), (r, g, b, a))
+        self._overlay_meta[vhandle] = {"kind": "hspan", "args": args}
+        if self._renderer is not None:
+            rust_id = self._renderer.chart2d_add_hspan(*args)
+            self._overlay_handle_map[vhandle] = rust_id
+            self._mark_dirty()
+        return vhandle
+
+    def axvspan(
+        self,
+        xmin: float,
+        xmax: float,
+        *,
+        color: "tuple[float, float, float, float]" = (0.4, 0.6, 1.0, 0.20),
+    ) -> int:
+        """Add a filled vertical band from *xmin* to *xmax* (data coordinates).
+
+        The band spans the full y extent of the chart.
+        Returns an overlay handle for :meth:`remove_overlay`.
+        """
+        r, g, b, a = float(color[0]), float(color[1]), float(color[2]), float(color[3])
+        vhandle = self._next_overlay_handle
+        self._next_overlay_handle += 1
+        args = (float(xmin), float(xmax), (r, g, b, a))
+        self._overlay_meta[vhandle] = {"kind": "vspan", "args": args}
+        if self._renderer is not None:
+            rust_id = self._renderer.chart2d_add_vspan(*args)
+            self._overlay_handle_map[vhandle] = rust_id
+            self._mark_dirty()
+        return vhandle
+
+    def axhline(
+        self,
+        y: float,
+        *,
+        color: "tuple[float, float, float]" = (0.8, 0.8, 0.3),
+        line_width: float = 1.5,
+    ) -> int:
+        """Add an infinite horizontal reference line at data y = *y*.
+
+        Returns an overlay handle for :meth:`remove_overlay`.
+        """
+        color = (float(color[0]), float(color[1]), float(color[2]))
+        vhandle = self._next_overlay_handle
+        self._next_overlay_handle += 1
+        args = (float(y), color, float(line_width))
+        self._overlay_meta[vhandle] = {"kind": "hline", "args": args}
+        if self._renderer is not None:
+            rust_id = self._renderer.chart2d_add_hline(*args)
+            self._overlay_handle_map[vhandle] = rust_id
+            self._mark_dirty()
+        return vhandle
+
+    def axvline(
+        self,
+        x: float,
+        *,
+        color: "tuple[float, float, float]" = (0.8, 0.8, 0.3),
+        line_width: float = 1.5,
+    ) -> int:
+        """Add an infinite vertical reference line at data x = *x*.
+
+        Returns an overlay handle for :meth:`remove_overlay`.
+        """
+        color = (float(color[0]), float(color[1]), float(color[2]))
+        vhandle = self._next_overlay_handle
+        self._next_overlay_handle += 1
+        args = (float(x), color, float(line_width))
+        self._overlay_meta[vhandle] = {"kind": "vline", "args": args}
+        if self._renderer is not None:
+            rust_id = self._renderer.chart2d_add_vline(*args)
+            self._overlay_handle_map[vhandle] = rust_id
+            self._mark_dirty()
+        return vhandle
+
+    def remove_overlay(self, handle: int) -> None:
+        """Remove a reference overlay (span or line) by the handle from :meth:`axhspan` etc."""
+        self._overlay_meta.pop(handle, None)
+        rust_id = self._overlay_handle_map.pop(handle, None)
+        if rust_id is not None and self._renderer is not None:
+            self._renderer.chart2d_remove_overlay(rust_id)
+            self._mark_dirty()
+
+    def clear_chart_overlays(self) -> None:
+        """Remove all reference spans and lines."""
+        self._overlay_meta.clear()
+        self._overlay_handle_map.clear()
+        if self._renderer is not None:
+            self._renderer.chart2d_clear_overlays()
+            self._mark_dirty()
+
+    # ── Axis formatting / scale ───────────────────────────────────────────────
+
+    def set_x_tick_formatter(self, fmt: str) -> None:
+        """Set the tick-label format for the X axis.
+
+        Parameters
+        ----------
+        fmt : ``"default"`` | ``"sci"`` | ``"int"`` | ``"time"``
+            * ``"default"`` — smart decimal / scientific notation
+            * ``"sci"``     — always scientific (``1.23e4``)
+            * ``"int"``     — integer (no decimal point)
+            * ``"time"``    — seconds → ``MM:SS`` or ``H:MM:SS``
+        """
+        self._x_tick_format = fmt
+        if self._renderer is not None:
+            self._renderer.chart2d_set_tick_format("x", fmt)
+            self._mark_dirty()
+
+    def set_y_tick_formatter(self, fmt: str) -> None:
+        """Set the tick-label format for the Y axis.
+
+        Parameters
+        ----------
+        fmt : ``"default"`` | ``"sci"`` | ``"int"`` | ``"time"``
+        """
+        self._y_tick_format = fmt
+        if self._renderer is not None:
+            self._renderer.chart2d_set_tick_format("y", fmt)
+            self._mark_dirty()
+
+    def set_xscale(self, scale: str) -> None:
+        """Set the X-axis scale.
+
+        Parameters
+        ----------
+        scale : ``"linear"`` | ``"log"``
+        """
+        enabled = scale == "log"
+        self._x_log_scale = enabled
+        if self._renderer is not None:
+            self._renderer.chart2d_set_log_scale("x", enabled)
+            self._mark_dirty()
+
+    def set_yscale(self, scale: str) -> None:
+        """Set the Y-axis scale.
+
+        Parameters
+        ----------
+        scale : ``"linear"`` | ``"log"``
+        """
+        enabled = scale == "log"
+        self._y_log_scale = enabled
+        if self._renderer is not None:
+            self._renderer.chart2d_set_log_scale("y", enabled)
+            self._mark_dirty()
 
     # ── Streaming API ─────────────────────────────────────────────────────────
 
@@ -3993,6 +4796,7 @@ class Line2D(Scatter3D):
         mode: str = "ring",
         color: "tuple[float, float, float]" = (0.3, 0.7, 1.0),
         line_width: float = 2.0,
+        label: "str | None" = None,
     ) -> int:
         """Pre-allocate a streaming polyline buffer.
 
@@ -4004,6 +4808,8 @@ class Line2D(Scatter3D):
         color : (r, g, b) in [0, 1]
         line_width : float, optional
             Line width in screen pixels.
+        label : str, optional
+            Series label shown in the legend when :meth:`show_legend` is True.
 
         Returns
         -------
@@ -4019,14 +4825,21 @@ class Line2D(Scatter3D):
         self._line_streams[sid] = {
             "buf_x":        np.zeros(max_points, dtype=np.float32),
             "buf_y":        np.zeros(max_points, dtype=np.float32),
+            # Pre-allocated reorder buffer — avoids heap allocation every frame
+            # for wrapped ring buffers (avoids np.concatenate in _stream_ordered).
+            "out_x":        np.empty(max_points, dtype=np.float32),
+            "out_y":        np.empty(max_points, dtype=np.float32),
             "head":         0,
             "count":        0,
             "max_pts":      max_points,
             "mode":         mode,
             "color":        color,
             "line_width":   line_width,
+            "label":        str(label) if label is not None else None,
             "render_handle": None,  # chart2d line handle, created on first upload
         }
+        if self._legend_visible and label is not None:
+            self._push_legend()
         return sid
 
     def stream_line(self, handle: int, x, y) -> None:
@@ -4078,7 +4891,8 @@ class Line2D(Scatter3D):
         if cnt < 2:
             return
 
-        self._auto_fit(buf_x[:cnt], buf_y[:cnt])
+        if not self._box_zoom_active:
+            self._refit_from_all_sources()
 
         if self._renderer is None:
             return
@@ -4098,16 +4912,26 @@ class Line2D(Scatter3D):
         self._mark_dirty()
 
     def _stream_ordered(self, st: dict):
-        """Return (x_ordered, y_ordered) arrays oldest-to-newest, or (None, None)."""
+        """Return (x_ordered, y_ordered) arrays oldest-to-newest, or (None, None).
+
+        When the ring buffer has not yet wrapped, returns zero-copy slices of the
+        underlying buffers.  When it has wrapped, writes into the pre-allocated
+        ``out_x``/``out_y`` buffers (avoids per-frame heap allocation).
+        """
         cnt = st["count"]
         if cnt < 2:
             return None, None
         buf_x, buf_y, max_pts = st["buf_x"], st["buf_y"], st["max_pts"]
         if cnt < max_pts:
-            return buf_x[:cnt], buf_y[:cnt]
+            return buf_x[:cnt], buf_y[:cnt]  # zero-copy slice
         head = st["head"]
-        return (np.concatenate([buf_x[head:], buf_x[:head]]),
-                np.concatenate([buf_y[head:], buf_y[:head]]))
+        out_x, out_y = st["out_x"], st["out_y"]
+        tail = max_pts - head
+        out_x[:tail] = buf_x[head:]
+        out_x[tail:] = buf_x[:head]
+        out_y[:tail] = buf_y[head:]
+        out_y[tail:] = buf_y[:head]
+        return out_x, out_y
 
     def clear_line_stream(self, handle: int) -> None:
         """Reset a streaming line to empty; pre-allocated buffer is kept."""
@@ -4120,6 +4944,7 @@ class Line2D(Scatter3D):
             self._renderer.chart2d_update_line(
                 st["render_handle"], empty, empty, st["color"], st["line_width"]
             )
+        self._refit_from_all_sources()
         self._mark_dirty()
 
     def remove_line_stream(self, handle: int) -> None:
@@ -4129,13 +4954,23 @@ class Line2D(Scatter3D):
             raise KeyError(f"No line stream with handle {handle!r}")
         if st["render_handle"] is not None and self._renderer is not None:
             self._renderer.chart2d_remove_line(st["render_handle"])
+        self._refit_from_all_sources()
+        if self._legend_visible:
+            self._push_legend()
         self._mark_dirty()
 
     # ── Mouse / camera overrides ──────────────────────────────────────────────
 
     def _drag_move(self, event: tk.Event, button: int) -> None:
-        """No camera pan in chart mode — only selection drags pass through."""
+        """No camera pan in chart mode — box zoom and selection drags pass through."""
         if self._renderer is None or self._drag_btn != button:
+            return
+        # Box zoom: show the drag rect as a selection rect overlay.
+        if button == 1 and self._bz_dragging:
+            self._renderer.set_selection_rect(
+                float(self._bz_px0), float(self._bz_py0),
+                float(event.x), float(event.y))
+            self._mark_dirty()
             return
         if self._try_lasso_move(event):
             return
@@ -4160,17 +4995,54 @@ class Line2D(Scatter3D):
 
     def _push_chart2d(self) -> None:
         """Send current chart2d state to the Rust renderer."""
-        if self._renderer is None or self._xlim is None or self._ylim is None:
+        if self._renderer is None:
             return
+        # When no data has arrived yet (or was just cleared), use a neutral
+        # (0, 1) range so the renderer shows a clean empty grid rather than
+        # retaining the previous chart's axes/ticks.
+        xlim = self._xlim if self._xlim is not None else (0.0, 1.0)
+        ylim = self._ylim if self._ylim is not None else (0.0, 1.0)
         self._renderer.set_chart2d(
             self._pad_left, self._pad_right,
             self._pad_top,  self._pad_bottom,
-            self._xlim[0],  self._xlim[1],
-            self._ylim[0],  self._ylim[1],
+            xlim[0], xlim[1],
+            ylim[0], ylim[1],
             self._xlabel,   self._ylabel,
             self._y_tick_interval,
+            self._title,
+            self._x_tick_interval,
         )
         self._chart2d_sent = True
+        self._mark_dirty()
+
+    def _push_legend(self) -> None:
+        """Recompute and send legend entries to the Rust renderer."""
+        if self._renderer is None:
+            return
+        if not self._legend_visible:
+            self._renderer.chart2d_set_legend([], self._legend_position, False)
+            self._mark_dirty()
+            return
+
+        entries: "list[tuple[str, tuple[float, float, float]]]" = []
+
+        # Primary line (set_line)
+        if self._primary_label is not None and self._primary_handle is not None:
+            entries.append((self._primary_label, self._primary_color))
+
+        # Named extra lines (add_line)
+        for meta in self._named_lines.values():
+            lbl = meta.get("label")
+            if lbl is not None:
+                entries.append((lbl, meta["color"]))
+
+        # Streaming lines (add_line_stream)
+        for st in self._line_streams.values():
+            lbl = st.get("label")
+            if lbl is not None:
+                entries.append((lbl, st["color"]))
+
+        self._renderer.chart2d_set_legend(entries, self._legend_position, True)
         self._mark_dirty()
 
     def _sync_limit_freeze(self) -> None:
@@ -4197,17 +5069,6 @@ class Line2D(Scatter3D):
             self._mark_dirty()
             return
         self._push_chart2d()
-
-    def _auto_fit(self, x: "np.ndarray", y: "np.ndarray") -> None:
-        """Derive xlim/ylim from data bounds for any axis that is not frozen."""
-        if len(x) < 1:
-            return
-        if not self._x_limits_frozen:
-            xmin, xmax = float(x.min()), float(x.max())
-            self._apply_xlim(*_nice_bounds_1d(xmin, xmax), freeze=False)
-        if not self._y_limits_frozen:
-            ymin, ymax = float(y.min()), float(y.max())
-            self._apply_ylim(*_nice_bounds_1d(ymin, ymax), freeze=False)
 
 
 # ── Linked-camera module API ──────────────────────────────────────────────────
